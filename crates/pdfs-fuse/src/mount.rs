@@ -196,6 +196,8 @@ pub fn mount(
         drain_wake: Arc::new((Mutex::new(false), Condvar::new())),
         timeline_refreshing: Arc::new(AtomicBool::new(false)),
         trash_refreshing: Arc::new(AtomicBool::new(false)),
+        conflict_notified: Arc::new(Mutex::new(HashSet::new())),
+        own_sealed_revs: Arc::new(Mutex::new(HashMap::new())),
         thumb_gen: Arc::new(Mutex::new(HashSet::new())),
         no_thumbnail: Arc::new(Mutex::new(HashMap::new())),
         size_upgrades: Arc::new(Mutex::new(HashMap::new())),
@@ -225,6 +227,16 @@ pub fn mount(
     // Start the folder-sync engine. It watches every mirror folder, polls the
     // remotes, and reconciles on its own thread — never in front of a FUSE call.
     sync::spawn(core.clone(), sync_rx);
+
+    // Reconcile leftover `(sync-conflict …)` copies: drop the ones that turned
+    // out identical to the live file, surface the ones that genuinely diverge.
+    // Its own thread — it enumerates and trashes, and must never block a FUSE call.
+    {
+        let core = core.clone();
+        std::thread::Builder::new()
+            .name("pdfs-conflict-sweep".into())
+            .spawn(move || core.run_conflict_sweep_loop())?;
+    }
 
     // Mounted from the cache: watch for the network coming back so the mount can
     // stop being read-only-ish without the user restarting the daemon.

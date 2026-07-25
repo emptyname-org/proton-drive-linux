@@ -60,11 +60,12 @@ use pdfs_core::control::{
     TransferDirection,
 };
 use pdfs_core::db::{
-    Db, LOCAL_VOLUME, OP_CREATE, OP_MKDIR, OP_RENAME, OP_REVISION, OP_TRASH, PendingOp, StoredNode,
-    StoredSyncFolder, StoredTrash,
+    Db, LOCAL_VOLUME, OP_CREATE, OP_MKDIR, OP_RENAME, OP_REVISION, OP_TRASH, PARK_UNTIL, PendingOp,
+    StoredNode, StoredSyncFolder, StoredTrash,
 };
 use pdfs_core::localindex;
 use pdfs_core::search::relevance_score;
+use pdfs_core::syncignore::is_transient_name;
 use pdfs_core::{CoreError, CoreResult};
 use proton_drive_rs::proton_sdk::api::ResponseCode;
 use proton_drive_rs::proton_sdk::error::ProtonError;
@@ -87,6 +88,7 @@ mod profile;
 mod reads;
 mod sharing;
 mod state;
+mod sweep;
 mod sync;
 mod transfers;
 mod upload;
@@ -237,6 +239,22 @@ struct Core {
     /// off one refresh rather than one per request.
     timeline_refreshing: Arc<AtomicBool>,
     trash_refreshing: Arc<AtomicBool>,
+    /// Conflict copies the sweep has already flagged as needing attention this
+    /// run, so a divergent `(sync-conflict …)` file is logged once rather than
+    /// on every sweep pass. See [`Core::run_conflict_sweep_loop`].
+    conflict_notified: Arc<Mutex<HashSet<NodeUid>>>,
+    /// The latest server revision id this daemon has itself sealed, keyed by
+    /// node. A queued write whose baseline names an *earlier* revision would
+    /// normally fork into a `(sync-conflict)` copy when the drain finds the
+    /// remote already moved on — but if the remote sits at a revision *we*
+    /// sealed, no other device touched the file: it is a single-writer
+    /// stall→resume (a browser download that closed and reopened its fd, then
+    /// rewrote the whole file). [`Core::revision_conflict`] consults this to
+    /// adopt our own revision as the base and supersede instead of forking
+    /// (docs/BUGS.md B70, layer B). One entry per written node, overwritten as
+    /// the node advances and dropped when it is trashed; lost on restart, which
+    /// only widens the (already narrow) fork window across a daemon bounce.
+    own_sealed_revs: Arc<Mutex<HashMap<NodeUid, String>>>,
     /// Photos whose missing thumbnail is being generated right now. A tile that is
     /// still on screen asks for its thumbnail again every few seconds, and each of
     /// those downloads is a full-size photo — so an in-flight uid is never started
@@ -1146,7 +1164,12 @@ impl Core {
             base_mtime: h.base_mtime,
             complete: authored == [(0, h.len)],
             authored,
-            based_on: self.remote_baseline(&h.uid, h.base_mtime, h.base_size),
+            based_on: self.remote_baseline(
+                &h.uid,
+                h.base_mtime,
+                h.base_size,
+                h.base_revision_id.clone(),
+            ),
         };
         self.enqueue_staged_write(&h.uid, h.ino, &h.path, meta)?;
         debug!(uid = %h.uid, len = h.len, complete = filled, "queued revision upload");
@@ -1167,7 +1190,13 @@ impl Core {
     ///
     /// `None` for a node that has never existed remotely: there is no revision
     /// to conflict with until its create drains.
-    fn remote_baseline(&self, uid: &NodeUid, base_mtime: i64, base_size: u64) -> Option<Baseline> {
+    fn remote_baseline(
+        &self,
+        uid: &NodeUid,
+        base_mtime: i64,
+        base_size: u64,
+        base_revision_id: Option<String>,
+    ) -> Option<Baseline> {
         if is_local_uid(uid) {
             return None;
         }
@@ -1177,6 +1206,7 @@ impl Core {
                 mtime: base_mtime,
                 size: base_size,
                 hash: None,
+                revision_id: base_revision_id,
             }),
         }
     }
@@ -1293,12 +1323,15 @@ impl Core {
     /// - Shrinking authors nothing: every remaining byte still comes from the
     ///   base, so it is the drain that has to fetch it.
     fn queue_truncate(&self, ino: u64, size: u64) -> Result<(), Errno> {
-        let (uid, base_mtime, base_size) = {
+        let (uid, base_mtime, base_size, base_revision_id) = {
             let st = self.state.lock();
             match st.entries.get(&ino) {
-                Some(e) if e.node.is_file() => {
-                    (e.uid.clone(), e.node.modification_time, node_size(&e.node))
-                }
+                Some(e) if e.node.is_file() => (
+                    e.uid.clone(),
+                    e.node.modification_time,
+                    node_size(&e.node),
+                    node_revision_id(&e.node),
+                ),
                 Some(_) => return Err(Errno::EISDIR),
                 None => return Err(Errno::ENOENT),
             }
@@ -1374,7 +1407,7 @@ impl Core {
                 base_mtime,
                 authored,
                 complete,
-                based_on: self.remote_baseline(&uid, base_mtime, base_size),
+                based_on: self.remote_baseline(&uid, base_mtime, base_size, base_revision_id),
             },
         };
         self.enqueue_staged_write(&uid, ino, &path, meta)?;
@@ -1394,6 +1427,7 @@ impl Core {
         parent_uid: &NodeUid,
         name: &str,
         is_dir: bool,
+        hold: bool,
     ) -> Result<Node, Errno> {
         let uid = mint_local_uid();
         let op = PendingOp {
@@ -1407,7 +1441,10 @@ impl Core {
             created_at: now_millis(),
             attempts: 0,
             last_error: None,
-            next_attempt_at: 0,
+            // Parked when the name is transient: its bytes ride on this create
+            // (via `attach_blob_to_create`) and must not upload until a rename to
+            // the finished name un-parks it (docs/BUGS.md B70).
+            next_attempt_at: if hold { PARK_UNTIL } else { 0 },
         };
         self.db.enqueue_op(&op).map_err(|e| {
             error!(%parent_uid, name, error = %e, "queueing local node failed");
@@ -2725,6 +2762,8 @@ fn local_node(uid: NodeUid, parent_uid: NodeUid, name: String, is_dir: bool) -> 
                 total_size_on_storage: 0,
                 // No revision has been sealed: nothing has been uploaded yet.
                 active_revision_state: None,
+                active_revision_id: None,
+                content_sha1: None,
                 claimed_size: Some(0),
                 claimed_modification_time: None,
             }
@@ -2930,6 +2969,27 @@ fn node_size(node: &Node) -> u64 {
             total_size_on_storage,
             ..
         } => claimed_size.unwrap_or(*total_size_on_storage).max(0) as u64,
+    }
+}
+
+/// The server revision id of a node's active revision, if it is a file that has
+/// one. The stable identity the drain conflict-checks against (see [`Baseline`]).
+fn node_revision_id(node: &Node) -> Option<String> {
+    match &node.kind {
+        NodeKind::Folder => None,
+        NodeKind::File {
+            active_revision_id, ..
+        } => active_revision_id.clone(),
+    }
+}
+
+/// The plaintext content SHA-1 of a file node, if its active revision carried one.
+/// A download-free content fingerprint the conflict sweep uses to prove two files
+/// hold identical bytes before it removes one.
+fn node_content_sha1(node: &Node) -> Option<String> {
+    match &node.kind {
+        NodeKind::Folder => None,
+        NodeKind::File { content_sha1, .. } => content_sha1.clone(),
     }
 }
 
@@ -3290,6 +3350,8 @@ mod pending_size_tests {
                 media_type: "text/plain".into(),
                 total_size_on_storage: 0,
                 active_revision_state: None,
+                active_revision_id: None,
+                content_sha1: None,
                 claimed_size: Some(claimed),
                 claimed_modification_time: None,
             },
@@ -3486,6 +3548,7 @@ mod tests {
                     mtime: 42,
                     size: 3,
                     hash: None,
+                    revision_id: None,
                 }),
             },
         }
@@ -3661,6 +3724,8 @@ mod tests {
                     media_type: "text/plain".into(),
                     total_size_on_storage: 0,
                     active_revision_state: None,
+                    active_revision_id: None,
+                    content_sha1: None,
                     claimed_size: Some(0),
                     claimed_modification_time: None,
                 }

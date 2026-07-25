@@ -110,12 +110,17 @@ impl Filesystem for ProtonFs {
     }
 
     fn open(&self, _req: &Request, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
-        let (uid, base_mtime, base_size) = {
+        let (uid, base_mtime, base_size, base_revision_id) = {
             let mut st = self.core.state.lock();
             match st.entries.get_mut(&ino.0) {
                 Some(e) if e.node.is_file() => {
                     e.open_count = e.open_count.saturating_add(1);
-                    (e.uid.clone(), e.node.modification_time, node_size(&e.node))
+                    (
+                        e.uid.clone(),
+                        e.node.modification_time,
+                        node_size(&e.node),
+                        node_revision_id(&e.node),
+                    )
                 }
                 Some(_) => {
                     reply.error(Errno::EISDIR);
@@ -194,6 +199,7 @@ impl Filesystem for ProtonFs {
                 len: base_size,
                 base_size,
                 base_mtime,
+                base_revision_id,
                 dirty: false,
                 open_count: 0,
             }
@@ -330,44 +336,57 @@ impl Filesystem for ProtonFs {
                 }
             }
         };
+        // A transient scratch name — a browser's in-flight `*.crdownload`, an
+        // editor's `*.swp` — is kept purely local and *parked*: no remote node is
+        // minted and its bytes never upload while it wears that name. The app
+        // renames the finished file to its real name, and that rename un-parks the
+        // create so only the completed file reaches Drive. Minting an empty remote
+        // node here instead is what let a stalled+resumed download fork a
+        // `(sync-conflict)` copy (docs/BUGS.md B70).
+        let transient = is_transient_name(&name);
         // Offline the server cannot mint a uid, so invent one and queue the
         // create. The file is real to the caller either way; only its identity is
         // provisional until the drain (offline.md Phase 3b).
         //
         // A parent that is itself still queued forces the same path even when we
         // are online: the API has no folder to put this in yet.
-        let node = if self.core.online.load(Ordering::Relaxed) && !is_local_uid(&parent_uid) {
-            // Create an empty file on the remote so it has a real uid immediately;
-            // written bytes are buffered and sealed as a new revision on close.
-            let new_uid = match self.core.rt.block_on(self.core.client.upload_file(
-                &parent_uid,
-                &name,
-                media_type_for(&name),
-                b"",
-            )) {
-                Ok(u) => u,
-                Err(e) => {
-                    error!(%parent_uid, name, error = %e, "create file failed");
-                    reply.error(Errno::EIO);
-                    return;
+        let node =
+            if !transient && self.core.online.load(Ordering::Relaxed) && !is_local_uid(&parent_uid)
+            {
+                // Create an empty file on the remote so it has a real uid immediately;
+                // written bytes are buffered and sealed as a new revision on close.
+                let new_uid = match self.core.rt.block_on(self.core.client.upload_file(
+                    &parent_uid,
+                    &name,
+                    media_type_for(&name),
+                    b"",
+                )) {
+                    Ok(u) => u,
+                    Err(e) => {
+                        error!(%parent_uid, name, error = %e, "create file failed");
+                        reply.error(Errno::EIO);
+                        return;
+                    }
+                };
+                match self.core.fetch_node(&new_uid) {
+                    Ok(n) => n,
+                    Err(e) => {
+                        reply.error(e);
+                        return;
+                    }
+                }
+            } else {
+                match self
+                    .core
+                    .queue_local_node(&parent_uid, &name, false, transient)
+                {
+                    Ok(n) => n,
+                    Err(e) => {
+                        reply.error(e);
+                        return;
+                    }
                 }
             };
-            match self.core.fetch_node(&new_uid) {
-                Ok(n) => n,
-                Err(e) => {
-                    reply.error(e);
-                    return;
-                }
-            }
-        } else {
-            match self.core.queue_local_node(&parent_uid, &name, false) {
-                Ok(n) => n,
-                Err(e) => {
-                    reply.error(e);
-                    return;
-                }
-            }
-        };
         let new_uid = node.uid.clone();
         // The base this handle writes over is the node as it actually exists —
         // the empty file the server just minted — so its modification time comes
@@ -409,6 +428,8 @@ impl Filesystem for ProtonFs {
                 len: 0,
                 base_size: 0,
                 base_mtime,
+                // A brand-new file has no sealed remote revision to conflict with.
+                base_revision_id: None,
                 dirty: false,
                 open_count: 0,
             }
@@ -655,10 +676,13 @@ impl Filesystem for ProtonFs {
                     aw.len,
                     aw.base_size,
                     aw.base_mtime,
+                    aw.base_revision_id.clone(),
                 )
             })
         };
-        let Some((f, path, uid, dirty, written, len, base_size, base_mtime)) = handle else {
+        let Some((f, path, uid, dirty, written, len, base_size, base_mtime, base_revision_id)) =
+            handle
+        else {
             reply.error(Errno::EBADF);
             return;
         };
@@ -694,7 +718,9 @@ impl Filesystem for ProtonFs {
             base_mtime,
             complete: authored == [(0, len)],
             authored,
-            based_on: self.core.remote_baseline(&uid, base_mtime, base_size),
+            based_on: self
+                .core
+                .remote_baseline(&uid, base_mtime, base_size, base_revision_id),
         };
         // A failed sidecar means the write is not durable, and `fsync` promising
         // otherwise is the defect this exists to fix — so it is an error, not a
@@ -887,7 +913,7 @@ impl Filesystem for ProtonFs {
                 }
             }
         } else {
-            match self.core.queue_local_node(&parent_uid, &name, true) {
+            match self.core.queue_local_node(&parent_uid, &name, true, false) {
                 Ok(n) => n,
                 Err(e) => {
                     reply.error(e);
@@ -1069,6 +1095,22 @@ impl Filesystem for ProtonFs {
                         &new_parent_uid,
                         &newname,
                     );
+                    // Finalize: a transient scratch file (its create parked, bytes
+                    // held back) renamed to a finished name is the moment the
+                    // completed file is meant to reach Drive. Un-park the create so
+                    // the drain uploads it once (docs/BUGS.md B70). Renaming to
+                    // another transient name leaves it parked.
+                    if is_transient_name(&name) && !is_transient_name(&newname) {
+                        match self.core.db.set_create_hold(&uid.to_string(), false) {
+                            Ok(_) => {
+                                self.core.wake_drain();
+                                debug!(%uid, newname, "un-parked a finalized transient create");
+                            }
+                            Err(e) => {
+                                warn!(%uid, error = %e, "un-parking a finalized transient create failed")
+                            }
+                        }
+                    }
                     debug!(%uid, newname, "renamed a node whose create is still queued");
                     reply.ok();
                 }

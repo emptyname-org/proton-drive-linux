@@ -1615,6 +1615,58 @@ fn next_due_op_skips_ops_blocked_on_a_local_parent() {
     assert_eq!(db.next_due_op(10).unwrap().unwrap().uid, "vol~link3");
 }
 
+/// B70: a transient file's create is parked so its bytes never upload while it
+/// wears that name, the park survives a write attaching its blob, and the
+/// finalize rename (un-park) is what finally makes the completed file due.
+#[test]
+fn a_parked_transient_create_stays_off_the_drain_until_finalized() {
+    let db = Db::open_in_memory().unwrap();
+    let node = uid("dl").to_string();
+    let parent = uid("root").to_string();
+    db.enqueue_op(&PendingOp {
+        id: 0,
+        kind: OP_CREATE.to_string(),
+        uid: node.clone(),
+        parent_uid: Some(parent),
+        name: Some("movie.mkv.part".to_string()),
+        blob_path: None,
+        meta_json: None,
+        created_at: 1,
+        attempts: 0,
+        last_error: None,
+        next_attempt_at: PARK_UNTIL,
+    })
+    .unwrap();
+
+    // Parked: never selected, however far the clock advances.
+    assert!(
+        db.next_due_op(PARK_UNTIL - 1).unwrap().is_none(),
+        "a parked create is never due"
+    );
+
+    // A write attaches its blob to the create but must not wake it.
+    let attached = db
+        .attach_blob_to_create(&node, "/staging/blob1", "{}")
+        .unwrap();
+    assert!(attached.is_some(), "the blob attached to the create");
+    assert!(
+        db.next_due_op(PARK_UNTIL - 1).unwrap().is_none(),
+        "still parked after a write attaches"
+    );
+
+    // Finalize: un-park, and the completed file is due to upload with its bytes.
+    assert!(
+        db.set_create_hold(&node, false).unwrap(),
+        "a create row was un-parked"
+    );
+    let due = db
+        .next_due_op(1_000)
+        .unwrap()
+        .expect("the un-parked create is due");
+    assert_eq!(due.uid, node);
+    assert_eq!(due.blob_path.as_deref(), Some("/staging/blob1"));
+}
+
 /// Backoff still gates: nothing is returned before an op is due.
 #[test]
 fn next_due_op_respects_backoff() {
@@ -1806,6 +1858,8 @@ fn test_db_has_children_and_trashed_filtering() {
             media_type: "text/plain".into(),
             total_size_on_storage: 10,
             active_revision_state: None,
+            active_revision_id: None,
+            content_sha1: None,
             claimed_size: Some(10),
             claimed_modification_time: None,
         },

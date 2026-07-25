@@ -63,6 +63,16 @@ pub fn op_supersedes(kind: &str) -> bool {
 /// drain replaces it with the uid the server assigns.
 pub const LOCAL_VOLUME: &str = "local";
 
+/// A `next_attempt_at` far enough in the future that [`Db::next_due_op`] never
+/// selects the op (ms since epoch, ≈ year 2223). Used to *park* a queued create
+/// for a transient file — a browser's in-flight `*.crdownload`/`*.part`, an
+/// editor's `*.swp` — so its bytes never upload while it wears that name. A
+/// rename to the finished name un-parks it (see [`Db::set_create_hold`]), which
+/// is the only moment the completed file is meant to reach Drive. Without the
+/// park, every partial and every abandoned temp would upload and, on a
+/// stall+resume, fork a `(sync-conflict)` copy (docs/BUGS.md B70).
+pub const PARK_UNTIL: i64 = 8_000_000_000_000;
+
 /// A mutation that has been accepted locally but not yet performed against the
 /// API — the durable half of the write-back queue (offline.md Phase 3).
 ///
@@ -183,11 +193,18 @@ impl Db {
         let Some((id, superseded)) = existing else {
             return Ok(None);
         };
+        // Clearing the backoff lets the fresh bytes be tried promptly — except
+        // when the create is *parked* (a transient file, next_attempt_at at the
+        // PARK_UNTIL sentinel). Attaching a new revision to a still-growing
+        // download must not wake it; only the finalize rename does. So preserve a
+        // park and reset an ordinary backoff.
         conn.execute(
             "UPDATE pending_op
-             SET blob_path = ?2, meta_json = ?3, attempts = 0, next_attempt_at = 0
+             SET blob_path = ?2, meta_json = ?3, attempts = 0,
+                 next_attempt_at = CASE WHEN next_attempt_at >= ?4
+                                        THEN next_attempt_at ELSE 0 END
              WHERE id = ?1",
-            params![id, blob_path, meta_json],
+            params![id, blob_path, meta_json, PARK_UNTIL],
         )?;
         Ok(Some(AttachedBlob { id, superseded }))
     }
@@ -229,6 +246,25 @@ impl Db {
             "UPDATE pending_op SET parent_uid = ?2, name = ?3
              WHERE uid = ?1 AND kind IN (?4, ?5)",
             params![uid, parent_uid, name, OP_CREATE, OP_MKDIR],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Park or un-park a queued create/mkdir for `uid`, returning whether a row
+    /// was touched.
+    ///
+    /// Parking sets `next_attempt_at` to [`PARK_UNTIL`] so [`Db::next_due_op`]
+    /// skips it indefinitely; un-parking sets it due now. Used to keep a
+    /// transient file's bytes off Drive until it is renamed to its finished name
+    /// (docs/BUGS.md B70). Un-parking a create that was never parked is harmless:
+    /// it just makes the create due immediately, which for a normal local node it
+    /// already is.
+    pub fn set_create_hold(&self, uid: &str, held: bool) -> Result<bool> {
+        let conn = self.conn.lock();
+        let n = conn.execute(
+            "UPDATE pending_op SET next_attempt_at = ?2
+             WHERE uid = ?1 AND kind IN (?3, ?4)",
+            params![uid, if held { PARK_UNTIL } else { 0 }, OP_CREATE, OP_MKDIR],
         )?;
         Ok(n > 0)
     }

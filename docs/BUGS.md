@@ -1159,6 +1159,8 @@ retracted.
 
 **Verified:** Clean build and 200/200 workspace tests passing.
 
+**Residual (2026-07-24):** the two-part defense narrowed the window but did not close it — the baseline was still keyed on `(mtime, size)`, which drifts when the server re-stamps the *same* revision. Reproduced again on a plain application save (`test_export.xml`): base mtime `1784897777` vs sealed `1784897780`, identical size, no other device involved. The root cause is that mtime is not a revision identity. Fixed properly by **B69**.
+
 ---
 
 ## B17 — FUSE mount lock contention, missing next_attempt_at in DB enqueue, and ioctl ENOTTY fix
@@ -2110,3 +2112,108 @@ the explicit remote-folder mapping. Repeated retries also add noisy warnings.
 rather than directly at the device root, reuse that folder by stable identity,
 and make backup health visible. Verify upload, replacement, restart restore, and
 byte-identical fresh-state recovery on a dedicated account.
+
+## B69 — Spurious `(sync-conflict)` copies from mtime-keyed revision identity (B16/B25 root fix)
+
+**Status:** Fixed in-tree 2026-07-25 — offline-tested; **live validation pending** (needs an SDK release, see below)
+**Found:** 2026-07-24, user reported `test_export (sync-conflict 1784898786).xml` created after a normal save from an application into the on-demand mount. A full-mount scan turned up ~156 conflict copies; 151 were byte-identical to their live sibling.
+**Where:** `crates/pdfs-fuse/src/{drain,filesystem,lib,state,sweep,sync,sync/planner}.rs`, `crates/pdfs-core/src/cache.rs`, `crates/pdfs-core/src/control.rs`; SDK `proton-drive-rs` `node.rs`/`client.rs`/`public_link.rs`.
+
+**Cause:** Two independent false-positive sources, both from `(mtime, size)` being used as a revision identity (the weakness B25 flagged; the recurrence B16 could not fully close):
+1. **Re-stamped mtime.** `revision_conflict` compared the queued write's baseline mtime against the remote's. The server stamps a sealed revision with its own commit time (`…780`), a few seconds off the optimistic time the client baselined at (`…777`). Same bytes, same size, drifted mtime → the drain diverted the write into a conflict copy of its own base.
+2. **First-sync of pre-existing files.** `plan_file` classified `(local, remote, no-baseline)` as `Conflict`, so the *first* reconcile of a folder cut a conflict copy of every file that already existed identically on both sides — the ~151-file storm, all in one ~40s window.
+
+**Fix:** Make conflict detection key on the server **revision id**, the true identity (it advances iff a new revision was sealed):
+1. **SDK** exposes `active_revision_id` and `content_sha1` (plaintext SHA-1 from the revision's decrypted `XAttr`) on `NodeKind::File` — both already on the wire / already decrypted, no extra round trips.
+2. **`Baseline`** gains `revision_id`, captured at write-open (`WriteHandle.base_revision_id`) and carried across supersede/rebaseline like the mtime. `revision_changed` (extracted, pure, unit-tested) trusts the id when both sides have it and only falls back to `(mtime, size)` for an old sidecar. A re-stamped mtime on the same id is no longer a conflict; a same-size edit by another device (new id) still is.
+3. **Planner** adds `FilePlan::AdoptBaseline`: a no-baseline pair of equal size is recorded into the baseline instead of conflicted. Divergent sizes stay a real conflict.
+4. **Auto-sweep** (`sweep.rs`, `pdfs-conflict-sweep` thread, 5-min cadence): removes conflict copies proven identical to their live sibling (equal size **and** equal `content_sha1`, trashing the copy remotely) and surfaces divergent/orphaned ones once as a new `ActivityKind::Conflict` entry. Never removes a copy it cannot prove is a duplicate.
+
+**Verified:** `proton-sdk-rs` 50/61 lib tests + clippy clean; client `cargo fmt`/`clippy -D warnings`/`cargo test --workspace --locked` all green (258 tests, incl. new `revision_changed`, planner `AdoptBaseline`, and `conflict_base_name` cases). The 151 identical copies were removed manually during triage; the 5 divergent ones are left for the user.
+
+**Shipping note (resolved 2026-07-25):** the client's revision-id/sha1 use depends on new SDK surface (`proton-sdk`/`proton-drive-rs` **0.2.2**). That version is now **published to crates.io**; the client's workspace deps were bumped `"0.2"` → `"0.2.2"`, the `Cargo.lock` re-resolved to the registry crates, and the local `[patch.crates-io]` shim removed. No local patch remains. (Live validation of the fix against a real account is still pending.)
+
+## B70 — Browser in-flight temp files uploaded and conflict-forked on the on-demand mount
+
+**Status:** Layers A + B fixed in-tree 2026-07-25 — offline-tested; **live validation pending**.
+**Found:** triaging the divergent conflict copies B69 left behind. In `~/Downloads`
+(an on-demand mount) the complete files had been forked into `(sync-conflict)`
+copies while their truncated partials kept the canonical name — e.g.
+`teamspeak.tar.gz` (30 MB partial live vs a 3.77 GB conflict copy) and `nils.zip`
+(17 MB vs 3.18 GB). The conflict copies were byte-exact to the user's independent
+gdrive backups, proving the *conflict copy* was the finished download and the
+*live* file the stub. The smoking gun: four `Unconfirmed NNNNN (sync-conflict …).crdownload`
+copies — Brave's in-flight temp files, forked *mid-download*. User confirmed the
+trigger: downloading with Brave directly into the on-demand folder, where a stall
++ "resume" is routine.
+**Where:** on-demand write path — `crates/pdfs-fuse/src/filesystem.rs` `release`
+(`queue_revision`, ~line 780) and `rename` (~line 933); drain seal in
+`crates/pdfs-fuse/src/drain.rs`. The existing ignore system
+(`crates/pdfs-core/src/syncignore.rs`, `DEFAULT_IGNORE_PATTERNS`) is wired **only**
+into mirror reconcile (`sync.rs`), so it never sees on-demand writes.
+
+**Cause:** A browser downloading into the mount writes a growing temp file
+(`*.crdownload`, or `*.part` for Firefox) and, on a stall, closes the fd. `release`
+hands every closed write to `queue_revision`, so a *partial* revision gets sealed
+as the canonical file. On resume the browser reopens and rewrites the full file;
+its baseline revision has moved (the client sealed the partial itself), so the
+drain diverts the finished bytes into a `(sync-conflict)` copy. Net: the stub wins
+the name, the real file is exiled to a conflict copy, and every abandoned
+`.crdownload` is uploaded as its own multi-hundred-MB node. Unlike B69 this is a
+*genuine* two-revision divergence, so B69's revision-id detection correctly refuses
+to auto-sweep it — the fix has to stop the fork from happening, not reconcile it
+after.
+
+**Fix — two layers, both without an SDK release (A stops transient names ever
+sealing; B stops a single-writer resume forking against its own seal):**
+
+- **A — transient names never seal a revision until finalized (done 2026-07-25).**
+  A new `syncignore::is_transient_name` recognises browser download temps
+  (`*.crdownload`/`*.part`/`*.partial`/`*.download`), generic scratch
+  (`*.tmp`/`*.temp`), editor swap/backup (`*.swp`/`*.swx`/`*~`), and office/lock
+  files (`.~lock.*`, `~$*`). On `create` (filesystem.rs) a transient name is kept
+  **purely local** — no empty remote node is minted — and its queued create is
+  **parked**: `next_attempt_at` is set to the new `PARK_UNTIL` sentinel so
+  `Db::next_due_op` never selects it. Written bytes still ride on that create via
+  the existing `attach_blob_to_create`, whose `next_attempt_at` reset now
+  *preserves* a park (SQL `CASE … >= PARK_UNTIL`), so a growing download attaches
+  revision after revision without ever waking the drain. The finalize `rename`
+  (`foo.crdownload → foo`) goes through the existing `is_local_uid` branch
+  (`rewrite_op_target` renames the queued create); when the old name was transient
+  and the new one is not, it calls `Db::set_create_hold(uid, false)` and wakes the
+  drain, so the *completed* file uploads exactly once. Net: no partial and no
+  abandoned temp ever reaches Drive, and nothing forks. Reuses the whole
+  create/attach/rename/drain pipeline — the only new surface is the predicate, the
+  `PARK_UNTIL` sentinel, `set_create_hold`, a `hold` arg on `queue_local_node`,
+  and the attach-preserves-park `CASE`. Tests: `syncignore` predicate cases +
+  `db::a_parked_transient_create_stays_off_the_drain_until_finalized`. No SDK
+  dependency.
+  - *Not yet covered by A:* apps that write the final name in place with **no**
+    temp suffix (rare), and Firefox multi-connection `.part` files that it may
+    rename per-segment — those still rely on B. An abandoned transient file (a
+    cancelled download left on disk) now stays local-only forever rather than
+    polluting Drive; a later janitor could reclaim its staged blob.
+- **B — don't self-conflict a single-writer sequential rewrite (done 2026-07-25,
+  no SDK dep).** The safety net for names A does not recognise (an app writing the
+  final name in place, Firefox per-segment `.part` renames, or any resume the
+  in-memory rebase machinery missed). The daemon now records the server revision
+  id it *itself* seals per node (`Core.own_sealed_revs`, written in
+  `refresh_after_upload` where the sealed node is already fetched, dropped on
+  trash). When a queued write drains and `revision_changed` fires,
+  `Core::revision_conflict` checks whether the remote sits at one of *our own*
+  sealed revisions (pure `is_own_self_supersede`): if so, no other device touched
+  the file — it is a single-writer stall→resume — so it chains (supersedes)
+  instead of forking a `(sync-conflict)` copy. Gated on `meta.complete`: an
+  incomplete blob's gaps still refer to the stale base, so it keeps the
+  non-destructive conflict-copy path. This is a superset guard over the existing
+  `refresh_after_upload`/`rebaseline_pending` rebasers, which only fire while a
+  handle/op is live; B catches the windows they miss (fresh open during the
+  earlier upload's flight, a stale inherited baseline). Tests: `is_own_self_supersede`
+  cases in `drain.rs`. *Residual:* the map is in-memory only, so a daemon restart
+  between the partial seal and the resume drops the record and that one write can
+  still fork — narrow, and B69's revision-id keying already covers the mtime-drift
+  half. A persisted own-seal ledger would close it.
+
+**Triage of the copies already made is done (2026-07-25):** all completed files
+were promoted back to their canonical names (metadata-only rename, no re-upload)
+and the abandoned `.crdownload` stubs trashed.

@@ -1002,6 +1002,7 @@ fn activity_verb(kind: pdfs_core::control::ActivityKind) -> &'static str {
         Share => "share",
         PublicLink => "link",
         Unshare => "unshare",
+        Conflict => "conflict",
     }
 }
 
