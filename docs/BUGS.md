@@ -2356,12 +2356,48 @@ correct behaviour for the first live pass is to trash nothing.
 
 ## B72 — `pdfs trash` never returns
 
-**Status:** Open — found 2026-07-26.
+**Status:** Hardened in-tree 2026-07-26 — the hang is gone by construction; the
+underlying slowness of the first refresh is still unmeasured (live-pending).
 **Found:** capturing a trash baseline before the B69/B70 live validation. `pdfs trash`
 produced no output and was still running when killed at 120 s. Daemon was healthy
 and every other CLI call (`pdfs sync list`, `pdfs --version`) returned promptly.
-**Where:** unconfirmed — either the `Request` handler in `crates/pdfs-fuse/src/control.rs`
-or the CLI's response read in `crates/pdfs-cli/src/main.rs`.
+**Where:** `Core::list_trash` (`crates/pdfs-fuse/src/lib.rs`). Not the CLI: the
+client's 120 s `READ_TIMEOUT` (`pdfs-core/src/control.rs`) is what ends the call,
+and the daemon never writes a response line.
+
+**Root cause.** The trash of this account had never been fetched successfully —
+`trash` table empty, no `trash_synced_ms` in `sync_state`. `list_trash` therefore
+always took its "never fetched → `rt.block_on(refresh_trash())`" branch, which:
+
+- materialized the *entire* trash in one `enumerate_nodes` call (one S2K unlock
+  per node) before persisting anything, so nothing was ever saved and no later
+  request could be served from the DB;
+- had no single-flight guard on that branch (only `spawn_trash_refresh` did), so
+  every attempt started another full refresh;
+- was never cancelled when the requester timed out, because the control handler
+  sits in `block_on` on its own thread and nothing signals it.
+
+So each look at the trash added a permanent, full-cost refresh to the daemon.
+Measured on the live daemon after a handful of GUI/CLI attempts: **11 stale
+`pdfs-control` threads**, RSS 2.9 GB. Concurrent with a drain backlog that was
+uploading conflict copies continuously (1991 `Conflict` activity rows, multi-GB
+uploads), none of the refreshes ever finished.
+
+**Fix (in-tree).** `list_trash` never blocks on the whole refresh: it kicks the
+single-flighted background refresh, waits at most `TRASH_FIRST_WAIT` (20 s, well
+under the front-end read timeout) on a `Notify`, and answers with whatever has
+materialized. `refresh_trash` now materializes in `TRASH_MATERIALIZE_CHUNK` (150)
+batches, persisting the cumulative listing after each one, and logs the uid count
+plus per-batch and total elapsed at INFO/DEBUG — previously the whole path was
+silent, which is why the stall could not be located from the journal.
+
+**Still open:** *why* one refresh is slow enough to matter. The new INFO lines
+(`trash refresh: enumerated` / `batch` / `done`) answer that on the next run:
+whether `enumerate_trash_node_uids` returns at all, how many nodes the trash
+holds, and the per-batch cost. If the count is large, materializing with
+`enumerate_nodes_light` (skips the per-file node-key S2K; `size` would fall back
+to on-storage size) is the next lever.
+
 **Impact:** the trash listing is the user's recovery path after any destructive
 operation, including the B71 sweep. It needs to work before the sweep is allowed
 to trash anything.

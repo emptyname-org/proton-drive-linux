@@ -209,6 +209,7 @@ pub fn mount(
         drain_wake: Arc::new((Mutex::new(false), Condvar::new())),
         timeline_refreshing: Arc::new(AtomicBool::new(false)),
         trash_refreshing: Arc::new(AtomicBool::new(false)),
+        trash_progress: Arc::new(tokio::sync::Notify::new()),
         conflict_notified: Arc::new(Mutex::new(HashSet::new())),
         sweep_mode,
         own_sealed_revs: Arc::new(Mutex::new(HashMap::new())),

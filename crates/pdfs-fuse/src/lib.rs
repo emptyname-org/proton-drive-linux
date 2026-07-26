@@ -151,6 +151,22 @@ const TIMELINE_ENRICH_CHUNK: usize = 200;
 /// one listing a user changes and then immediately looks at — though our own
 /// mutations also invalidate it outright, so this only covers other clients.
 const TRASH_TTL: Duration = Duration::from_secs(60);
+/// How many trashed nodes are materialized per
+/// [`ProtonDriveClient::enumerate_nodes`] call, and persisted as a batch. The
+/// trash of an account that has been through a conflict storm runs to thousands
+/// of nodes, each costing an S2K unlock, so a single all-or-nothing call can
+/// take minutes and lose everything it decrypted if it fails. Same value as the
+/// SDK's own `MAX_BATCH_COUNT`: one chunk is exactly one request.
+const TRASH_MATERIALIZE_CHUNK: usize = 150;
+/// How long a `ListTrash` request waits for a first-ever refresh before
+/// answering with whatever has materialized so far.
+///
+/// The refresh keeps running in the background either way — this bounds the
+/// *reply*, not the work. It has to stay well under the front-ends' 120 s
+/// control-socket read timeout (`pdfs_core::control`), because a request that
+/// outlives that timeout is a hang from the user's side: the client gives up,
+/// the user asks again, and the daemon accumulates another refresh.
+const TRASH_FIRST_WAIT: Duration = Duration::from_secs(20);
 
 /// `sync_state` keys for the freshness stamps of the two persisted listings, and
 /// for whether the account has a photos volume at all (so an account without one
@@ -240,6 +256,11 @@ struct Core {
     /// off one refresh rather than one per request.
     timeline_refreshing: Arc<AtomicBool>,
     trash_refreshing: Arc<AtomicBool>,
+    /// Fires whenever a trash refresh persists a batch or finishes, so a
+    /// `ListTrash` request waiting on a first-ever refresh wakes on progress
+    /// instead of polling or blocking for the whole run. See
+    /// [`Core::await_trash_refresh`].
+    trash_progress: Arc<tokio::sync::Notify>,
     /// Conflict copies the sweep has already flagged as needing attention this
     /// run, so a divergent `(sync-conflict …)` file is logged once rather than
     /// on every sweep pass. See [`Core::run_conflict_sweep_loop`].
@@ -2491,13 +2512,20 @@ impl Core {
     /// back at DB speed and is refreshed in the background past [`TRASH_TTL`].
     /// Our own trash mutations invalidate it outright (see
     /// [`Core::invalidate_trash`]), so the TTL only covers changes made elsewhere.
+    ///
+    /// The refresh always runs *off* the request: a never-fetched trash waits for
+    /// it, but only for [`TRASH_FIRST_WAIT`], and then answers with the batches
+    /// that have landed so far. Blocking the request on the whole refresh is what
+    /// made a large trash unlistable — the refresh outran the front-end's read
+    /// timeout, the user asked again, and each attempt left another full refresh
+    /// grinding in the daemon (`docs/BUGS.md` B72).
     fn list_trash(&self) -> CoreResult<Vec<DirEntry>> {
-        let stale = self.listing_stale(TRASH_SYNCED_MS, TRASH_TTL);
-        // Never fetched: this request has to wait for it.
-        if self.db.state_i64(TRASH_SYNCED_MS).ok().flatten().is_none() {
-            self.rt.block_on(self.refresh_trash())?;
-        } else if stale {
+        let never_fetched = self.db.state_i64(TRASH_SYNCED_MS).ok().flatten().is_none();
+        if never_fetched || self.listing_stale(TRASH_SYNCED_MS, TRASH_TTL) {
             self.spawn_trash_refresh();
+        }
+        if never_fetched {
+            self.await_trash_refresh(TRASH_FIRST_WAIT);
         }
 
         Ok(self
@@ -2521,36 +2549,68 @@ impl Core {
     }
 
     /// Re-fetch the trash listing from the server and persist it.
+    ///
+    /// Materialized in chunks of [`TRASH_MATERIALIZE_CHUNK`], each persisted as
+    /// it lands: decrypting a trashed node costs an S2K unlock, so a trash of a
+    /// few thousand nodes takes minutes, and an all-or-nothing write would throw
+    /// that away on the first failure and show the user nothing until the very
+    /// end. Every batch is a usable listing.
     async fn refresh_trash(&self) -> CoreResult<()> {
+        let started = Instant::now();
         let uids = self
             .client
             .enumerate_trash_node_uids()
             .await
             .map_err(|e| CoreError::from_api(&e, "enumerate trash"))?;
-        let nodes = if uids.is_empty() {
-            Vec::new()
-        } else {
-            self.client
-                .enumerate_nodes(&uids)
+        info!(
+            count = uids.len(),
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "trash refresh: enumerated"
+        );
+
+        if uids.is_empty() {
+            self.db.trash_replace(&[]).map_err(CoreError::from)?;
+        }
+        let mut items: Vec<StoredTrash> = Vec::with_capacity(uids.len());
+        for chunk in uids.chunks(TRASH_MATERIALIZE_CHUNK) {
+            let chunk_started = Instant::now();
+            let nodes = self
+                .client
+                .enumerate_nodes(chunk)
                 .await
-                .map_err(|e| CoreError::from_api(&e, "enumerate nodes"))?
-        };
-        let items: Vec<StoredTrash> = nodes
-            .into_iter()
-            .map(|node| StoredTrash {
+                .map_err(|e| CoreError::from_api(&e, "enumerate nodes"))?;
+            items.extend(nodes.into_iter().map(|node| StoredTrash {
                 uid: node.uid.to_string(),
                 name: node.name.clone(),
                 is_dir: node.is_folder(),
                 size: node_size(&node) as i64,
                 mtime: node.modification_time,
-            })
-            .collect();
-        self.db.trash_replace(&items).map_err(CoreError::from)?;
+            }));
+            // Cumulative, so the table is always a prefix of the real trash
+            // rather than a mix of this refresh and the last one.
+            self.db.trash_replace(&items).map_err(CoreError::from)?;
+            self.trash_progress.notify_waiters();
+            debug!(
+                materialized = items.len(),
+                total = uids.len(),
+                chunk_ms = chunk_started.elapsed().as_millis() as u64,
+                "trash refresh: batch"
+            );
+        }
+
         let _ = self.db.set_state_i64(TRASH_SYNCED_MS, now_ms());
+        info!(
+            count = items.len(),
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "trash refresh: done"
+        );
         Ok(())
     }
 
-    /// Refresh the trash off the request path. At most one refresh at a time.
+    /// Refresh the trash off the request path. At most one refresh at a time —
+    /// including the one a first-ever [`Core::list_trash`] waits on, so a burst
+    /// of requests against an unfetched trash joins one refresh instead of
+    /// starting one apiece.
     fn spawn_trash_refresh(&self) {
         if self.trash_refreshing.swap(true, Ordering::SeqCst) {
             return;
@@ -2561,6 +2621,38 @@ impl Core {
                 warn!(error = %e, "background trash refresh failed");
             }
             core.trash_refreshing.store(false, Ordering::SeqCst);
+            // After the flag, so a waiter that wakes on this sees it cleared.
+            core.trash_progress.notify_waiters();
+        });
+    }
+
+    /// Wait for the in-flight trash refresh to make progress, for at most
+    /// `budget`. Returns early when it finishes; never cancels it — the refresh
+    /// is a detached task, so giving up here costs the work nothing.
+    fn await_trash_refresh(&self, budget: Duration) {
+        let deadline = Instant::now() + budget;
+        self.rt.block_on(async {
+            while self.trash_refreshing.load(Ordering::SeqCst) {
+                let Some(left) = deadline.checked_duration_since(Instant::now()) else {
+                    break;
+                };
+                let notified = self.trash_progress.notified();
+                tokio::pin!(notified);
+                // Register before re-checking the flag: a refresh that finishes
+                // in between must not leave us waiting for a notify that has
+                // already fired.
+                notified.as_mut().enable();
+                if !self.trash_refreshing.load(Ordering::SeqCst) {
+                    break;
+                }
+                if tokio::time::timeout(left, notified).await.is_err() {
+                    warn!(
+                        budget_s = budget.as_secs(),
+                        "trash refresh still running; answering with what has materialized"
+                    );
+                    break;
+                }
+            }
         });
     }
 
