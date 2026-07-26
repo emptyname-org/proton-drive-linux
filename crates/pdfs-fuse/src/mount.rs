@@ -143,6 +143,15 @@ fn fetch_or_recall_root(
     }
 }
 
+/// Per-mount settings resolved from [`pdfs_core::config::AppConfig`] by the
+/// caller, so `mount` itself never reads config or the environment.
+pub struct MountOptions {
+    /// Proton account the session belongs to, for display and per-user paths.
+    pub username: String,
+    /// What the background conflict sweep may do. See `docs/BUGS.md` B71.
+    pub sweep_mode: SweepMode,
+}
+
 /// Mount the filesystem at `mountpoint` and block until it is unmounted or the
 /// daemon is asked to stop.
 ///
@@ -162,8 +171,12 @@ pub fn mount(
     cache: ContentCache,
     control_socket: &Path,
     db: Arc<Db>,
-    username: String,
+    options: MountOptions,
 ) -> std::io::Result<MountOutcome> {
+    let MountOptions {
+        username,
+        sweep_mode,
+    } = options;
     let (root, online) = fetch_or_recall_root(&client, &rt, &db)?;
     let scope = root.tree_event_scope_id();
 
@@ -197,6 +210,7 @@ pub fn mount(
         timeline_refreshing: Arc::new(AtomicBool::new(false)),
         trash_refreshing: Arc::new(AtomicBool::new(false)),
         conflict_notified: Arc::new(Mutex::new(HashSet::new())),
+        sweep_mode,
         own_sealed_revs: Arc::new(Mutex::new(HashMap::new())),
         thumb_gen: Arc::new(Mutex::new(HashSet::new())),
         no_thumbnail: Arc::new(Mutex::new(HashMap::new())),
@@ -231,7 +245,12 @@ pub fn mount(
     // Reconcile leftover `(sync-conflict …)` copies: drop the ones that turned
     // out identical to the live file, surface the ones that genuinely diverge.
     // Its own thread — it enumerates and trashes, and must never block a FUSE call.
-    {
+    // `Off` skips the thread entirely rather than starting an idle one, so the
+    // setting is verifiable from the outside (`ls /proc/<pid>/task/*/comm`).
+    if sweep_mode == SweepMode::Off {
+        info!("conflict sweep disabled by configuration");
+    } else {
+        info!(mode = ?sweep_mode, "conflict sweep enabled");
         let core = core.clone();
         std::thread::Builder::new()
             .name("pdfs-conflict-sweep".into())

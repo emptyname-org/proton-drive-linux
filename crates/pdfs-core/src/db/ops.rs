@@ -280,6 +280,22 @@ impl Db {
         Ok(count > 0)
     }
 
+    /// Check whether *any* op of any kind is queued against `uid`.
+    ///
+    /// Used as a safety interlock by callers that are about to remove a node
+    /// they only know about from a stale snapshot: a queued op means the user's
+    /// bytes are still owed an upload, and dropping it would discard the staged
+    /// blob that holds them (`docs/BUGS.md` B71).
+    pub fn has_any_op(&self, uid: &str) -> Result<bool> {
+        let conn = self.conn.lock();
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM pending_op WHERE uid = ?1",
+            params![uid],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
     /// Drop every op targeting a node **or anything queued beneath it**,
     /// returning the staged blobs they held so the caller can delete them.
     ///

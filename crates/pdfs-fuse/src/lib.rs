@@ -53,7 +53,7 @@ use fuser::{
     ReplyEntry, ReplyIoctl, ReplyOpen, ReplyWrite, Request, Session, TimeOrNow, WriteFlags,
 };
 use pdfs_core::cache::{BLOCK_SIZE, Baseline, ContentCache, StagedWrite};
-use pdfs_core::config::AppDirs;
+use pdfs_core::config::{AppDirs, SweepMode};
 use pdfs_core::control::{
     ActivityEntry, ActivityKind, DirEntry, ErrorKind, LocalHit, PhotoKind, PublicLinkInfo,
     SearchFilters, SearchHit, SearchSource, SyncFolderInfo, SyncPhase, SyncProgress,
@@ -95,7 +95,7 @@ mod upload;
 mod workers;
 use background::{run_event_sync, run_local_index};
 pub(crate) use mount::is_stale_mount;
-pub use mount::{MountOutcome, mount};
+pub use mount::{MountOptions, MountOutcome, mount};
 use mount::{SecondaryMount, clear_stale_mount, fuse_connection_id, umount_session_unblocked};
 use reads::{ReaderSlot, STREAM_BYPASS_MIN, StreamRing};
 use state::{Entry, Intervals, PendingRevision, State, WriteHandle};
@@ -243,6 +243,11 @@ struct Core {
     /// run, so a divergent `(sync-conflict …)` file is logged once rather than
     /// on every sweep pass. See [`Core::run_conflict_sweep_loop`].
     conflict_notified: Arc<Mutex<HashSet<NodeUid>>>,
+    /// Whether the conflict sweep may actually trash the duplicates it finds, or
+    /// only report them. Resolved once at mount from config + environment
+    /// ([`AppConfig::resolved_conflict_sweep`]); [`SweepMode::Off`] means the
+    /// sweep thread is never spawned at all. See `docs/BUGS.md` B71.
+    sweep_mode: SweepMode,
     /// The latest server revision id this daemon has itself sealed, keyed by
     /// node. A queued write whose baseline names an *earlier* revision would
     /// normally fork into a `(sync-conflict)` copy when the drain finds the

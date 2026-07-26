@@ -2115,7 +2115,7 @@ byte-identical fresh-state recovery on a dedicated account.
 
 ## B69 — Spurious `(sync-conflict)` copies from mtime-keyed revision identity (B16/B25 root fix)
 
-**Status:** Fixed in-tree 2026-07-25 — offline-tested; **live validation pending** (needs an SDK release, see below)
+**Status:** Fixed — offline-tested 2026-07-25, **live-validated 2026-07-26** (see below)
 **Found:** 2026-07-24, user reported `test_export (sync-conflict 1784898786).xml` created after a normal save from an application into the on-demand mount. A full-mount scan turned up ~156 conflict copies; 151 were byte-identical to their live sibling.
 **Where:** `crates/pdfs-fuse/src/{drain,filesystem,lib,state,sweep,sync,sync/planner}.rs`, `crates/pdfs-core/src/cache.rs`, `crates/pdfs-core/src/control.rs`; SDK `proton-drive-rs` `node.rs`/`client.rs`/`public_link.rs`.
 
@@ -2130,6 +2130,19 @@ byte-identical fresh-state recovery on a dedicated account.
 4. **Auto-sweep** (`sweep.rs`, `pdfs-conflict-sweep` thread, 5-min cadence): removes conflict copies proven identical to their live sibling (equal size **and** equal `content_sha1`, trashing the copy remotely) and surfaces divergent/orphaned ones once as a new `ActivityKind::Conflict` entry. Never removes a copy it cannot prove is a duplicate.
 
 **Verified:** `proton-sdk-rs` 50/61 lib tests + clippy clean; client `cargo fmt`/`clippy -D warnings`/`cargo test --workspace --locked` all green (258 tests, incl. new `revision_changed`, planner `AdoptBaseline`, and `conflict_base_name` cases). The 151 identical copies were removed manually during triage; the 5 divergent ones are left for the user.
+
+**Live validation (2026-07-26):** 1.1.0 installed over the production account (6
+FUSE mounts of real data), daemon restarted, sweep observed across its warmup pass
+and a full 5-minute interval. Pre-run snapshot: exactly 2 `(sync-conflict)` copies
+left on the account, both divergent in size *and* `content_sha1`, so the correct
+behaviour was to remove nothing. Result: **nothing removed** — the conflict
+manifest was byte-identical before and after, the activity feed gained zero
+`auto-removed duplicate` entries, and the copies were flagged `differs from …` as
+intended. (The 40 `trash` entries in the feed for that window are
+`trashed from the mount` — a previous FUSE-acceptance run's queued cleanup ops
+replaying through the drain, unrelated to the sweep.) The sweep's *removal* path
+therefore remains unexercised against a real account; it is now report-only by
+default (B71) precisely so that stays true until there is field evidence.
 
 **Shipping note (resolved 2026-07-25):** the client's revision-id/sha1 use depends on new SDK surface (`proton-sdk`/`proton-drive-rs` **0.2.2**). That version is now **published to crates.io**; the client's workspace deps were bumped `"0.2"` → `"0.2.2"`, the `Cargo.lock` re-resolved to the registry crates, and the local `[patch.crates-io]` shim removed. No local patch remains. (Live validation of the fix against a real account is still pending.)
 
@@ -2217,3 +2230,135 @@ sealing; B stops a single-writer resume forking against its own seal):**
 **Triage of the copies already made is done (2026-07-25):** all completed files
 were promoted back to their canonical names (metadata-only rename, no re-upload)
 and the abandoned `.crdownload` stubs trashed.
+
+## B71 — Conflict sweep is not production-ready (auto-trash loop, CRIT-13)
+
+**Status:** Blockers 1–4 fixed in-tree 2026-07-26; items 5–10 and the remaining
+cleanup still open. The sweep is safe to leave running (it is report-only by
+default and cannot trash anything until explicitly switched to `enforce`).
+**Where:** `crates/pdfs-fuse/src/sweep.rs`, spawn site `crates/pdfs-fuse/src/mount.rs`,
+config surface `crates/pdfs-core/src/config.rs`.
+
+The B69 fix (see above) shipped a `pdfs-conflict-sweep` thread that **trashes user
+files on the real Drive** from a background loop. The identity check itself is
+conservative (equal size *and* equal `content_sha1`, missing digest treated as
+divergent), but the machinery around it is not yet safe to run unattended. Review
+found the following, ordered by severity. Each is a separate defect; they are
+grouped because they gate the same feature.
+
+**Blockers (all fixed 2026-07-26 — the sweep may not trash anything without them):**
+
+1. **Data-loss race — trash-then-discard (CRIT).** `remove_conflict_copy`
+   (`sweep.rs:137-155`) trashes the node remotely and *then* calls
+   `discard_queued_ops(uid)`, which deletes the node's queued ops **and discards
+   their staged blobs** (`lib.rs:1544-1553`). The decision was made from the
+   `load_all()` snapshot taken at `sweep.rs:77`, with network round trips in
+   between. A user edit landing in that window is destroyed — the queued write is
+   dropped and its staged bytes, which may be the only copy, are discarded. This
+   violates the invariant that `staging/` is never purged. *Fix:* re-read the node
+   from the DB and re-verify `active_revision_id` immediately before trashing;
+   skip the node outright if `Core.pending` or the op table has any entry for it;
+   never let the sweep discard staged bytes.
+2. **No kill-switch (CRIT).** `mount.rs:234-239` spawns the loop unconditionally.
+   There is no `AppConfig` field and no environment override, so the only way to
+   stop a destructive background loop is to uninstall. *Fix:* add
+   `AppConfig.conflict_sweep: Option<bool>` (same `Option` idiom as `cache_budget`
+   / `ignore_patterns`), a `PDFS_CONFLICT_SWEEP=off` override for support, and a
+   Settings toggle.
+3. **Open handles ignored (HIGH).** Nothing checks for a live file handle before
+   `forget_or_unlink` + `evict_reader`, so the sweep can trash a node a reader
+   currently has open. *Fix:* skip nodes with open handles.
+4. **Enforcing on day one (HIGH, process).** The sweep exists because B69 proved
+   the previous revision-identity check was wrong; betting deletion on the
+   *replacement* check in the same release, with no field evidence, is the wrong
+   order. *Fix:* ship report-only (log `would-trash` plus the existing
+   `ActivityKind::Conflict`), collect a release cycle of real logs, then flip to
+   enforcing.
+
+**Fix for 1–4 (landed 2026-07-26):**
+
+- **`SweepMode`** (`pdfs-core/src/config.rs`) — `Off` / `Report` / `Enforce`,
+  serialised into `AppConfig.conflict_sweep` (`#[serde(default)]`, so configs
+  predating the field still load). `Default` is **`Report`**, which is blocker 4:
+  an existing install that has never heard of the setting cannot get the
+  enforcing behaviour on upgrade. `AppConfig::resolved_conflict_sweep` layers
+  `PDFS_CONFLICT_SWEEP` over the stored value; the precedence is a pure
+  `resolve_sweep_mode(env, stored)` so it is testable without mutating process
+  state. An unparseable value falls through to the config rather than guessing a
+  mode in either direction.
+- **Spawn gate** (`mount.rs`) — `SweepMode::Off` skips the thread entirely rather
+  than starting an idle one, so the setting is verifiable from outside the
+  process (`ls /proc/<pid>/task/*/comm`). Both branches log the resolved mode at
+  startup. `mount` grew past clippy's argument limit, so `username` +
+  `sweep_mode` moved into a `MountOptions` struct resolved by the caller —
+  `mount` still reads neither config nor environment.
+- **Interlocks** (`sweep.rs::duplicate_still_removable`) — re-checks, immediately
+  before the destructive call, everything the pass decided from its stale
+  snapshot: no queued op (new `Db::has_any_op`, a cheap `COUNT` — a queued op
+  means bytes are owed an upload and `discard_queued_ops` would throw away the
+  staged blob holding them), no open write handle or shared scratch file
+  (`Core::is_busy`, checking `active_writes` + `handles` under one `State` lock),
+  and the node still at the same revision id, size, digest, name, parent and
+  untrashed state. Any doubt — including a failed DB read — means leave it alone:
+  a copy that survives to the next pass costs nothing, a wrongly removed one
+  costs data. This is blockers 1 and 3.
+- **Testability** — the decision moved into a pure
+  `decide(node, sibling, base, mode) -> SweepAction`, the same extraction used
+  for `revision_changed` and `is_own_self_supersede`; everything that can fail or
+  race stays in the caller. Tests now cover removal-when-enforcing,
+  report-mode-never-removes, size-differs, digest-differs, missing-digest in both
+  directions, and orphaned copies. Gate: `cargo fmt` / `clippy -D warnings` clean,
+  `cargo test --workspace` 282 passed (was 270).
+
+**Should fix:**
+
+5. **`load_all()` every pass (MED).** Each 300 s pass pulls the entire node table
+   into a `Vec<StoredNode>` and builds a full `(parent, name)` `HashMap`. *Fix:*
+   query only conflict-named rows (`name LIKE '% (sync-conflict %'`) and look up
+   siblings per parent — O(conflicts), not O(drive).
+6. **No batching or per-pass cap (MED).** The B69 incident produced 151 copies;
+   that is 151 sequential `trash_nodes` calls in one pass with no cap and no
+   backoff. `trash_nodes` takes a slice — batch it and cap per pass.
+7. **`online` sampled once per pass (MED).** Read at `sweep.rs:100`, ahead of a
+   loop that does network I/O; going offline mid-pass yields a long run of failing
+   calls. *Fix:* bail on the first transport error.
+8. **Ambiguous sibling index (MED).** `by_parent_name.insert` (`sweep.rs:97`) is
+   last-write-wins, so with duplicate `(parent, name)` rows the surviving entry
+   depends on `load_all` row order. *Fix:* make the choice deterministic or skip
+   ambiguous parents.
+9. **Trashed ancestors (LOW).** A copy under a trashed folder finds no live
+   sibling and is flagged "orphaned", spamming the activity feed. *Fix:* skip
+   nodes with a trashed ancestor.
+10. **SHA-1 provenance unverified (MED).** `is_identical` (`sweep.rs:181`)
+    compares digests without asserting they belong to the current
+    `active_revision_id`. A stale `XAttr` digest from an earlier revision plus a
+    size collision would delete real data. (The *missing* digest case is already
+    handled correctly.)
+
+**Also required to close:**
+
+- **Tests.** The *policy* is now covered via the pure `decide` (see above). Still
+  untested are the *interlocks*, which need a `Core`: pending-op→skip,
+  open-handle→skip, revision-moved→skip, offline→skip. Those want a test harness
+  that can build a `Core` against a temp DB and a stub client.
+- **`conflict_notified` is unbounded.** `HashSet<NodeUid>` that only grows except
+  on trash (`sweep.rs:157,170`).
+- **Docs.** `docs/ARCHITECTURE.md` thread map does not list `pdfs-conflict-sweep`;
+  `docs/RECOVERY.md` needs a "the sweep trashed a file, recover it from Proton
+  trash" path.
+
+**Mitigating context from the 2026-07-26 pre-run snapshot:** the account had only
+2 conflict copies left, both divergent in size *and* `content_sha1`, so the
+correct behaviour for the first live pass is to trash nothing.
+
+## B72 — `pdfs trash` never returns
+
+**Status:** Open — found 2026-07-26.
+**Found:** capturing a trash baseline before the B69/B70 live validation. `pdfs trash`
+produced no output and was still running when killed at 120 s. Daemon was healthy
+and every other CLI call (`pdfs sync list`, `pdfs --version`) returned promptly.
+**Where:** unconfirmed — either the `Request` handler in `crates/pdfs-fuse/src/control.rs`
+or the CLI's response read in `crates/pdfs-cli/src/main.rs`.
+**Impact:** the trash listing is the user's recovery path after any destructive
+operation, including the B71 sweep. It needs to work before the sweep is allowed
+to trash anything.

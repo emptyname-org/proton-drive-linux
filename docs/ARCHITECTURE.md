@@ -225,6 +225,7 @@ The background daemon relies on the following thread topology:
 3. **IPC listener Thread:** Listens on the Unix socket and admits at most 64 concurrent, timeout-bound handlers for front-end status/configuration requests.
 4. **Sync Engine Loop Thread:** Serializes sync runs. Wakes on debounced local inotify filesystem changes, remote polling intervals, or manual user requests.
 5. **Drain Queue Worker Thread:** Processes staged writes (`PendingOp`) sequentially, uploading revisions and retrying with exponential backoff on failures.
+6. **Conflict Sweep Thread (`pdfs-conflict-sweep`, optional):** Reconciles leftover `(sync-conflict …)` copies — 30 s warmup, then one pass every 5 minutes. A copy proven identical to its live sibling (equal size **and** equal `content_sha1`) is redundant; anything it cannot prove identical is surfaced to the activity feed and left alone. Governed by `AppConfig.conflict_sweep` / `PDFS_CONFLICT_SWEEP` (`SweepMode`): **report-only by default**, `off` skips the thread entirely, and only `enforce` lets it trash. Because it deletes, the enforcing path re-verifies revision id, size, digest, name, parent, queued ops and open handles immediately before acting rather than trusting its own pass-start snapshot. See `docs/BUGS.md` B69 and B71.
 
 ---
 

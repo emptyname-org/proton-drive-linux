@@ -21,11 +21,12 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
+use pdfs_core::config::SweepMode;
 use pdfs_core::control::ActivityKind;
 use proton_drive_rs::proton_sdk::ids::NodeUid;
 use tracing::{debug, info, warn};
 
-use super::{Core, node_content_sha1, node_size};
+use super::{Core, node_content_sha1, node_revision_id, node_size};
 
 /// Time between sweeps. Conflicts are rare and non-urgent; a slow cadence keeps
 /// the sweep off the hot path while still cleaning up within a few minutes.
@@ -112,29 +113,35 @@ impl Core {
                 .unwrap_or_default();
             let sibling = by_parent_name.get(&(parent, base.as_str())).copied();
 
-            match sibling {
-                Some(sib) if is_identical(node, sib) => {
-                    // Redundant duplicate — remove it, but only while online (the
-                    // remote trash is the point). Offline, it waits for a later pass.
+            match decide(node, sibling, &base, self.sweep_mode) {
+                SweepAction::Remove => {
+                    // Only while online — the remote trash is the point. Offline,
+                    // it waits for a later pass.
                     if online {
-                        self.remove_conflict_copy(&node.uid, &node.name, &base);
+                        self.remove_conflict_copy(node, &base);
                     }
                 }
-                Some(_) => {
-                    self.flag_conflict(&node.uid, &node.name, format!("differs from {base}"))
-                }
-                None => self.flag_conflict(
-                    &node.uid,
-                    &node.name,
-                    format!("no original {base} to reconcile against"),
-                ),
+                SweepAction::Flag(detail) => self.flag_conflict(&node.uid, &node.name, detail),
             }
         }
     }
 
     /// Trash a conflict copy proven identical to its live sibling, and unhook it
     /// locally — the same sequence the interactive unlink path uses after a trash.
-    fn remove_conflict_copy(&self, uid: &NodeUid, name: &str, base: &str) {
+    ///
+    /// `snapshot` is the node as the pass saw it, which by now is stale: the pass
+    /// enumerated every node up front and has been doing network I/O since. Before
+    /// touching anything remote this re-reads the node and refuses to act unless
+    /// it is *still* the same revision, still untrashed, still unwritten and still
+    /// unopened. Without that, a user edit landing inside the window is destroyed
+    /// — `discard_queued_ops` below drops the queued write *and its staged blob*,
+    /// which may hold the only copy of those bytes (`docs/BUGS.md` B71).
+    fn remove_conflict_copy(&self, snapshot: &proton_drive_rs::Node, base: &str) {
+        let uid = &snapshot.uid;
+        let name = snapshot.name.as_str();
+        if !self.duplicate_still_removable(snapshot) {
+            return;
+        }
         match self
             .rt
             .block_on(self.client.trash_nodes(std::slice::from_ref(uid)))
@@ -164,6 +171,75 @@ impl Core {
         info!(%uid, name, base, "conflict sweep: removed identical conflict copy");
     }
 
+    /// Re-check, immediately before the destructive call, everything the pass
+    /// decided from its stale snapshot. Any doubt means "leave it alone": a
+    /// conflict copy that survives to the next pass costs nothing, a wrongly
+    /// removed one costs the user data.
+    fn duplicate_still_removable(&self, snapshot: &proton_drive_rs::Node) -> bool {
+        let uid = &snapshot.uid;
+        let name = snapshot.name.as_str();
+
+        // A queued op means bytes are still owed an upload. `discard_queued_ops`
+        // would throw those away along with the staged blob holding them.
+        match self.db.has_any_op(&uid.to_string()) {
+            Ok(false) => {}
+            Ok(true) => {
+                debug!(%uid, name, "conflict sweep: skipping duplicate with queued ops");
+                return false;
+            }
+            // Cannot prove the queue is empty — assume it is not.
+            Err(e) => {
+                warn!(%uid, name, error = ?e, "conflict sweep: op check failed; skipping");
+                return false;
+            }
+        }
+
+        // Someone is writing to it, or holds it open. Trashing now would pull the
+        // node out from under a live handle.
+        if self.is_busy(uid) {
+            debug!(%uid, name, "conflict sweep: skipping duplicate that is open or being written");
+            return false;
+        }
+
+        // Finally, the node itself must not have moved on since the snapshot.
+        match self.db.node_by_uid(&uid.to_string()) {
+            Ok(Some(fresh)) => {
+                if fresh.trashed {
+                    return false;
+                }
+                if fresh.name != snapshot.name || fresh.parent_uid != snapshot.parent_uid {
+                    debug!(%uid, name, "conflict sweep: duplicate was renamed or moved; skipping");
+                    return false;
+                }
+                if node_revision_id(&fresh) != node_revision_id(snapshot)
+                    || node_size(&fresh) != node_size(snapshot)
+                    || node_content_sha1(&fresh) != node_content_sha1(snapshot)
+                {
+                    debug!(%uid, name, "conflict sweep: duplicate changed since the pass began");
+                    return false;
+                }
+                true
+            }
+            // Already gone locally, or unreadable — either way, not ours to remove.
+            Ok(None) => false,
+            Err(e) => {
+                warn!(%uid, name, error = ?e, "conflict sweep: re-read failed; skipping");
+                false
+            }
+        }
+    }
+
+    /// Whether a node has a write in flight or a file handle open against it.
+    /// Read-only opens use fh 0 and are not tracked, so this is specifically the
+    /// writer/holder check.
+    fn is_busy(&self, uid: &NodeUid) -> bool {
+        let state = self.state.lock();
+        let Some(&ino) = state.by_uid.get(uid) else {
+            return false;
+        };
+        state.active_writes.contains_key(&ino) || state.handles.values().any(|&held| held == ino)
+    }
+
     /// Surface a conflict copy that needs the user's attention, at most once per
     /// daemon run so the activity feed is not spammed each pass.
     fn flag_conflict(&self, uid: &NodeUid, name: &str, detail: String) {
@@ -172,6 +248,46 @@ impl Core {
         }
         debug!(%uid, name, detail, "conflict sweep: flagged divergent conflict copy");
         self.log_activity(ActivityKind::Conflict, name, detail, false);
+    }
+}
+
+/// What the sweep concluded about one `(sync-conflict …)` copy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SweepAction {
+    /// Provably redundant: trash it, subject to the runtime interlocks in
+    /// [`Core::duplicate_still_removable`].
+    Remove,
+    /// Only the user can resolve this one; surface it with this detail.
+    Flag(String),
+}
+
+/// Decide what to do about conflict copy `node` given its live sibling (if any)
+/// and the configured `mode`.
+///
+/// Pure, so the policy that governs deletion is testable without a mount, a
+/// runtime, or an account — the same split used for `revision_changed` and
+/// `is_own_self_supersede`. Everything that can fail or race lives in the caller.
+fn decide(
+    node: &proton_drive_rs::Node,
+    sibling: Option<&proton_drive_rs::Node>,
+    base: &str,
+    mode: SweepMode,
+) -> SweepAction {
+    match sibling {
+        Some(sib) if is_identical(node, sib) => {
+            if mode.is_enforcing() {
+                SweepAction::Remove
+            } else {
+                // Report-only: say what would happen, remove nothing. The point is
+                // to accumulate field evidence that the identity check is right
+                // before it is trusted with deletion (docs/BUGS.md B71).
+                SweepAction::Flag(format!(
+                    "identical to {base}; would be removed (sweep is report-only)"
+                ))
+            }
+        }
+        Some(_) => SweepAction::Flag(format!("differs from {base}")),
+        None => SweepAction::Flag(format!("no original {base} to reconcile against")),
     }
 }
 
@@ -191,6 +307,113 @@ fn is_identical(a: &proton_drive_rs::Node, b: &proton_drive_rs::Node) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proton_drive_rs::NodeKind;
+    use proton_drive_rs::proton_sdk::ids::{LinkId, VolumeId};
+
+    /// A file node with the two fields the sweep's identity check reads.
+    fn file(name: &str, size: i64, sha1: Option<&str>) -> proton_drive_rs::Node {
+        proton_drive_rs::Node {
+            uid: NodeUid::new(VolumeId::from("v"), LinkId::from(name)),
+            parent_uid: None,
+            kind: NodeKind::File {
+                media_type: "text/plain".into(),
+                total_size_on_storage: size,
+                active_revision_state: None,
+                active_revision_id: Some("rev".into()),
+                claimed_size: Some(size),
+                claimed_modification_time: None,
+                content_sha1: sha1.map(String::from),
+            },
+            name: name.into(),
+            creation_time: 0,
+            modification_time: 0,
+            trashed: false,
+            is_shared: false,
+            is_shared_publicly: false,
+            signature_email: None,
+            verification: Default::default(),
+        }
+    }
+
+    /// The only input shape that may ever produce a removal: same size, same
+    /// present digest, live sibling, enforcing mode.
+    #[test]
+    fn removes_only_a_provably_identical_copy_when_enforcing() {
+        let copy = file("f (sync-conflict 1).txt", 100, Some("aaa"));
+        let live = file("f.txt", 100, Some("aaa"));
+        assert_eq!(
+            decide(&copy, Some(&live), "f.txt", SweepMode::Enforce),
+            SweepAction::Remove
+        );
+    }
+
+    #[test]
+    fn report_only_never_removes_but_still_says_what_it_would_do() {
+        let copy = file("f (sync-conflict 1).txt", 100, Some("aaa"));
+        let live = file("f.txt", 100, Some("aaa"));
+        // Same inputs as the removal case above; only the mode differs.
+        let SweepAction::Flag(detail) = decide(&copy, Some(&live), "f.txt", SweepMode::Report)
+        else {
+            panic!("report mode must never remove");
+        };
+        assert!(detail.contains("would be removed"), "{detail}");
+        assert!(detail.contains("report-only"), "{detail}");
+    }
+
+    #[test]
+    fn a_differing_size_is_a_real_conflict() {
+        let copy = file("f (sync-conflict 1).txt", 101, Some("aaa"));
+        let live = file("f.txt", 100, Some("aaa"));
+        assert_eq!(
+            decide(&copy, Some(&live), "f.txt", SweepMode::Enforce),
+            SweepAction::Flag("differs from f.txt".into())
+        );
+    }
+
+    #[test]
+    fn a_missing_digest_is_never_proof_of_identity() {
+        // Equal sizes are not enough: two different 100-byte files are common.
+        // A copy the sweep cannot fingerprint must survive, in either direction.
+        for (a, b) in [(None, Some("aaa")), (Some("aaa"), None), (None, None)] {
+            let copy = file("f (sync-conflict 1).txt", 100, a);
+            let live = file("f.txt", 100, b);
+            assert_eq!(
+                decide(&copy, Some(&live), "f.txt", SweepMode::Enforce),
+                SweepAction::Flag("differs from f.txt".into()),
+                "{a:?} vs {b:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_differing_digest_at_equal_size_is_a_real_conflict() {
+        let copy = file("f (sync-conflict 1).txt", 100, Some("aaa"));
+        let live = file("f.txt", 100, Some("bbb"));
+        assert_eq!(
+            decide(&copy, Some(&live), "f.txt", SweepMode::Enforce),
+            SweepAction::Flag("differs from f.txt".into())
+        );
+    }
+
+    #[test]
+    fn an_orphaned_copy_is_surfaced_not_removed() {
+        // No live original left to reconcile against — the copy may be the only
+        // surviving version of the file, so it is never the sweep's to remove.
+        let copy = file("f (sync-conflict 1).txt", 100, Some("aaa"));
+        assert_eq!(
+            decide(&copy, None, "f.txt", SweepMode::Enforce),
+            SweepAction::Flag("no original f.txt to reconcile against".into())
+        );
+    }
+
+    #[test]
+    fn identity_needs_both_size_and_digest_to_match() {
+        let a = file("a", 100, Some("aaa"));
+        assert!(is_identical(&a, &file("b", 100, Some("aaa"))));
+        assert!(!is_identical(&a, &file("b", 101, Some("aaa"))));
+        assert!(!is_identical(&a, &file("b", 100, Some("bbb"))));
+        assert!(!is_identical(&a, &file("b", 100, None)));
+    }
 
     #[test]
     fn parses_conflict_names_and_leaves_others_alone() {
