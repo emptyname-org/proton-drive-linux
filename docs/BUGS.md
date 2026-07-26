@@ -1159,6 +1159,8 @@ retracted.
 
 **Verified:** Clean build and 200/200 workspace tests passing.
 
+**Residual (2026-07-24):** the two-part defense narrowed the window but did not close it — the baseline was still keyed on `(mtime, size)`, which drifts when the server re-stamps the *same* revision. Reproduced again on a plain application save (`test_export.xml`): base mtime `1784897777` vs sealed `1784897780`, identical size, no other device involved. The root cause is that mtime is not a revision identity. Fixed properly by **B69**.
+
 ---
 
 ## B17 — FUSE mount lock contention, missing next_attempt_at in DB enqueue, and ioctl ENOTTY fix
@@ -2110,3 +2112,537 @@ the explicit remote-folder mapping. Repeated retries also add noisy warnings.
 rather than directly at the device root, reuse that folder by stable identity,
 and make backup health visible. Verify upload, replacement, restart restore, and
 byte-identical fresh-state recovery on a dedicated account.
+
+## B69 — Spurious `(sync-conflict)` copies from mtime-keyed revision identity (B16/B25 root fix)
+
+**Status:** Fixed — offline-tested 2026-07-25, **live-validated 2026-07-26** (see below)
+**Found:** 2026-07-24, user reported `test_export (sync-conflict 1784898786).xml` created after a normal save from an application into the on-demand mount. A full-mount scan turned up ~156 conflict copies; 151 were byte-identical to their live sibling.
+**Where:** `crates/pdfs-fuse/src/{drain,filesystem,lib,state,sweep,sync,sync/planner}.rs`, `crates/pdfs-core/src/cache.rs`, `crates/pdfs-core/src/control.rs`; SDK `proton-drive-rs` `node.rs`/`client.rs`/`public_link.rs`.
+
+**Cause:** Two independent false-positive sources, both from `(mtime, size)` being used as a revision identity (the weakness B25 flagged; the recurrence B16 could not fully close):
+1. **Re-stamped mtime.** `revision_conflict` compared the queued write's baseline mtime against the remote's. The server stamps a sealed revision with its own commit time (`…780`), a few seconds off the optimistic time the client baselined at (`…777`). Same bytes, same size, drifted mtime → the drain diverted the write into a conflict copy of its own base.
+2. **First-sync of pre-existing files.** `plan_file` classified `(local, remote, no-baseline)` as `Conflict`, so the *first* reconcile of a folder cut a conflict copy of every file that already existed identically on both sides — the ~151-file storm, all in one ~40s window.
+
+**Fix:** Make conflict detection key on the server **revision id**, the true identity (it advances iff a new revision was sealed):
+1. **SDK** exposes `active_revision_id` and `content_sha1` (plaintext SHA-1 from the revision's decrypted `XAttr`) on `NodeKind::File` — both already on the wire / already decrypted, no extra round trips.
+2. **`Baseline`** gains `revision_id`, captured at write-open (`WriteHandle.base_revision_id`) and carried across supersede/rebaseline like the mtime. `revision_changed` (extracted, pure, unit-tested) trusts the id when both sides have it and only falls back to `(mtime, size)` for an old sidecar. A re-stamped mtime on the same id is no longer a conflict; a same-size edit by another device (new id) still is.
+3. **Planner** adds `FilePlan::AdoptBaseline`: a no-baseline pair of equal size is recorded into the baseline instead of conflicted. Divergent sizes stay a real conflict.
+4. **Auto-sweep** (`sweep.rs`, `pdfs-conflict-sweep` thread, 5-min cadence): removes conflict copies proven identical to their live sibling (equal size **and** equal `content_sha1`, trashing the copy remotely) and surfaces divergent/orphaned ones once as a new `ActivityKind::Conflict` entry. Never removes a copy it cannot prove is a duplicate.
+
+**Verified:** `proton-sdk-rs` 50/61 lib tests + clippy clean; client `cargo fmt`/`clippy -D warnings`/`cargo test --workspace --locked` all green (258 tests, incl. new `revision_changed`, planner `AdoptBaseline`, and `conflict_base_name` cases). The 151 identical copies were removed manually during triage; the 5 divergent ones are left for the user.
+
+**Live validation (2026-07-26):** 1.1.0 installed over the production account (6
+FUSE mounts of real data), daemon restarted, sweep observed across its warmup pass
+and a full 5-minute interval. Pre-run snapshot: exactly 2 `(sync-conflict)` copies
+left on the account, both divergent in size *and* `content_sha1`, so the correct
+behaviour was to remove nothing. Result: **nothing removed** — the conflict
+manifest was byte-identical before and after, the activity feed gained zero
+`auto-removed duplicate` entries, and the copies were flagged `differs from …` as
+intended. (The 40 `trash` entries in the feed for that window are
+`trashed from the mount` — a previous FUSE-acceptance run's queued cleanup ops
+replaying through the drain, unrelated to the sweep.) The sweep's *removal* path
+therefore remains unexercised against a real account; it is now report-only by
+default (B71) precisely so that stays true until there is field evidence.
+
+**Shipping note (resolved 2026-07-25):** the client's revision-id/sha1 use depends on new SDK surface (`proton-sdk`/`proton-drive-rs` **0.2.2**). That version is now **published to crates.io**; the client's workspace deps were bumped `"0.2"` → `"0.2.2"`, the `Cargo.lock` re-resolved to the registry crates, and the local `[patch.crates-io]` shim removed. No local patch remains. (Live validation of the fix against a real account is still pending.)
+
+## B70 — Browser in-flight temp files uploaded and conflict-forked on the on-demand mount
+
+**Status:** Layers A + B fixed in-tree 2026-07-25 — **live-validated 2026-07-26**.
+Validation was blocked until B74 was fixed (its scenario ends in a rename, which
+B74 made read back as empty); with that out of the way the acceptance case
+`regression B70: transient download name is not sealed` passes live.
+**Found:** triaging the divergent conflict copies B69 left behind. In `~/Downloads`
+(an on-demand mount) the complete files had been forked into `(sync-conflict)`
+copies while their truncated partials kept the canonical name — e.g.
+`teamspeak.tar.gz` (30 MB partial live vs a 3.77 GB conflict copy) and `nils.zip`
+(17 MB vs 3.18 GB). The conflict copies were byte-exact to the user's independent
+gdrive backups, proving the *conflict copy* was the finished download and the
+*live* file the stub. The smoking gun: four `Unconfirmed NNNNN (sync-conflict …).crdownload`
+copies — Brave's in-flight temp files, forked *mid-download*. User confirmed the
+trigger: downloading with Brave directly into the on-demand folder, where a stall
++ "resume" is routine.
+**Where:** on-demand write path — `crates/pdfs-fuse/src/filesystem.rs` `release`
+(`queue_revision`, ~line 780) and `rename` (~line 933); drain seal in
+`crates/pdfs-fuse/src/drain.rs`. The existing ignore system
+(`crates/pdfs-core/src/syncignore.rs`, `DEFAULT_IGNORE_PATTERNS`) is wired **only**
+into mirror reconcile (`sync.rs`), so it never sees on-demand writes.
+
+**Cause:** A browser downloading into the mount writes a growing temp file
+(`*.crdownload`, or `*.part` for Firefox) and, on a stall, closes the fd. `release`
+hands every closed write to `queue_revision`, so a *partial* revision gets sealed
+as the canonical file. On resume the browser reopens and rewrites the full file;
+its baseline revision has moved (the client sealed the partial itself), so the
+drain diverts the finished bytes into a `(sync-conflict)` copy. Net: the stub wins
+the name, the real file is exiled to a conflict copy, and every abandoned
+`.crdownload` is uploaded as its own multi-hundred-MB node. Unlike B69 this is a
+*genuine* two-revision divergence, so B69's revision-id detection correctly refuses
+to auto-sweep it — the fix has to stop the fork from happening, not reconcile it
+after.
+
+**Fix — two layers, both without an SDK release (A stops transient names ever
+sealing; B stops a single-writer resume forking against its own seal):**
+
+- **A — transient names never seal a revision until finalized (done 2026-07-25).**
+  A new `syncignore::is_transient_name` recognises browser download temps
+  (`*.crdownload`/`*.part`/`*.partial`/`*.download`), generic scratch
+  (`*.tmp`/`*.temp`), editor swap/backup (`*.swp`/`*.swx`/`*~`), and office/lock
+  files (`.~lock.*`, `~$*`). On `create` (filesystem.rs) a transient name is kept
+  **purely local** — no empty remote node is minted — and its queued create is
+  **parked**: `next_attempt_at` is set to the new `PARK_UNTIL` sentinel so
+  `Db::next_due_op` never selects it. Written bytes still ride on that create via
+  the existing `attach_blob_to_create`, whose `next_attempt_at` reset now
+  *preserves* a park (SQL `CASE … >= PARK_UNTIL`), so a growing download attaches
+  revision after revision without ever waking the drain. The finalize `rename`
+  (`foo.crdownload → foo`) goes through the existing `is_local_uid` branch
+  (`rewrite_op_target` renames the queued create); when the old name was transient
+  and the new one is not, it calls `Db::set_create_hold(uid, false)` and wakes the
+  drain, so the *completed* file uploads exactly once. Net: no partial and no
+  abandoned temp ever reaches Drive, and nothing forks. Reuses the whole
+  create/attach/rename/drain pipeline — the only new surface is the predicate, the
+  `PARK_UNTIL` sentinel, `set_create_hold`, a `hold` arg on `queue_local_node`,
+  and the attach-preserves-park `CASE`. Tests: `syncignore` predicate cases +
+  `db::a_parked_transient_create_stays_off_the_drain_until_finalized`. No SDK
+  dependency.
+  - *Not yet covered by A:* apps that write the final name in place with **no**
+    temp suffix (rare), and Firefox multi-connection `.part` files that it may
+    rename per-segment — those still rely on B. An abandoned transient file (a
+    cancelled download left on disk) now stays local-only forever rather than
+    polluting Drive; a later janitor could reclaim its staged blob.
+- **B — don't self-conflict a single-writer sequential rewrite (done 2026-07-25,
+  no SDK dep).** The safety net for names A does not recognise (an app writing the
+  final name in place, Firefox per-segment `.part` renames, or any resume the
+  in-memory rebase machinery missed). The daemon now records the server revision
+  id it *itself* seals per node (`Core.own_sealed_revs`, written in
+  `refresh_after_upload` where the sealed node is already fetched, dropped on
+  trash). When a queued write drains and `revision_changed` fires,
+  `Core::revision_conflict` checks whether the remote sits at one of *our own*
+  sealed revisions (pure `is_own_self_supersede`): if so, no other device touched
+  the file — it is a single-writer stall→resume — so it chains (supersedes)
+  instead of forking a `(sync-conflict)` copy. Gated on `meta.complete`: an
+  incomplete blob's gaps still refer to the stale base, so it keeps the
+  non-destructive conflict-copy path. This is a superset guard over the existing
+  `refresh_after_upload`/`rebaseline_pending` rebasers, which only fire while a
+  handle/op is live; B catches the windows they miss (fresh open during the
+  earlier upload's flight, a stale inherited baseline). Tests: `is_own_self_supersede`
+  cases in `drain.rs`. *Residual:* the map is in-memory only, so a daemon restart
+  between the partial seal and the resume drops the record and that one write can
+  still fork — narrow, and B69's revision-id keying already covers the mtime-drift
+  half. A persisted own-seal ledger would close it.
+
+**Triage of the copies already made is done (2026-07-25):** all completed files
+were promoted back to their canonical names (metadata-only rename, no re-upload)
+and the abandoned `.crdownload` stubs trashed.
+
+## B71 — Conflict sweep is not production-ready (auto-trash loop, CRIT-13)
+
+**Status:** Blockers 1–4 fixed in-tree 2026-07-26; items 5–10 and the remaining
+cleanup still open. The sweep is safe to leave running (it is report-only by
+default and cannot trash anything until explicitly switched to `enforce`).
+**Where:** `crates/pdfs-fuse/src/sweep.rs`, spawn site `crates/pdfs-fuse/src/mount.rs`,
+config surface `crates/pdfs-core/src/config.rs`.
+
+The B69 fix (see above) shipped a `pdfs-conflict-sweep` thread that **trashes user
+files on the real Drive** from a background loop. The identity check itself is
+conservative (equal size *and* equal `content_sha1`, missing digest treated as
+divergent), but the machinery around it is not yet safe to run unattended. Review
+found the following, ordered by severity. Each is a separate defect; they are
+grouped because they gate the same feature.
+
+**Blockers (all fixed 2026-07-26 — the sweep may not trash anything without them):**
+
+1. **Data-loss race — trash-then-discard (CRIT).** `remove_conflict_copy`
+   (`sweep.rs:137-155`) trashes the node remotely and *then* calls
+   `discard_queued_ops(uid)`, which deletes the node's queued ops **and discards
+   their staged blobs** (`lib.rs:1544-1553`). The decision was made from the
+   `load_all()` snapshot taken at `sweep.rs:77`, with network round trips in
+   between. A user edit landing in that window is destroyed — the queued write is
+   dropped and its staged bytes, which may be the only copy, are discarded. This
+   violates the invariant that `staging/` is never purged. *Fix:* re-read the node
+   from the DB and re-verify `active_revision_id` immediately before trashing;
+   skip the node outright if `Core.pending` or the op table has any entry for it;
+   never let the sweep discard staged bytes.
+2. **No kill-switch (CRIT).** `mount.rs:234-239` spawns the loop unconditionally.
+   There is no `AppConfig` field and no environment override, so the only way to
+   stop a destructive background loop is to uninstall. *Fix:* add
+   `AppConfig.conflict_sweep: Option<bool>` (same `Option` idiom as `cache_budget`
+   / `ignore_patterns`), a `PDFS_CONFLICT_SWEEP=off` override for support, and a
+   Settings toggle.
+3. **Open handles ignored (HIGH).** Nothing checks for a live file handle before
+   `forget_or_unlink` + `evict_reader`, so the sweep can trash a node a reader
+   currently has open. *Fix:* skip nodes with open handles.
+4. **Enforcing on day one (HIGH, process).** The sweep exists because B69 proved
+   the previous revision-identity check was wrong; betting deletion on the
+   *replacement* check in the same release, with no field evidence, is the wrong
+   order. *Fix:* ship report-only (log `would-trash` plus the existing
+   `ActivityKind::Conflict`), collect a release cycle of real logs, then flip to
+   enforcing.
+
+**Fix for 1–4 (landed 2026-07-26):**
+
+- **`SweepMode`** (`pdfs-core/src/config.rs`) — `Off` / `Report` / `Enforce`,
+  serialised into `AppConfig.conflict_sweep` (`#[serde(default)]`, so configs
+  predating the field still load). `Default` is **`Report`**, which is blocker 4:
+  an existing install that has never heard of the setting cannot get the
+  enforcing behaviour on upgrade. `AppConfig::resolved_conflict_sweep` layers
+  `PDFS_CONFLICT_SWEEP` over the stored value; the precedence is a pure
+  `resolve_sweep_mode(env, stored)` so it is testable without mutating process
+  state. An unparseable value falls through to the config rather than guessing a
+  mode in either direction.
+- **Spawn gate** (`mount.rs`) — `SweepMode::Off` skips the thread entirely rather
+  than starting an idle one, so the setting is verifiable from outside the
+  process (`ls /proc/<pid>/task/*/comm`). Both branches log the resolved mode at
+  startup. `mount` grew past clippy's argument limit, so `username` +
+  `sweep_mode` moved into a `MountOptions` struct resolved by the caller —
+  `mount` still reads neither config nor environment.
+- **Interlocks** (`sweep.rs::duplicate_still_removable`) — re-checks, immediately
+  before the destructive call, everything the pass decided from its stale
+  snapshot: no queued op (new `Db::has_any_op`, a cheap `COUNT` — a queued op
+  means bytes are owed an upload and `discard_queued_ops` would throw away the
+  staged blob holding them), no open write handle or shared scratch file
+  (`Core::is_busy`, checking `active_writes` + `handles` under one `State` lock),
+  and the node still at the same revision id, size, digest, name, parent and
+  untrashed state. Any doubt — including a failed DB read — means leave it alone:
+  a copy that survives to the next pass costs nothing, a wrongly removed one
+  costs data. This is blockers 1 and 3.
+- **Testability** — the decision moved into a pure
+  `decide(node, sibling, base, mode) -> SweepAction`, the same extraction used
+  for `revision_changed` and `is_own_self_supersede`; everything that can fail or
+  race stays in the caller. Tests now cover removal-when-enforcing,
+  report-mode-never-removes, size-differs, digest-differs, missing-digest in both
+  directions, and orphaned copies. Gate: `cargo fmt` / `clippy -D warnings` clean,
+  `cargo test --workspace` 282 passed (was 270).
+
+**Should fix:**
+
+5. **`load_all()` every pass (MED).** Each 300 s pass pulls the entire node table
+   into a `Vec<StoredNode>` and builds a full `(parent, name)` `HashMap`. *Fix:*
+   query only conflict-named rows (`name LIKE '% (sync-conflict %'`) and look up
+   siblings per parent — O(conflicts), not O(drive).
+6. **No batching or per-pass cap (MED).** The B69 incident produced 151 copies;
+   that is 151 sequential `trash_nodes` calls in one pass with no cap and no
+   backoff. `trash_nodes` takes a slice — batch it and cap per pass.
+7. **`online` sampled once per pass (MED).** Read at `sweep.rs:100`, ahead of a
+   loop that does network I/O; going offline mid-pass yields a long run of failing
+   calls. *Fix:* bail on the first transport error.
+8. **Ambiguous sibling index (MED).** `by_parent_name.insert` (`sweep.rs:97`) is
+   last-write-wins, so with duplicate `(parent, name)` rows the surviving entry
+   depends on `load_all` row order. *Fix:* make the choice deterministic or skip
+   ambiguous parents.
+9. **Trashed ancestors (LOW).** A copy under a trashed folder finds no live
+   sibling and is flagged "orphaned", spamming the activity feed. *Fix:* skip
+   nodes with a trashed ancestor.
+10. **SHA-1 provenance unverified (MED).** `is_identical` (`sweep.rs:181`)
+    compares digests without asserting they belong to the current
+    `active_revision_id`. A stale `XAttr` digest from an earlier revision plus a
+    size collision would delete real data. (The *missing* digest case is already
+    handled correctly.)
+
+**Also required to close:**
+
+- **Tests.** The *policy* is now covered via the pure `decide` (see above). Still
+  untested are the *interlocks*, which need a `Core`: pending-op→skip,
+  open-handle→skip, revision-moved→skip, offline→skip. Those want a test harness
+  that can build a `Core` against a temp DB and a stub client.
+- **`conflict_notified` is unbounded.** `HashSet<NodeUid>` that only grows except
+  on trash (`sweep.rs:157,170`).
+- **Docs.** `docs/ARCHITECTURE.md` thread map does not list `pdfs-conflict-sweep`;
+  `docs/RECOVERY.md` needs a "the sweep trashed a file, recover it from Proton
+  trash" path.
+
+**Mitigating context from the 2026-07-26 pre-run snapshot:** the account had only
+2 conflict copies left, both divergent in size *and* `content_sha1`, so the
+correct behaviour for the first live pass is to trash nothing.
+
+## B72 — `pdfs trash` never returns
+
+**Status:** Open — found 2026-07-26.
+**Found:** capturing a trash baseline before the B69/B70 live validation. `pdfs trash`
+produced no output and was still running when killed at 120 s. Daemon was healthy
+and every other CLI call (`pdfs sync list`, `pdfs --version`) returned promptly.
+**Where:** unconfirmed — either the `Request` handler in `crates/pdfs-fuse/src/control.rs`
+or the CLI's response read in `crates/pdfs-cli/src/main.rs`.
+**Impact:** the trash listing is the user's recovery path after any destructive
+operation, including the B71 sweep. It needs to work before the sweep is allowed
+to trash anything.
+
+## B73 — Unimplemented FUSE handlers log a WARN per probe
+
+**Status:** Fixed in-tree 2026-07-26 — live-validated. Found 2026-07-26 by the
+expanded acceptance suite.
+**Found:** `scripts/fuse-acceptance.sh --live` step "unsupported operations refuse
+cleanly". Each probe produced a multi-line `fuser` warning in the daemon journal:
+
+```
+WARN fuser: [Not Implemented] symlink(parent: INodeNo(0x2d), link_name: "symlink", target: "link-target")
+WARN fuser: [Not Implemented] link(ino: INodeNo(0x94), newparent: INodeNo(0x2d), newname: "hardlink")
+WARN fuser: [Not Implemented] mknod(parent: INodeNo(0x2d), name: "fifo", mode: 4516, umask: 0x12, rdev: 0)
+WARN fuser: [Not Implemented] setxattr(ino: INodeNo(0x91), name: "user.pdfs.probe", flags: 0x0, position: 0)
+WARN fuser: [Not Implemented] lseek(ino: INodeNo(0x93), fh: 0, offset: 0, whence: 3)
+```
+
+**Cause:** `ProtonFs` does not implement these callbacks, so `fuser`'s default
+trait method answers `ENOSYS` *and logs at WARN*. The refusal is correct — the
+acceptance suite accepts every one of them as a clean refusal — but the logging
+is not conditional on anything the user did wrong.
+**Impact:** cosmetic, but these are not exotic calls: `git` probes symlinks,
+`cp -a` probes hard links, `tar` and `cp --sparse` probe `SEEK_HOLE`/`SEEK_DATA`
+(`whence: 3` above is `SEEK_DATA`), and any xattr-aware tool probes `setxattr`.
+Warnings that look like faults bury real ones and make both `--journal-check`
+and manual triage noisier.
+**Measured** across two full acceptance runs against one daemon lifetime (PID
+887441, mount never remounted):
+
+| op | warnings | behaviour |
+|---|---|---|
+| `link` | 11 | repeats on every call |
+| `symlink` | 4 | repeats on every call |
+| `mknod` | 2 | repeats on every call |
+| `setxattr` | 1 | kernel cached the `ENOSYS`; never asked again |
+| `lseek` | 1 | cached |
+| `copy_file_range` | 1 | cached |
+| `fsyncdir` | 1 | cached |
+
+So the FUSE kernel module remembers `ENOSYS` for the file-level operations and
+stops issuing them for the lifetime of the mount, but not for the namespace
+operations, which are re-issued forever.
+
+`link` leads for a sharper reason than "tools probe it": git uses `link()` to
+place **every loose object**, falling back to `rename()` when it fails. In one
+workloads run, 9 of 10 `link` warnings carried a 38-hex-character name — the
+`.git/objects/ab/<38 hex>` layout — from just 3 commits over 3 files. The volume
+is therefore proportional to work done, not a fixed startup cost: a `git clone`
+of a real repository emits one multi-line warning per object. The lone `symlink`
+that is not the acceptance probe is git's `core.symlinks` detection at
+`git init` (a random name pointing at `testing`).
+
+That moves this from cosmetic to a genuine operational problem: ordinary use of
+git inside a mount can bury every other log line.
+
+**Fix (applied):** all seven callbacks are now implemented explicitly in
+`crates/pdfs-fuse/src/filesystem.rs`, each answering with **the same errno
+`fuser`'s default would** and nothing else — no WARN. Following `ioctl`
+(which already used this pattern and says why in its comment), the errno
+contract is unchanged, so the acceptance suite's clean-refusal assertions hold
+byte for byte:
+
+| op | errno | why that one |
+|---|---|---|
+| `symlink`, `link` | `EPERM` | meaningful operation, unrepresentable on Drive; git falls back to `rename()` |
+| `mknod` | `ENOSYS` | no devices/FIFOs/sockets; regular files arrive via `create` |
+| `setxattr` | `ENOSYS` | surfaces as `EOPNOTSUPP`; reads stay implemented for the thumbnail interface |
+| `fsyncdir` | `ENOSYS` | kernel absorbs it and reports success; dir changes are already durable in SQLite |
+| `lseek`, `copy_file_range` | `ENOSYS` | **must stay** `ENOSYS` — it is what makes the kernel emulate `SEEK_HOLE`/`SEEK_DATA` and coreutils fall back to read/write instead of failing |
+
+Only the three namespace ops were strictly required (the other four silence
+themselves once the kernel caches `ENOSYS`), but implementing all seven keeps the
+refusal explicit and documented at the call site rather than inherited.
+
+**Verified:** full live acceptance run after the fix — 19 pass / 1 skip, the
+capability diff identical to the pre-fix run, and **0** `Not Implemented` lines
+in the journal across the whole run (was 17, 10 of them `link`).
+**Regression cover:** the acceptance suite's clean-refusal probes assert the
+errno contract; they pass unchanged.
+
+## B74 — A drained create never reaches a sync-folder mount's inode space, so the file reads as empty
+
+**Status:** Fixed in-tree 2026-07-26 — live-validated. Found 2026-07-26 by the
+expanded acceptance suite (`regression B70` case), then isolated to a broader
+trigger.
+**Impact:** on a *sync folder* mount (not `~/ProtonDrive`), a file whose create
+was still queued reads back as **0 bytes for as long as the daemon runs**, even
+though the bytes are on Drive intact. This is the write-to-temp-then-rename
+pattern used by every browser download, most editor saves, `rsync`, and `git`.
+
+**Not data loss.** An earlier revision of this entry called it permanent data
+loss; that was wrong and is corrected here. The uploaded revision is complete and
+correct: for every "lost" file the node row carried the right `size` and
+`active_revision_state: "Active"`, and a daemon restart made all of them read
+back with the expected sha256. Nothing had to be recovered. The defect was
+entirely local and entirely in the read path.
+
+**Reproduction** (on an on-demand mount, per file: write, close, rename, wait for
+`pdfs status` to report the queue drained, then read back):
+
+| scenario | result |
+|---|---|
+| plain name, never renamed | content intact |
+| plain name, renamed after close | **0 bytes until restart** |
+| `.crdownload`, renamed after close | **0 bytes until restart** |
+| `.crdownload`, never renamed | content intact |
+| already-settled file, renamed | content intact |
+| any of the above, after a daemon restart | content intact |
+
+The gap between `close()` and `rename()` does not matter — 0 s, 2 s and 20 s all
+behave the same. The boundary is not timing but state: the affected node is one
+whose **create op was still queued**, on a mount that is not the primary one.
+
+**Root cause — one drain thread, many inode spaces.** The daemon mounts
+`~/ProtonDrive` plus one FUSE session per `ondemand` sync folder. Each of those
+is a `Core::fork_state` clone with its **own** `State` — its own `entries`,
+`by_uid`, `children`, `next_ino` — while sharing `db`, `cache`, `pending` and
+`client`. There is exactly **one** `pdfs-drain` thread in the process, owned by
+the primary mount, and it serves the whole shared `pending_op` table.
+
+So when a create queued by a sync-folder mount lands, the drain calls
+`adopt_real_uid` — which looked only at `self.state`, the *primary* mount's inode
+space. The fork's entry keeps its `local~…` placeholder uid forever. And
+`Core::read_range` (`crates/pdfs-fuse/src/reads.rs:314`) short-circuits a local
+uid to an empty vec:
+
+```rust
+if is_local_uid(uid) { return Ok(Vec::new()); }
+```
+
+which is why the read is silent, instant, and zero-length. A restart rebuilds
+every state from the DB, where `remap_local_uid` had already written the real
+uid, so the file reads correctly from then on.
+
+Confirmed live: `read handler uid=local~1785067300752-0 fsize=140000` three
+seconds after `pending create landed`, and at the same moment
+`adopt_real_uid … hit=None strays=[]` — the primary state had no entry for the
+uid at all. `/proc/<pid>/task/*/comm` showed 1 `pdfs-drain` against 8 fuser
+sessions.
+
+**Fix:** `Core` gained a `states: Arc<StateRegistry>` — a `Vec` of weakly-held
+mounts that every mount publishes itself into (`Core::register_state`, called
+from `mount.rs` for the primary and from `fork_state` for each fork), plus
+`Core::for_each_state`, which walks every live inode space one lock at a time.
+A uid is unique across mounts, so at most one state matches and the rest are
+no-ops. Five drain sites were converted: `adopt_real_uid`, `adopt_drained_name`,
+the conflict-copy `invalidate_listing`, the `active_writes` baseline rebase in
+`refresh_after_upload`, and that function's closing `intern`.
+
+**It was completely silent.** No `ERROR`, no `WARN`, no failed op, no conflict
+copy, no retry — `pdfs status` reported the queue drained, because it had. Any
+diagnosis that relies on the journal or on queue state will not see this.
+
+**Regression cover:** `scripts/fuse-acceptance.py`, case
+`regression B74: rename after close keeps its content` — the narrowest form
+(plain names, no overwrite, no transient suffix). It failed in two consecutive
+live runs before the fix and passes after it. The pre-existing B70 case failed on
+the same cause and now passes too.
+
+**Audit of the rest of the daemon.** Every background-thread `state.lock()` was
+reviewed for the same shape. The rule that came out of it: **a uid is unique
+across mounts, so uid-keyed work must be broadcast; an inode number is only
+meaningful to the mount that minted it, so inode-keyed work must not be.** What
+changed:
+
+| file | site | why |
+|---|---|---|
+| `background.rs` | `apply_event` | the read-side twin of this bug — remote deletes, trashes and renames only ever reached the primary mount's tree |
+| `sweep.rs` | conflict-copy `forget_or_unlink` | a conflict copy inside a sync folder lives in that fork's inode space |
+| `sweep.rs` | `is_busy` | answered "idle" for every file open on a fork, letting the sweep delete one with a writer attached |
+| `sharing.rs` | `rel_path_for_uid` | a share of a node in a sync folder could not be named |
+| `drain.rs` | `node_place` | fell through to a DB lookup for fork-resident nodes |
+| `lib.rs` | `queue_trash`, `rename`, `remove_replaced` (×2), `drop_local`, `restore` | uid-keyed `forget`/invalidate |
+
+Deliberately left on `self.state`: `upload.rs` (`parent_ino`/`pino` are inode
+numbers), the size-upgrade path in `lib.rs`, and `drain.rs`'s `root_uid`, which
+is correctly primary-only. The 38 `filesystem.rs` sites are FUSE callbacks —
+they already run on the right mount's session thread. `parent_is_gone` never
+touches state at all; an earlier note here saying it did was wrong.
+
+The registry is now a `StateRegistry` type with a unit test
+(`state_registry_walks_every_live_mount_and_reaps_the_rest`) covering the case
+this bug was: a fork that fails to appear in the walk, or one that lingers after
+unmount.
+
+**One regression came out of the audit, and is fixed.** Broadcasting
+`apply_event`'s parent-listing invalidation meant forks started receiving
+invalidations they had never received — and it invalidated a folder once per
+event, while a burst of our own uploads produces one event per file all naming
+the *same* folder. Every following lookup in that folder then re-enumerated it
+from the API: quadratic in the folder's size.
+
+Two mitigations, both in `background.rs`. A batch is collapsed to one
+invalidation per folder — `apply_event` records the parent in `DirtyParents` and
+`flush_dirty_parents` publishes it once after the batch loop (every `break` path
+falls through to it). And a change the daemon made *itself* is recognised as its
+own echo rather than treated as foreign: the drain records it
+(`Core::note_self_change`, consumed once within `SELF_CHANGE_TTL_MS`), which
+stops the feed's report of our own upload from evicting the content blob we just
+sent. Neither weakens the result — the state after a batch is what it always was.
+
+**The hang that showed up alongside this was a different bug, and this entry
+originally misattributed it.** `readdir stability` at 133.94 s and a concurrency
+case that blew past its timeout were blamed here on the invalidation storm. They
+were not: the mount was freezing because network work runs on fuser's single
+dispatch thread, which is B75. Fixing that took the concurrency case from two
+timeouts in three runs to 16.9 / 24.1 / 29.1 s and `readdir stability` to 62.9 s.
+The coalescing above is still worth having — it is a real amplification — but it
+was never the stall.
+
+**Note on B70:** B70's own fix was never implicated. The `.crdownload` park/un-park
+behaves correctly in isolation; the empty read arrived with the rename, on the
+same path a plain temp file takes. B70's live validation was blocked on this and
+is now unblocked — its acceptance case passes.
+
+## B75 — Network work on fuser's single dispatch thread freezes the whole mount
+
+**Status:** Fixed in-tree 2026-07-26 — live-validated. Found 2026-07-26 while
+chasing what was thought to be a B74 regression.
+**Impact:** any burst of concurrent writes froze the entire mount — not the
+files being written, the *mount*. `ls` on an unrelated directory of it timed out
+for minutes. The daemon itself stayed healthy throughout: the primary mount and
+the control socket answered normally while a sync-folder mount was unreachable.
+
+**Root cause.** `mount.rs` and `devices.rs` both build their session from
+`Config::default()`, which leaves `n_threads` unset, and fuser 0.17 defaults it
+to 1 (`session.rs:254`). One dispatch thread per mount reads a request, runs the
+handler to completion, and only then reads the next. Six handlers were handed to
+the [`Workers`] pool — `lookup`, `getattr`, `readdir`, `read`, `getxattr` and the
+slow `serve_lookup` — and everything else ran inline, including handlers that
+block on the API:
+
+| handler | blocking work |
+|---|---|
+| `create` | `upload_file` to mint the node, then `fetch_node` — two round trips |
+| `mkdir` | `create_folder`, then `fetch_node` |
+| `rename` | `rename_node`, then `move_node`, plus a trash on the replaced-destination path |
+| `unlink` / `rmdir` | `trash_nodes`; `rmdir` enumerates the folder first |
+| `setattr` (path truncate) | `queue_truncate` → `fill_gaps`, which reads the kept prefix from the remote |
+
+So eight applications each creating a file served one create at a time, and
+every `read`, `open` and `lookup` on that mount queued behind them.
+
+**Measured**, acceptance suite's `independent and shared-file concurrency` (8
+threads × 16 files), and a 3-second `ls` of the mount root sampled every 4 s
+throughout:
+
+| | before | after |
+|---|---|---|
+| concurrency case | 200 s watchdog ×2, 37 s ×1 | 16.9 / 24.1 / 29.1 s, all pass |
+| `ls` of the mount during the run | 33 of 55 probes timed out | 0 of 85 |
+| `readdir stability` | 148.8 s | 62.9 s |
+| `namespace operations` | 31.3 s | 15.7 s |
+
+**Fix:** each of those handlers now parses its arguments inline — cheap, and it
+keeps the error paths prompt — and hands the body to the worker pool as a
+`serve_*` method, the pattern `lookup`/`readdir` already used. Metadata work
+takes `Lane::Meta`; the truncate path takes `Lane::Transfer` because it can pull
+a whole file.
+
+**`release` was deliberately left inline, and this is load-bearing.** Moving it
+too made all three concurrency runs fail with `concurrent file 1 mismatch`. The
+kernel does not wait for a `release` reply before letting `close(2)` return, so
+the only thing sequencing the staging of the written bytes against the `open` +
+`read` an application issues immediately afterwards is that both are served by
+the same dispatch loop. From a worker, the read overtakes the staging and is
+answered from the remote's older revision. Taking `release` off the loop — worth
+doing, since `queue_revision` gap-fills a partial write from the network — needs
+a per-node "staging in flight" barrier that reads wait on, not the dispatch
+loop's accidental ordering.
+
+**Not fixed here.** `n_threads` is still 1; with the blocking handlers moved off,
+the loop is short enough that raising it is a separate question. Related findings
+from the same audit, still open: cache/reader validity is keyed on
+`(mtime, size)` while the revision identity is `active_revision_id`
+(`cache.rs:84` — two same-size revisions within one mtime second collide, which
+is what a SQLite page rewrite looks like); `local_finish_scan` holds the daemon's
+one SQLite connection across a full FTS5 trigram rebuild (`db/local.rs:79`);
+`earliest_due_at` has no `<= now` filter where `next_due_op` does, so the drain
+busy-spins when offline with a due op (`db/ops.rs:385` vs `:421`); and
+`drain_local_node` deletes its op before the fallible `adopt_real_uid`
+(`drain.rs:346`).

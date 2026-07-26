@@ -143,6 +143,15 @@ fn fetch_or_recall_root(
     }
 }
 
+/// Per-mount settings resolved from [`pdfs_core::config::AppConfig`] by the
+/// caller, so `mount` itself never reads config or the environment.
+pub struct MountOptions {
+    /// Proton account the session belongs to, for display and per-user paths.
+    pub username: String,
+    /// What the background conflict sweep may do. See `docs/BUGS.md` B71.
+    pub sweep_mode: SweepMode,
+}
+
 /// Mount the filesystem at `mountpoint` and block until it is unmounted or the
 /// daemon is asked to stop.
 ///
@@ -162,8 +171,12 @@ pub fn mount(
     cache: ContentCache,
     control_socket: &Path,
     db: Arc<Db>,
-    username: String,
+    options: MountOptions,
 ) -> std::io::Result<MountOutcome> {
+    let MountOptions {
+        username,
+        sweep_mode,
+    } = options;
     let (root, online) = fetch_or_recall_root(&client, &rt, &db)?;
     let scope = root.tree_event_scope_id();
 
@@ -196,6 +209,10 @@ pub fn mount(
         drain_wake: Arc::new((Mutex::new(false), Condvar::new())),
         timeline_refreshing: Arc::new(AtomicBool::new(false)),
         trash_refreshing: Arc::new(AtomicBool::new(false)),
+        conflict_notified: Arc::new(Mutex::new(HashSet::new())),
+        sweep_mode,
+        own_sealed_revs: Arc::new(Mutex::new(HashMap::new())),
+        self_changes: Arc::new(Mutex::new(HashMap::new())),
         thumb_gen: Arc::new(Mutex::new(HashSet::new())),
         no_thumbnail: Arc::new(Mutex::new(HashMap::new())),
         size_upgrades: Arc::new(Mutex::new(HashMap::new())),
@@ -206,7 +223,11 @@ pub fn mount(
         sync_tx,
         mounts: Arc::new(Mutex::new(HashMap::new())),
         sync_locks: Arc::new(Mutex::new(HashMap::new())),
+        states: Arc::new(StateRegistry::default()),
     };
+    // Before anything can queue work against it: the drain thread below reaches
+    // every mount's inode space through this registry, not through `core.state`.
+    core.register_state();
 
     // Writes queued by a previous run (or left behind by a crash) are still owed
     // an upload, and reads must be served from their staged blobs until they land.
@@ -225,6 +246,21 @@ pub fn mount(
     // Start the folder-sync engine. It watches every mirror folder, polls the
     // remotes, and reconciles on its own thread — never in front of a FUSE call.
     sync::spawn(core.clone(), sync_rx);
+
+    // Reconcile leftover `(sync-conflict …)` copies: drop the ones that turned
+    // out identical to the live file, surface the ones that genuinely diverge.
+    // Its own thread — it enumerates and trashes, and must never block a FUSE call.
+    // `Off` skips the thread entirely rather than starting an idle one, so the
+    // setting is verifiable from the outside (`ls /proc/<pid>/task/*/comm`).
+    if sweep_mode == SweepMode::Off {
+        info!("conflict sweep disabled by configuration");
+    } else {
+        info!(mode = ?sweep_mode, "conflict sweep enabled");
+        let core = core.clone();
+        std::thread::Builder::new()
+            .name("pdfs-conflict-sweep".into())
+            .spawn(move || core.run_conflict_sweep_loop())?;
+    }
 
     // Mounted from the cache: watch for the network coming back so the mount can
     // stop being read-only-ish without the user restarting the daemon.
@@ -310,15 +346,7 @@ pub fn mount(
     // Same channel, kept on the `Core` so background work (a size upgrade, say)
     // can invalidate kernel-cached metadata without threading a handle through.
     let _ = core.notifier.set(notifier.clone());
-    rt.spawn(run_event_sync(
-        client,
-        scope,
-        core.state,
-        core.cache,
-        core.db,
-        core.pending,
-        notifier,
-    ));
+    rt.spawn(run_event_sync(client, scope, core.clone()));
 
     // Stop signals (SIGTERM from `systemctl --user stop`, SIGINT from Ctrl-C)
     // are delivered onto the async runtime; bridge them onto a sync channel so

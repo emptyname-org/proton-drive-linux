@@ -200,6 +200,12 @@ pub(super) enum FilePlan {
     DeleteLocal,
     DeleteRemote,
     ForgetBaseline,
+    /// First sync of a file that already exists on both sides with identical
+    /// content: record the baseline without transferring anything. Without this,
+    /// a folder synced for the first time cuts a `(sync-conflict)` copy of every
+    /// pre-existing file, because a missing baseline makes both sides read as
+    /// "changed" (see the mass first-sync conflict storm in docs/BUGS.md).
+    AdoptBaseline,
 }
 
 pub(super) fn plan_file(
@@ -219,10 +225,16 @@ pub(super) fn plan_file(
     });
 
     match (local, remote) {
-        (Some(_), Some(_)) => match (local_changed, remote_changed) {
+        (Some(l), Some(r)) => match (local_changed, remote_changed) {
             (false, false) => FilePlan::Unchanged,
             (true, false) => FilePlan::UploadRevision,
             (false, true) => FilePlan::Download,
+            // With a baseline, both-changed is a genuine concurrent edit and must
+            // be preserved as a conflict. Without one, "both changed" only means
+            // this is the first sync and there was nothing to compare to: adopt
+            // the baseline when the sizes already match rather than conflict-copy
+            // an already-identical file. Divergent sizes stay a real conflict.
+            (true, true) if baseline.is_none() && l.size == r.size => FilePlan::AdoptBaseline,
             (true, true) => FilePlan::Conflict,
         },
         (Some(_), None) if baseline.is_none() || local_changed => FilePlan::UploadNew,
@@ -348,6 +360,31 @@ mod file_plan_tests {
                 FilePlan::Deferred
             );
         }
+    }
+
+    #[test]
+    fn first_sync_of_an_identical_file_adopts_the_baseline_not_a_conflict() {
+        // No baseline yet (first sync). Same size on both sides is a pre-existing
+        // identical file, not a concurrent edit: adopt it rather than cut a
+        // conflict copy of every file in the folder.
+        let local = local(10, 40);
+        let remote = remote(30, 40);
+        assert_eq!(
+            plan_file(Some(&local), Some(&remote), None),
+            FilePlan::AdoptBaseline
+        );
+    }
+
+    #[test]
+    fn first_sync_of_differing_sizes_is_still_a_conflict() {
+        // No baseline and the sizes disagree: a genuine both-sides divergence,
+        // preserved non-destructively as a conflict.
+        let local = local(10, 20);
+        let remote = remote(30, 40);
+        assert_eq!(
+            plan_file(Some(&local), Some(&remote), None),
+            FilePlan::Conflict
+        );
     }
 
     #[test]

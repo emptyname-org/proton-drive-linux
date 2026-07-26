@@ -670,6 +670,27 @@ impl Core {
 
             match plan_file(l, r, baseline.get(rel)) {
                 FilePlan::Unchanged => {}
+                FilePlan::AdoptBaseline => {
+                    // First sync of an already-identical file: record the baseline
+                    // in place so future divergence is detected, without any
+                    // transfer or a spurious conflict copy.
+                    let local = l.expect("adopt baseline requires a local file");
+                    let remote = r.expect("adopt baseline requires a remote file");
+                    if let Err(e) = self.db.sync_entry_upsert(
+                        folder_id,
+                        &StoredSyncEntry {
+                            rel_path: rel.clone(),
+                            remote_uid: Some(remote.uid.to_string()),
+                            local_mtime: local.mtime,
+                            local_size: local.size,
+                            remote_rev: Some(remote.mtime.to_string()),
+                            remote_hash: Some(remote.size.to_string()),
+                        },
+                    ) {
+                        warn!(rel, error = ?e, "sync: adopt baseline failed");
+                        outcome.errors += 1;
+                    }
+                }
                 FilePlan::Deferred => {
                     debug!(
                         rel,

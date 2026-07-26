@@ -45,6 +45,45 @@ pub const DEFAULT_IGNORE_PATTERNS: &[&str] = &[
     "Thumbs.db",
 ];
 
+/// Suffixes of files that are, by convention, incomplete or throwaway while they
+/// wear the name: a download in flight, an editor's swap or backup, an atomic
+/// write's scratch copy. On an on-demand mount these should never seal a remote
+/// revision — the app renames the finished file to its real name, and only that
+/// belongs on Drive. See [`is_transient_name`] and docs/BUGS.md B70.
+const TRANSIENT_SUFFIXES: &[&str] = &[
+    ".crdownload", // Chromium/Brave/Edge
+    ".part",       // Firefox, wget, aria2c
+    ".partial",    // some downloaders / older IE
+    ".download",   // Safari / macOS
+    ".tmp",        // generic scratch
+    ".temp",       // generic scratch
+    ".swp",        // vim swap
+    ".swx",        // vim swap (secondary)
+];
+
+/// Whether `name` is a transient scratch/in-flight file whose bytes should not
+/// be uploaded on an on-demand mount until it is renamed to its finished name.
+///
+/// Recognises browser download temps, editor swap/backup files, and lock files.
+/// Case-insensitive on the suffix so `FOO.CRDOWNLOAD` counts too. This is the
+/// on-demand-write counterpart to [`DEFAULT_IGNORE_PATTERNS`] (which only covers
+/// mirror-folder reconcile); keep the two conceptually in step.
+pub fn is_transient_name(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    if TRANSIENT_SUFFIXES.iter().any(|s| lower.ends_with(s)) {
+        return true;
+    }
+    // Emacs/gedit/kate backup copies.
+    if name.ends_with('~') {
+        return true;
+    }
+    // LibreOffice lock files (`.~lock.<doc>#`) and MS Office temps (`~$doc`).
+    if name.starts_with(".~lock.") || name.starts_with("~$") {
+        return true;
+    }
+    false
+}
+
 /// Filenames accepted as a folder's ignore file, in precedence order.
 const IGNORE_FILE_NAMES: &[&str] = &[".pdfsignore", ".protonignore"];
 
@@ -271,5 +310,38 @@ mod tests {
         // A blanket rule must not classify the folder root, or the pass would
         // have nothing to reconcile against.
         assert!(!rules.is_ignored("", true));
+    }
+
+    #[test]
+    fn transient_download_and_editor_names_are_recognised() {
+        for name in [
+            "Unconfirmed 540477.crdownload",
+            "movie.mkv.part",
+            "big.iso.partial",
+            "photo.jpg.download",
+            "export.xml.tmp",
+            "notes.TEMP",
+            ".notes.txt.swp",
+            "doc.txt~",
+            ".~lock.report.odt#",
+            "~$budget.xlsx",
+            "FOO.CRDOWNLOAD",
+        ] {
+            assert!(is_transient_name(name), "{name} should be transient");
+        }
+    }
+
+    #[test]
+    fn finished_names_are_not_transient() {
+        for name in [
+            "teamspeak.tar.gz",
+            "nils.zip",
+            "report.xml",
+            "archive.partly.zip", // ".partly" is not ".part"
+            "template.dotx",
+            "readme",
+        ] {
+            assert!(!is_transient_name(name), "{name} should not be transient");
+        }
     }
 }

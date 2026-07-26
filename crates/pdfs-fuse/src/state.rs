@@ -106,6 +106,12 @@ pub(crate) struct WriteHandle {
     pub(crate) base_size: u64,
     /// Modification time of the remote base at open, validating its block cache.
     pub(crate) base_mtime: i64,
+    /// Server revision id of the remote base at open, if it had one. This is the
+    /// stable identity the drain conflict-checks against: `base_mtime` alone
+    /// drifts when the server re-stamps the *same* revision, which reads as a
+    /// spurious conflict (see B16/B25). `None` for a file with no sealed remote
+    /// revision, or one read through a surface that does not carry the id.
+    pub(crate) base_revision_id: Option<String>,
     /// Whether anything diverged from the remote and needs an upload.
     pub(crate) dirty: bool,
     /// Number of file handles currently sharing this scratch state.
@@ -438,6 +444,8 @@ mod tests {
                     media_type: "text/plain".into(),
                     total_size_on_storage: 0,
                     active_revision_state: None,
+                    active_revision_id: None,
+                    content_sha1: None,
                     claimed_size: Some(0),
                     claimed_modification_time: None,
                 }

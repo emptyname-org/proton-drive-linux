@@ -281,6 +281,7 @@ pub(crate) fn activity_verb(kind: ActivityKind) -> &'static str {
         ActivityKind::Share => "Shared",
         ActivityKind::PublicLink => "Linked",
         ActivityKind::Unshare => "Unshared",
+        ActivityKind::Conflict => "Conflict",
     }
 }
 
@@ -299,6 +300,7 @@ pub(crate) fn activity_icon(kind: ActivityKind) -> &'static str {
         ActivityKind::Restore => "edit-undo-symbolic",
         ActivityKind::Share | ActivityKind::PublicLink => "emblem-shared-symbolic",
         ActivityKind::Unshare => "action-unavailable-symbolic",
+        ActivityKind::Conflict => "dialog-warning-symbolic",
     }
 }
 

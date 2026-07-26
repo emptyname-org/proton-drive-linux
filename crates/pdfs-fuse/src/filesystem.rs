@@ -110,12 +110,17 @@ impl Filesystem for ProtonFs {
     }
 
     fn open(&self, _req: &Request, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
-        let (uid, base_mtime, base_size) = {
+        let (uid, base_mtime, base_size, base_revision_id) = {
             let mut st = self.core.state.lock();
             match st.entries.get_mut(&ino.0) {
                 Some(e) if e.node.is_file() => {
                     e.open_count = e.open_count.saturating_add(1);
-                    (e.uid.clone(), e.node.modification_time, node_size(&e.node))
+                    (
+                        e.uid.clone(),
+                        e.node.modification_time,
+                        node_size(&e.node),
+                        node_revision_id(&e.node),
+                    )
                 }
                 Some(_) => {
                     reply.error(Errno::EISDIR);
@@ -194,6 +199,7 @@ impl Filesystem for ProtonFs {
                 len: base_size,
                 base_size,
                 base_mtime,
+                base_revision_id,
                 dirty: false,
                 open_count: 0,
             }
@@ -309,10 +315,6 @@ impl Filesystem for ProtonFs {
         reply: ReplyCreate,
     ) {
         let parent = parent.0;
-        if let Err(e) = self.core.ensure_children(parent) {
-            reply.error(e);
-            return;
-        }
         let name = match fuse_name(name) {
             Ok(name) => name,
             Err(error) => {
@@ -320,109 +322,16 @@ impl Filesystem for ProtonFs {
                 return;
             }
         };
-        let parent_uid = {
-            let st = self.core.state.lock();
-            match st.entries.get(&parent) {
-                Some(e) => e.uid.clone(),
-                None => {
-                    reply.error(Errno::ENOENT);
-                    return;
-                }
-            }
-        };
-        // Offline the server cannot mint a uid, so invent one and queue the
-        // create. The file is real to the caller either way; only its identity is
-        // provisional until the drain (offline.md Phase 3b).
-        //
-        // A parent that is itself still queued forces the same path even when we
-        // are online: the API has no folder to put this in yet.
-        let node = if self.core.online.load(Ordering::Relaxed) && !is_local_uid(&parent_uid) {
-            // Create an empty file on the remote so it has a real uid immediately;
-            // written bytes are buffered and sealed as a new revision on close.
-            let new_uid = match self.core.rt.block_on(self.core.client.upload_file(
-                &parent_uid,
-                &name,
-                media_type_for(&name),
-                b"",
-            )) {
-                Ok(u) => u,
-                Err(e) => {
-                    error!(%parent_uid, name, error = %e, "create file failed");
-                    reply.error(Errno::EIO);
-                    return;
-                }
-            };
-            match self.core.fetch_node(&new_uid) {
-                Ok(n) => n,
-                Err(e) => {
-                    reply.error(e);
-                    return;
-                }
-            }
-        } else {
-            match self.core.queue_local_node(&parent_uid, &name, false) {
-                Ok(n) => n,
-                Err(e) => {
-                    reply.error(e);
-                    return;
-                }
-            }
-        };
-        let new_uid = node.uid.clone();
-        // The base this handle writes over is the node as it actually exists —
-        // the empty file the server just minted — so its modification time comes
-        // from the node, never from the local clock. `queue_revision` turns this
-        // into `StagedWrite::based_on` and the drain compares that against the
-        // remote: a `now_secs()` here differs from the server's stamp by however
-        // long the create round-trip took, so the first write to a brand-new file
-        // conflicts with its own create whenever the second happens to tick in
-        // between.
-        let base_mtime = node.modification_time;
-        let (file, path) = match self.core.cache.create_scratch() {
-            Ok(x) => x,
-            Err(e) => {
-                error!(%new_uid, error = %e, "create scratch file failed");
-                reply.error(Errno::EIO);
-                return;
-            }
-        };
-        let mut st = self.core.state.lock();
-        let ino = st.intern(parent, node);
-        if let Some(entry) = st.entries.get_mut(&ino) {
-            entry.open_count = entry.open_count.saturating_add(1);
-        }
-        if let Some(kids) = st.children.get_mut(&parent)
-            && !kids.contains(&ino)
-        {
-            kids.push(ino);
-        }
-        let fh = st.next_fh;
-        st.next_fh += 1;
-        let aw = st.active_writes.entry(ino).or_insert_with(|| {
-            // A brand-new file: empty base, everything written is authored.
-            WriteHandle {
-                ino,
-                uid: new_uid,
-                file: Arc::new(file),
-                path,
-                written: Intervals::default(),
-                len: 0,
-                base_size: 0,
-                base_mtime,
-                dirty: false,
-                open_count: 0,
-            }
-        });
-        aw.open_count += 1;
-        st.handles.insert(fh, ino);
-        let attr = self.attr(ino, &st.entries.get(&ino).unwrap().node);
-        reply.created(
-            &TTL,
-            &attr,
-            Generation(0),
-            FileHandle(fh),
-            FopenFlags::empty(),
-        );
+        // Minting a node on the remote is one round trip plus a `fetch_node`,
+        // and a cold parent adds an enumeration before either. Answering that
+        // inline stalls the whole mount: fuser's dispatch loop is
+        // non-concurrent, so eight applications each creating a file were served
+        // one create at a time, with `ls` on the same mount timing out for as
+        // long as the burst lasted. See [`Workers`].
+        let fs = self.clone();
+        self.core
+            .workers
+            .run(Lane::Meta, move || fs.serve_create(parent, &name, reply));
     }
 
     fn write(
@@ -535,22 +444,26 @@ impl Filesystem for ProtonFs {
                 // queueing it is what lets a redirect work offline at all: it
                 // never reaches `release`, so without this it failed before any
                 // byte was written (offline.md Phase 2/3b).
-                if let Err(e) = self.core.queue_truncate(ino.0, size) {
-                    reply.error(e);
-                    return;
-                }
-            } else {
-                self.core.state.lock().set_size(ino.0, size);
+                //
+                // The one branch of `setattr` that can reach the network:
+                // shrinking keeps the prefix, which `queue_truncate` gap-fills
+                // from the remote. So it answers from a worker, while the
+                // handle-backed resize above stays inline (it is a `set_len` on
+                // the scratch file).
+                let ino = ino.0;
+                let fs = self.clone();
+                self.core.workers.run(Lane::Transfer, move || {
+                    if let Err(e) = fs.core.queue_truncate(ino, size) {
+                        reply.error(e);
+                        return;
+                    }
+                    fs.reply_attr(ino, reply);
+                });
+                return;
             }
+            self.core.state.lock().set_size(ino.0, size);
         }
-        let st = self.core.state.lock();
-        match st.entries.get(&ino.0) {
-            Some(e) => {
-                let attr = self.attr(ino.0, &e.node);
-                reply.attr(&TTL, &attr);
-            }
-            None => reply.error(Errno::ENOENT),
-        }
+        self.reply_attr(ino.0, reply);
     }
 
     fn fallocate(
@@ -655,10 +568,13 @@ impl Filesystem for ProtonFs {
                     aw.len,
                     aw.base_size,
                     aw.base_mtime,
+                    aw.base_revision_id.clone(),
                 )
             })
         };
-        let Some((f, path, uid, dirty, written, len, base_size, base_mtime)) = handle else {
+        let Some((f, path, uid, dirty, written, len, base_size, base_mtime, base_revision_id)) =
+            handle
+        else {
             reply.error(Errno::EBADF);
             return;
         };
@@ -694,7 +610,9 @@ impl Filesystem for ProtonFs {
             base_mtime,
             complete: authored == [(0, len)],
             authored,
-            based_on: self.core.remote_baseline(&uid, base_mtime, base_size),
+            based_on: self
+                .core
+                .remote_baseline(&uid, base_mtime, base_size, base_revision_id),
         };
         // A failed sidecar means the write is not durable, and `fsync` promising
         // otherwise is the defect this exists to fix — so it is an error, not a
@@ -743,36 +661,24 @@ impl Filesystem for ProtonFs {
             });
             (h, unlinked_uid)
         };
-        let was_unlinked = unlinked_uid.is_some();
-        if let Some(uid) = unlinked_uid {
-            self.core.discard_queued_ops(&uid);
-            self.core.cache.evict(&uid);
-            self.core.evict_reader(&uid);
-        }
-        // Hand the bytes to the queue rather than uploading them here: the
-        // scratch file is the only copy of what was just written, and blocking
-        // the caller on the network is what made a copy into the mount run at
-        // upload speed (and fail outright offline).
-        match (handle, was_unlinked) {
-            (Some(h), true) => {
-                // POSIX keeps an unlinked file usable until the last close, but
-                // closing it must not resurrect those bytes as a new revision.
-                if let Err(e) = std::fs::remove_file(&h.path)
-                    && e.kind() != std::io::ErrorKind::NotFound
-                {
-                    warn!(path = %h.path.display(), error = %e, "discarding unlinked scratch file failed");
-                }
-                reply.ok();
-            }
-            (Some(h), false) => match self.core.queue_revision(&h) {
-                Ok(()) => reply.ok(),
-                Err(e) => reply.error(e),
-            },
-            (None, _) => reply.ok(),
-        }
+        // Deliberately **not** handed to a worker, unlike the other slow
+        // handlers here. The kernel does not wait for a `release` reply before
+        // letting `close(2)` return, so the only thing sequencing this against
+        // the `open`+`read` an application issues immediately afterwards is that
+        // both are served by the same dispatch loop. Off a worker, the read
+        // overtakes the staging and sees the *remote's* older revision: the
+        // acceptance suite's concurrency case failed with "concurrent file 1
+        // mismatch" on all three runs the moment this moved.
+        //
+        // The cost is real — `queue_revision` gap-fills a partial write from the
+        // remote — so moving it off still wants doing, but it needs the ordering
+        // made explicit first (a per-node "staging in flight" barrier that reads
+        // wait on) rather than inherited from the dispatch loop.
+        self.finish_release(handle, unlinked_uid, reply);
     }
 
     fn unlink(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
+        let parent = parent.0;
         let name_str = match fuse_name(name) {
             Ok(name) => name,
             Err(error) => {
@@ -780,19 +686,15 @@ impl Filesystem for ProtonFs {
                 return;
             }
         };
-        if let Ok((ino, _)) = self.core.lookup_child(parent.0, &name_str) {
-            let st = self.core.state.lock();
-            if let Some(entry) = st.entries.get(&ino)
-                && entry.node.is_folder()
-            {
-                reply.error(Errno::EISDIR);
-                return;
-            }
-        }
-        self.trash_child(parent.0, &name_str, reply);
+        // `trash_child` is a remote call; see `serve_create`.
+        let fs = self.clone();
+        self.core.workers.run(Lane::Meta, move || {
+            fs.serve_unlink(parent, &name_str, reply)
+        });
     }
 
     fn rmdir(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
+        let parent = parent.0;
         let name_str = match fuse_name(name) {
             Ok(name) => name,
             Err(error) => {
@@ -800,31 +702,12 @@ impl Filesystem for ProtonFs {
                 return;
             }
         };
-        if let Ok((ino, _)) = self.core.lookup_child(parent.0, &name_str) {
-            {
-                let st = self.core.state.lock();
-                if st
-                    .entries
-                    .get(&ino)
-                    .is_some_and(|entry| !entry.node.is_folder())
-                {
-                    reply.error(Errno::ENOTDIR);
-                    return;
-                }
-            }
-            // A missing cached listing says "unknown", not "empty". Proton's
-            // trash call is recursive, so enumerate before applying rmdir's
-            // POSIX emptiness rule.
-            if let Err(e) = self.core.ensure_children(ino) {
-                reply.error(e);
-                return;
-            }
-            if self.core.state.lock().has_children(ino) {
-                reply.error(Errno::ENOTEMPTY);
-                return;
-            }
-        }
-        self.trash_child(parent.0, &name_str, reply);
+        // Enumerates the folder to apply rmdir's emptiness rule, then trashes
+        // it: two remote calls. See `serve_create`.
+        let fs = self.clone();
+        self.core
+            .workers
+            .run(Lane::Meta, move || fs.serve_rmdir(parent, &name_str, reply));
     }
 
     fn mkdir(
@@ -837,10 +720,6 @@ impl Filesystem for ProtonFs {
         reply: ReplyEntry,
     ) {
         let parent = parent.0;
-        if let Err(e) = self.core.ensure_children(parent) {
-            reply.error(e);
-            return;
-        }
         let name = match fuse_name(name) {
             Ok(name) => name,
             Err(error) => {
@@ -848,73 +727,13 @@ impl Filesystem for ProtonFs {
                 return;
             }
         };
-        let parent_uid = {
-            let st = self.core.state.lock();
-            match st.entries.get(&parent) {
-                Some(e) => e.uid.clone(),
-                None => {
-                    reply.error(Errno::ENOENT);
-                    return;
-                }
-            }
-        };
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .ok();
-        // As in `create`: offline — or under a parent that is itself still
-        // queued — the folder becomes a placeholder that the drain turns into a
-        // real one (offline.md Phase 3b).
-        let node = if self.core.online.load(Ordering::Relaxed) && !is_local_uid(&parent_uid) {
-            let new_uid =
-                match self
-                    .core
-                    .rt
-                    .block_on(self.core.client.create_folder(&parent_uid, &name, now))
-                {
-                    Ok(u) => u,
-                    Err(e) => {
-                        error!(%parent_uid, name, error = %e, "create folder failed");
-                        reply.error(Errno::EIO);
-                        return;
-                    }
-                };
-            match self.core.fetch_node(&new_uid) {
-                Ok(n) => n,
-                Err(e) => {
-                    reply.error(e);
-                    return;
-                }
-            }
-        } else {
-            match self.core.queue_local_node(&parent_uid, &name, true) {
-                Ok(n) => n,
-                Err(e) => {
-                    reply.error(e);
-                    return;
-                }
-            }
-        };
-        let mut st = self.core.state.lock();
-        let local = is_local_uid(&node.uid);
-        let uid = node.uid.clone();
-        let ino = st.intern(parent, node);
-        if let Some(kids) = st.children.get_mut(&parent)
-            && !kids.contains(&ino)
-        {
-            kids.push(ino);
-        }
-        // A folder that exists only here has nothing to enumerate, and asking the
-        // API to enumerate a `local~` uid would 404. Record it as fully listed and
-        // empty, which it is, so reads stay offline-clean across a restart too.
-        if local {
-            st.children.insert(ino, Vec::new());
-            if let Err(e) = self.core.db.set_listed(&uid, true) {
-                warn!(%uid, error = %e, "db set_listed(true) failed for local folder");
-            }
-        }
-        let attr = self.attr(ino, &st.entries.get(&ino).unwrap().node);
-        reply.entry(&TTL, &attr, Generation(0));
+        // Off the dispatch loop for the same reason as `create`: this is a
+        // remote round trip, and inline it blocks every other request on the
+        // mount until it answers.
+        let fs = self.clone();
+        self.core
+            .workers
+            .run(Lane::Meta, move || fs.serve_mkdir(parent, &name, reply));
     }
 
     fn rename(
@@ -943,253 +762,15 @@ impl Filesystem for ProtonFs {
                 return;
             }
         };
-        let (ino, uid) = match self.core.lookup_child(parent, &name) {
-            Ok(x) => x,
-            Err(e) => {
-                reply.error(e);
-                return;
-            }
-        };
-        // Ancestor cycle check: moving a directory into itself or one of its descendants is forbidden by POSIX (EINVAL).
-        {
-            let st = self.core.state.lock();
-            if let Some(entry) = st.entries.get(&ino)
-                && entry.node.is_folder()
-                && st.is_ancestor_of(ino, newparent)
-            {
-                reply.error(Errno::EINVAL);
-                return;
-            }
-        }
-        // The destination has to be listed either way: the queued path pushes
-        // the node into that listing, and the online one drops it to force a
-        // re-enumeration.
-        if newparent != parent
-            && let Err(e) = self.core.ensure_children(newparent)
-        {
-            reply.error(e);
-            return;
-        }
-        let new_parent_uid = {
-            let st = self.core.state.lock();
-            match st.entries.get(&newparent) {
-                Some(e) => e.uid.clone(),
-                None => {
-                    reply.error(Errno::ENOENT);
-                    return;
-                }
-            }
-        };
-        // `rename(2)` replaces an existing destination; Proton has no replacing
-        // rename, so the victim has to be removed first and the operation stops
-        // being atomic. Without this the 422 surfaced as a blanket EIO and every
-        // write-to-temp-then-rename tool — rsync, atomic editor saves — failed
-        // at the very end of its transfer (bugs.md B13).
-        //
-        // `RENAME_EXCHANGE` has no Proton primitive and cannot be emulated
-        // without a window in which one of the two names does not exist.
-        if flags.contains(RenameFlags::RENAME_EXCHANGE) {
-            reply.error(Errno::EINVAL);
-            return;
-        }
-        let victim = match self.core.lookup_child(newparent, &newname) {
-            // Renaming a node onto its own name is a no-op, never a self-replace.
-            Ok((_, vuid)) if vuid == uid => None,
-            Ok(x) => Some(x),
-            // Nothing to replace: the overwhelmingly common case.
-            Err(e) if e.code() == libc::ENOENT => None,
-            Err(e) => {
-                reply.error(e);
-                return;
-            }
-        };
-        if let Some((victim_ino, victim_uid)) = &victim {
-            if flags.contains(RenameFlags::RENAME_NOREPLACE) {
-                reply.error(Errno::EEXIST);
-                return;
-            }
-            // POSIX requires both ends to agree on being a directory, and the
-            // check has to happen before anything is trashed: getting it wrong
-            // turns a refusal into the destruction of the destination.
-            let (src_dir, dst_dir) = {
-                let st = self.core.state.lock();
-                let is_dir = |i: &u64| {
-                    st.entries
-                        .get(i)
-                        .map(|e| matches!(e.node.kind, NodeKind::Folder))
-                };
-                match (is_dir(&ino), is_dir(victim_ino)) {
-                    (Some(a), Some(b)) => (a, b),
-                    _ => {
-                        reply.error(Errno::ENOENT);
-                        return;
-                    }
-                }
-            };
-            // Replacing a directory means trashing it, and Proton trashes a
-            // folder with its whole subtree — so the destination's emptiness has
-            // to be known before the decision is made.
-            let dst_empty = if dst_dir {
-                if let Err(e) = self.core.ensure_children(*victim_ino) {
-                    reply.error(e);
-                    return;
-                }
-                self.core
-                    .state
-                    .lock()
-                    .children
-                    .get(victim_ino)
-                    .is_none_or(|kids| kids.is_empty())
-            } else {
-                true
-            };
-            if let Err(e) = check_replaceable(src_dir, dst_dir, dst_empty) {
-                reply.error(e);
-                return;
-            }
-            if let Err(e) = self.core.remove_replaced(victim_uid, &newname) {
-                reply.error(e);
-                return;
-            }
-        }
-        // A node whose own creation is still queued has no server-side identity
-        // to rename: the queued op *is* the node, so rewriting its target is the
-        // whole rename. Nothing reaches the API, which is why this works offline
-        // (offline.md Phase 3b).
-        if is_local_uid(&uid) {
-            match self.core.db.rewrite_op_target(
-                &uid.to_string(),
-                &new_parent_uid.to_string(),
-                &newname,
-            ) {
-                Ok(true) => {
-                    self.core.state.lock().rename_in_place(
-                        ino,
-                        newparent,
-                        &new_parent_uid,
-                        &newname,
-                    );
-                    debug!(%uid, newname, "renamed a node whose create is still queued");
-                    reply.ok();
-                }
-                // The create drained underneath us, so the node has a real uid
-                // now and this handle's is stale. A retry resolves it.
-                Ok(false) => {
-                    warn!(%uid, name, newname, "queued create vanished under a rename");
-                    self.core.restore_replaced(victim.as_ref(), &newname);
-                    reply.error(Errno::EBUSY);
-                }
-                Err(e) => {
-                    error!(%uid, error = %e, "rewriting a queued create's target failed");
-                    self.core.restore_replaced(victim.as_ref(), &newname);
-                    reply.error(Errno::EIO);
-                }
-            }
-            return;
-        }
-        // Offline, or into a folder that does not exist remotely yet: queue the
-        // rename rather than 404 or fail. Online moves into a real parent still
-        // take the synchronous path, so a genuine API refusal (permissions, a
-        // name clash) surfaces to the caller instead of becoming a queued op
-        // that can only ever conflict.
-        if rename_needs_queue(
-            self.core.online.load(Ordering::Relaxed),
-            is_local_uid(&new_parent_uid),
-            newparent != parent,
-            newname != name,
-        ) {
-            match self
-                .core
-                .queue_rename(ino, &uid, newparent, &new_parent_uid, &newname)
-            {
-                Ok(()) => {
-                    // Send the rename response first. Kernel-side rename cache
-                    // updates happen while processing that response; notifying
-                    // before it lets those updates overwrite our invalidation
-                    // and retain an empty destination readdir page.
-                    reply.ok();
-                    if let Some(notifier) = self.core.notifier.get() {
-                        let _ = notifier.inval_entry(INodeNo(parent), OsStr::new(&name));
-                        let _ = notifier.inval_entry(INodeNo(newparent), OsStr::new(&newname));
-                        let _ = notifier.inval_inode(INodeNo(parent), 0, 0);
-                        if newparent != parent {
-                            let _ = notifier.inval_inode(INodeNo(newparent), 0, 0);
-                        }
-                    }
-                }
-                Err(e) => {
-                    self.core.restore_replaced(victim.as_ref(), &newname);
-                    reply.error(e);
-                }
-            }
-            return;
-        }
-        // Rename first if both halves change. Moving first makes the encrypted
-        // name requirements stale and repeatedly failed with InvalidRequirements.
-        // A failure past this point has already trashed any node the rename was
-        // replacing, so put it back rather than leaving the caller with neither
-        // the source moved nor the destination intact.
-        if newname != name
-            && let Err(e) = self
-                .core
-                .rt
-                .block_on(self.core.client.rename_node(&uid, &newname, None))
-        {
-            error!(%uid, error = %e, "rename failed");
-            self.core.restore_replaced(victim.as_ref(), &newname);
-            reply.error(Errno::EIO);
-            return;
-        }
-        if newparent != parent {
-            let mut attempts = 0u32;
-            let moved = loop {
-                match self
-                    .core
-                    .rt
-                    .block_on(self.core.client.move_node(&uid, &new_parent_uid))
-                {
-                    Ok(()) => break Ok(()),
-                    Err(e)
-                        if newname != name
-                            && api_code(&e) == Some(ResponseCode::InvalidRequirements)
-                            && attempts < 20 =>
-                    {
-                        attempts += 1;
-                        // Requirement propagation routinely takes longer than
-                        // three seconds. Keep a bounded ten-second window; a
-                        // successful POSIX reply must mean both remote halves
-                        // landed, not merely that the second half was queued.
-                        std::thread::sleep(Duration::from_millis(500));
-                    }
-                    Err(e) => break Err(e),
-                }
-            };
-            if let Err(e) = moved {
-                error!(%uid, attempts, error = %e, "move after rename failed");
-                // The rename half landed in the source directory.
-                let mut state = self.core.state.lock();
-                let old_parent_uid = state
-                    .entries
-                    .get(&parent)
-                    .map(|entry| entry.uid.clone())
-                    .unwrap_or_else(|| uid.clone());
-                state.rename_in_place(ino, parent, &old_parent_uid, &newname);
-                drop(state);
-                self.core.restore_replaced(victim.as_ref(), &newname);
-                reply.error(Errno::EIO);
-                return;
-            }
-        }
-        self.core
-            .state
-            .lock()
-            .relocate(ino, parent, newparent, &new_parent_uid, &newname);
-        reply.ok();
+        // A rename that reaches the remote is up to two calls (rename, then
+        // move), and the replaced-destination path adds a trash on top. See
+        // `serve_create` for why none of that may run on the dispatch loop.
+        let fs = self.clone();
+        self.core.workers.run(Lane::Meta, move || {
+            fs.serve_rename(parent, &name, newparent, &newname, flags, reply)
+        });
     }
 
-    /// Expose a file's server-side thumbnail/preview as an extended attribute, so
-    /// a previewing client can fetch it without downloading the whole file. The
-    /// bytes are fetched on demand and cached; absence yields `ENODATA`.
     fn getxattr(&self, _req: &Request, ino: INodeNo, name: &OsStr, size: u32, reply: ReplyXattr) {
         // Always off the dispatch loop: a miss goes to the wire, and a lister
         // that stats a directory issues one of these per file per advertised
@@ -1221,6 +802,124 @@ impl Filesystem for ProtonFs {
         // for unhandled ioctls is standard Linux POSIX behavior and prevents
         // fuser warning logs when applications probe file descriptors.
         reply.error(Errno::ENOTTY);
+    }
+
+    // The callbacks below are deliberately unsupported. Each answers with the
+    // same errno `fuser`'s default would, minus the `[Not Implemented]` WARN it
+    // logs on every call — a probe is a normal thing for an application to do,
+    // not an incident. git alone emits one `link` per loose object, which
+    // buried real diagnostics in the journal (`docs/BUGS.md` B73). The errno
+    // contract these keep is asserted by the acceptance suite's clean-refusal
+    // case, so it must not drift.
+
+    fn mknod(
+        &self,
+        _req: &Request,
+        _parent: INodeNo,
+        _name: &OsStr,
+        _mode: u32,
+        _umask: u32,
+        _rdev: u32,
+        reply: ReplyEntry,
+    ) {
+        // Drive stores files and folders; devices, FIFOs and sockets have no
+        // representation. Regular files arrive through `create`, never here.
+        reply.error(Errno::ENOSYS);
+    }
+
+    fn symlink(
+        &self,
+        _req: &Request,
+        _parent: INodeNo,
+        _link_name: &OsStr,
+        _target: &Path,
+        reply: ReplyEntry,
+    ) {
+        // EPERM, not ENOSYS: the operation is meaningful, Drive simply cannot
+        // represent it, and callers treat EPERM as a definite "no" rather than
+        // retrying against an older interface.
+        reply.error(Errno::EPERM);
+    }
+
+    fn link(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        _newparent: INodeNo,
+        _newname: &OsStr,
+        reply: ReplyEntry,
+    ) {
+        // A node has exactly one parent on Drive, so there are no hard links.
+        // git falls back to rename() on EPERM, which this filesystem supports.
+        reply.error(Errno::EPERM);
+    }
+
+    fn fsyncdir(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        _fh: FileHandle,
+        _datasync: bool,
+        reply: ReplyEmpty,
+    ) {
+        // ENOSYS, which the kernel absorbs: it clears its fsyncdir probe and
+        // reports success to the caller. There is no dirty directory buffer to
+        // flush — directory changes are durable in SQLite before the callback
+        // that made them returns.
+        reply.error(Errno::ENOSYS);
+    }
+
+    fn setxattr(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        _name: &OsStr,
+        _value: &[u8],
+        _flags: i32,
+        _position: u32,
+        reply: ReplyEmpty,
+    ) {
+        // Drive has no user-extended-attribute store. ENOSYS reaches userspace
+        // as EOPNOTSUPP, the errno callers expect from a filesystem without
+        // xattrs. Reads (`getxattr`/`listxattr`) are implemented, since the
+        // thumbnail interface is exposed that way.
+        reply.error(Errno::ENOSYS);
+    }
+
+    fn lseek(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        _fh: FileHandle,
+        _offset: i64,
+        _whence: i32,
+        reply: ReplyLseek,
+    ) {
+        // Must stay ENOSYS. A file's holes are not knowable without fetching
+        // its blocks, and ENOSYS is what makes the kernel stop asking and
+        // emulate SEEK_DATA/SEEK_HOLE itself. Any other errno would surface to
+        // the caller as a failed seek.
+        reply.error(Errno::ENOSYS);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn copy_file_range(
+        &self,
+        _req: &Request,
+        _ino_in: INodeNo,
+        _fh_in: FileHandle,
+        _offset_in: u64,
+        _ino_out: INodeNo,
+        _fh_out: FileHandle,
+        _offset_out: u64,
+        _len: u64,
+        _flags: CopyFileRangeFlags,
+        reply: ReplyWrite,
+    ) {
+        // Also must stay ENOSYS: there is no server-side copy, and this is the
+        // errno that sends coreutils (and the kernel) down the read/write path
+        // instead of failing the copy outright.
+        reply.error(Errno::ENOSYS);
     }
 }
 
@@ -1396,6 +1095,573 @@ impl ProtonFs {
     /// Trash the child `name` under `parent` on the remote, then drop it from the
     /// local cache. Backs both `unlink` and `rmdir` (Proton trashes whole
     /// subtrees, so an `rmdir` of a non-empty dir behaves the same).
+    /// The body of [`Filesystem::create`], run off the dispatch loop.
+    fn serve_create(&self, parent: u64, name: &str, reply: ReplyCreate) {
+        if let Err(e) = self.core.ensure_children(parent) {
+            reply.error(e);
+            return;
+        }
+        let parent_uid = {
+            let st = self.core.state.lock();
+            match st.entries.get(&parent) {
+                Some(e) => e.uid.clone(),
+                None => {
+                    reply.error(Errno::ENOENT);
+                    return;
+                }
+            }
+        };
+        // A transient scratch name — a browser's in-flight `*.crdownload`, an
+        // editor's `*.swp` — is kept purely local and *parked*: no remote node is
+        // minted and its bytes never upload while it wears that name. The app
+        // renames the finished file to its real name, and that rename un-parks the
+        // create so only the completed file reaches Drive. Minting an empty remote
+        // node here instead is what let a stalled+resumed download fork a
+        // `(sync-conflict)` copy (docs/BUGS.md B70).
+        let transient = is_transient_name(name);
+        // Offline the server cannot mint a uid, so invent one and queue the
+        // create. The file is real to the caller either way; only its identity is
+        // provisional until the drain (offline.md Phase 3b).
+        //
+        // A parent that is itself still queued forces the same path even when we
+        // are online: the API has no folder to put this in yet.
+        let node =
+            if !transient && self.core.online.load(Ordering::Relaxed) && !is_local_uid(&parent_uid)
+            {
+                // Create an empty file on the remote so it has a real uid immediately;
+                // written bytes are buffered and sealed as a new revision on close.
+                let new_uid = match self.core.rt.block_on(self.core.client.upload_file(
+                    &parent_uid,
+                    name,
+                    media_type_for(name),
+                    b"",
+                )) {
+                    Ok(u) => u,
+                    Err(e) => {
+                        error!(%parent_uid, name, error = %e, "create file failed");
+                        reply.error(Errno::EIO);
+                        return;
+                    }
+                };
+                match self.core.fetch_node(&new_uid) {
+                    Ok(n) => n,
+                    Err(e) => {
+                        reply.error(e);
+                        return;
+                    }
+                }
+            } else {
+                match self
+                    .core
+                    .queue_local_node(&parent_uid, name, false, transient)
+                {
+                    Ok(n) => n,
+                    Err(e) => {
+                        reply.error(e);
+                        return;
+                    }
+                }
+            };
+        let new_uid = node.uid.clone();
+        // The base this handle writes over is the node as it actually exists —
+        // the empty file the server just minted — so its modification time comes
+        // from the node, never from the local clock. `queue_revision` turns this
+        // into `StagedWrite::based_on` and the drain compares that against the
+        // remote: a `now_secs()` here differs from the server's stamp by however
+        // long the create round-trip took, so the first write to a brand-new file
+        // conflicts with its own create whenever the second happens to tick in
+        // between.
+        let base_mtime = node.modification_time;
+        let (file, path) = match self.core.cache.create_scratch() {
+            Ok(x) => x,
+            Err(e) => {
+                error!(%new_uid, error = %e, "create scratch file failed");
+                reply.error(Errno::EIO);
+                return;
+            }
+        };
+        let mut st = self.core.state.lock();
+        let ino = st.intern(parent, node);
+        if let Some(entry) = st.entries.get_mut(&ino) {
+            entry.open_count = entry.open_count.saturating_add(1);
+        }
+        if let Some(kids) = st.children.get_mut(&parent)
+            && !kids.contains(&ino)
+        {
+            kids.push(ino);
+        }
+        let fh = st.next_fh;
+        st.next_fh += 1;
+        let aw = st.active_writes.entry(ino).or_insert_with(|| {
+            // A brand-new file: empty base, everything written is authored.
+            WriteHandle {
+                ino,
+                uid: new_uid,
+                file: Arc::new(file),
+                path,
+                written: Intervals::default(),
+                len: 0,
+                base_size: 0,
+                base_mtime,
+                // A brand-new file has no sealed remote revision to conflict with.
+                base_revision_id: None,
+                dirty: false,
+                open_count: 0,
+            }
+        });
+        aw.open_count += 1;
+        st.handles.insert(fh, ino);
+        let attr = self.attr(ino, &st.entries.get(&ino).unwrap().node);
+        reply.created(
+            &TTL,
+            &attr,
+            Generation(0),
+            FileHandle(fh),
+            FopenFlags::empty(),
+        );
+    }
+
+    /// The body of [`Filesystem::mkdir`], run off the dispatch loop.
+    fn serve_mkdir(&self, parent: u64, name: &str, reply: ReplyEntry) {
+        if let Err(e) = self.core.ensure_children(parent) {
+            reply.error(e);
+            return;
+        }
+        let parent_uid = {
+            let st = self.core.state.lock();
+            match st.entries.get(&parent) {
+                Some(e) => e.uid.clone(),
+                None => {
+                    reply.error(Errno::ENOENT);
+                    return;
+                }
+            }
+        };
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .ok();
+        // As in `create`: offline — or under a parent that is itself still
+        // queued — the folder becomes a placeholder that the drain turns into a
+        // real one (offline.md Phase 3b).
+        let node = if self.core.online.load(Ordering::Relaxed) && !is_local_uid(&parent_uid) {
+            let new_uid =
+                match self
+                    .core
+                    .rt
+                    .block_on(self.core.client.create_folder(&parent_uid, name, now))
+                {
+                    Ok(u) => u,
+                    Err(e) => {
+                        error!(%parent_uid, name, error = %e, "create folder failed");
+                        reply.error(Errno::EIO);
+                        return;
+                    }
+                };
+            match self.core.fetch_node(&new_uid) {
+                Ok(n) => n,
+                Err(e) => {
+                    reply.error(e);
+                    return;
+                }
+            }
+        } else {
+            match self.core.queue_local_node(&parent_uid, name, true, false) {
+                Ok(n) => n,
+                Err(e) => {
+                    reply.error(e);
+                    return;
+                }
+            }
+        };
+        let mut st = self.core.state.lock();
+        let local = is_local_uid(&node.uid);
+        let uid = node.uid.clone();
+        let ino = st.intern(parent, node);
+        if let Some(kids) = st.children.get_mut(&parent)
+            && !kids.contains(&ino)
+        {
+            kids.push(ino);
+        }
+        // A folder that exists only here has nothing to enumerate, and asking the
+        // API to enumerate a `local~` uid would 404. Record it as fully listed and
+        // empty, which it is, so reads stay offline-clean across a restart too.
+        if local {
+            st.children.insert(ino, Vec::new());
+            if let Err(e) = self.core.db.set_listed(&uid, true) {
+                warn!(%uid, error = %e, "db set_listed(true) failed for local folder");
+            }
+        }
+        let attr = self.attr(ino, &st.entries.get(&ino).unwrap().node);
+        reply.entry(&TTL, &attr, Generation(0));
+    }
+
+    /// The body of [`Filesystem::unlink`], run off the dispatch loop.
+    fn serve_unlink(&self, parent: u64, name_str: &str, reply: ReplyEmpty) {
+        if let Ok((ino, _)) = self.core.lookup_child(parent, name_str) {
+            let st = self.core.state.lock();
+            if let Some(entry) = st.entries.get(&ino)
+                && entry.node.is_folder()
+            {
+                reply.error(Errno::EISDIR);
+                return;
+            }
+        }
+        self.trash_child(parent, name_str, reply);
+    }
+
+    /// The body of [`Filesystem::rmdir`], run off the dispatch loop.
+    fn serve_rmdir(&self, parent: u64, name_str: &str, reply: ReplyEmpty) {
+        if let Ok((ino, _)) = self.core.lookup_child(parent, name_str) {
+            {
+                let st = self.core.state.lock();
+                if st
+                    .entries
+                    .get(&ino)
+                    .is_some_and(|entry| !entry.node.is_folder())
+                {
+                    reply.error(Errno::ENOTDIR);
+                    return;
+                }
+            }
+            // A missing cached listing says "unknown", not "empty". Proton's
+            // trash call is recursive, so enumerate before applying rmdir's
+            // POSIX emptiness rule.
+            if let Err(e) = self.core.ensure_children(ino) {
+                reply.error(e);
+                return;
+            }
+            if self.core.state.lock().has_children(ino) {
+                reply.error(Errno::ENOTEMPTY);
+                return;
+            }
+        }
+        self.trash_child(parent, name_str, reply);
+    }
+
+    /// The tail of [`Filesystem::release`], run off the dispatch loop: retire
+    /// what the closed handle leaves behind.
+    fn finish_release(
+        &self,
+        handle: Option<WriteHandle>,
+        unlinked_uid: Option<NodeUid>,
+        reply: ReplyEmpty,
+    ) {
+        let was_unlinked = unlinked_uid.is_some();
+        if let Some(uid) = unlinked_uid {
+            self.core.discard_queued_ops(&uid);
+            self.core.cache.evict(&uid);
+            self.core.evict_reader(&uid);
+        }
+        // Hand the bytes to the queue rather than uploading them here: the
+        // scratch file is the only copy of what was just written, and blocking
+        // the caller on the network is what made a copy into the mount run at
+        // upload speed (and fail outright offline).
+        match (handle, was_unlinked) {
+            (Some(h), true) => {
+                // POSIX keeps an unlinked file usable until the last close, but
+                // closing it must not resurrect those bytes as a new revision.
+                if let Err(e) = std::fs::remove_file(&h.path)
+                    && e.kind() != std::io::ErrorKind::NotFound
+                {
+                    warn!(path = %h.path.display(), error = %e, "discarding unlinked scratch file failed");
+                }
+                reply.ok();
+            }
+            (Some(h), false) => match self.core.queue_revision(&h) {
+                Ok(()) => reply.ok(),
+                Err(e) => reply.error(e),
+            },
+            (None, _) => reply.ok(),
+        }
+    }
+
+    /// The body of [`Filesystem::rename`], run off the dispatch loop.
+    fn serve_rename(
+        &self,
+        parent: u64,
+        name: &str,
+        newparent: u64,
+        newname: &str,
+        flags: RenameFlags,
+        reply: ReplyEmpty,
+    ) {
+        let (ino, uid) = match self.core.lookup_child(parent, name) {
+            Ok(x) => x,
+            Err(e) => {
+                reply.error(e);
+                return;
+            }
+        };
+        // Ancestor cycle check: moving a directory into itself or one of its descendants is forbidden by POSIX (EINVAL).
+        {
+            let st = self.core.state.lock();
+            if let Some(entry) = st.entries.get(&ino)
+                && entry.node.is_folder()
+                && st.is_ancestor_of(ino, newparent)
+            {
+                reply.error(Errno::EINVAL);
+                return;
+            }
+        }
+        // The destination has to be listed either way: the queued path pushes
+        // the node into that listing, and the online one drops it to force a
+        // re-enumeration.
+        if newparent != parent
+            && let Err(e) = self.core.ensure_children(newparent)
+        {
+            reply.error(e);
+            return;
+        }
+        let new_parent_uid = {
+            let st = self.core.state.lock();
+            match st.entries.get(&newparent) {
+                Some(e) => e.uid.clone(),
+                None => {
+                    reply.error(Errno::ENOENT);
+                    return;
+                }
+            }
+        };
+        // `rename(2)` replaces an existing destination; Proton has no replacing
+        // rename, so the victim has to be removed first and the operation stops
+        // being atomic. Without this the 422 surfaced as a blanket EIO and every
+        // write-to-temp-then-rename tool — rsync, atomic editor saves — failed
+        // at the very end of its transfer (bugs.md B13).
+        //
+        // `RENAME_EXCHANGE` has no Proton primitive and cannot be emulated
+        // without a window in which one of the two names does not exist.
+        if flags.contains(RenameFlags::RENAME_EXCHANGE) {
+            reply.error(Errno::EINVAL);
+            return;
+        }
+        let victim = match self.core.lookup_child(newparent, newname) {
+            // Renaming a node onto its own name is a no-op, never a self-replace.
+            Ok((_, vuid)) if vuid == uid => None,
+            Ok(x) => Some(x),
+            // Nothing to replace: the overwhelmingly common case.
+            Err(e) if e.code() == libc::ENOENT => None,
+            Err(e) => {
+                reply.error(e);
+                return;
+            }
+        };
+        if let Some((victim_ino, victim_uid)) = &victim {
+            if flags.contains(RenameFlags::RENAME_NOREPLACE) {
+                reply.error(Errno::EEXIST);
+                return;
+            }
+            // POSIX requires both ends to agree on being a directory, and the
+            // check has to happen before anything is trashed: getting it wrong
+            // turns a refusal into the destruction of the destination.
+            let (src_dir, dst_dir) = {
+                let st = self.core.state.lock();
+                let is_dir = |i: &u64| {
+                    st.entries
+                        .get(i)
+                        .map(|e| matches!(e.node.kind, NodeKind::Folder))
+                };
+                match (is_dir(&ino), is_dir(victim_ino)) {
+                    (Some(a), Some(b)) => (a, b),
+                    _ => {
+                        reply.error(Errno::ENOENT);
+                        return;
+                    }
+                }
+            };
+            // Replacing a directory means trashing it, and Proton trashes a
+            // folder with its whole subtree — so the destination's emptiness has
+            // to be known before the decision is made.
+            let dst_empty = if dst_dir {
+                if let Err(e) = self.core.ensure_children(*victim_ino) {
+                    reply.error(e);
+                    return;
+                }
+                self.core
+                    .state
+                    .lock()
+                    .children
+                    .get(victim_ino)
+                    .is_none_or(|kids| kids.is_empty())
+            } else {
+                true
+            };
+            if let Err(e) = check_replaceable(src_dir, dst_dir, dst_empty) {
+                reply.error(e);
+                return;
+            }
+            if let Err(e) = self.core.remove_replaced(victim_uid, newname) {
+                reply.error(e);
+                return;
+            }
+        }
+        // A node whose own creation is still queued has no server-side identity
+        // to rename: the queued op *is* the node, so rewriting its target is the
+        // whole rename. Nothing reaches the API, which is why this works offline
+        // (offline.md Phase 3b).
+        if is_local_uid(&uid) {
+            match self.core.db.rewrite_op_target(
+                &uid.to_string(),
+                &new_parent_uid.to_string(),
+                newname,
+            ) {
+                Ok(true) => {
+                    self.core.state.lock().rename_in_place(
+                        ino,
+                        newparent,
+                        &new_parent_uid,
+                        newname,
+                    );
+                    // Finalize: a transient scratch file (its create parked, bytes
+                    // held back) renamed to a finished name is the moment the
+                    // completed file is meant to reach Drive. Un-park the create so
+                    // the drain uploads it once (docs/BUGS.md B70). Renaming to
+                    // another transient name leaves it parked.
+                    if is_transient_name(name) && !is_transient_name(newname) {
+                        match self.core.db.set_create_hold(&uid.to_string(), false) {
+                            Ok(_) => {
+                                self.core.wake_drain();
+                                debug!(%uid, newname, "un-parked a finalized transient create");
+                            }
+                            Err(e) => {
+                                warn!(%uid, error = %e, "un-parking a finalized transient create failed")
+                            }
+                        }
+                    }
+                    debug!(%uid, newname, "renamed a node whose create is still queued");
+                    reply.ok();
+                }
+                // The create drained underneath us, so the node has a real uid
+                // now and this handle's is stale. A retry resolves it.
+                Ok(false) => {
+                    warn!(%uid, name, newname, "queued create vanished under a rename");
+                    self.core.restore_replaced(victim.as_ref(), newname);
+                    reply.error(Errno::EBUSY);
+                }
+                Err(e) => {
+                    error!(%uid, error = %e, "rewriting a queued create's target failed");
+                    self.core.restore_replaced(victim.as_ref(), newname);
+                    reply.error(Errno::EIO);
+                }
+            }
+            return;
+        }
+        // Offline, or into a folder that does not exist remotely yet: queue the
+        // rename rather than 404 or fail. Online moves into a real parent still
+        // take the synchronous path, so a genuine API refusal (permissions, a
+        // name clash) surfaces to the caller instead of becoming a queued op
+        // that can only ever conflict.
+        if rename_needs_queue(
+            self.core.online.load(Ordering::Relaxed),
+            is_local_uid(&new_parent_uid),
+            newparent != parent,
+            newname != name,
+        ) {
+            match self
+                .core
+                .queue_rename(ino, &uid, newparent, &new_parent_uid, newname)
+            {
+                Ok(()) => {
+                    // Send the rename response first. Kernel-side rename cache
+                    // updates happen while processing that response; notifying
+                    // before it lets those updates overwrite our invalidation
+                    // and retain an empty destination readdir page.
+                    reply.ok();
+                    if let Some(notifier) = self.core.notifier.get() {
+                        let _ = notifier.inval_entry(INodeNo(parent), OsStr::new(&name));
+                        let _ = notifier.inval_entry(INodeNo(newparent), OsStr::new(&newname));
+                        let _ = notifier.inval_inode(INodeNo(parent), 0, 0);
+                        if newparent != parent {
+                            let _ = notifier.inval_inode(INodeNo(newparent), 0, 0);
+                        }
+                    }
+                }
+                Err(e) => {
+                    self.core.restore_replaced(victim.as_ref(), newname);
+                    reply.error(e);
+                }
+            }
+            return;
+        }
+        // Rename first if both halves change. Moving first makes the encrypted
+        // name requirements stale and repeatedly failed with InvalidRequirements.
+        // A failure past this point has already trashed any node the rename was
+        // replacing, so put it back rather than leaving the caller with neither
+        // the source moved nor the destination intact.
+        if newname != name
+            && let Err(e) = self
+                .core
+                .rt
+                .block_on(self.core.client.rename_node(&uid, newname, None))
+        {
+            error!(%uid, error = %e, "rename failed");
+            self.core.restore_replaced(victim.as_ref(), newname);
+            reply.error(Errno::EIO);
+            return;
+        }
+        if newparent != parent {
+            let mut attempts = 0u32;
+            let moved = loop {
+                match self
+                    .core
+                    .rt
+                    .block_on(self.core.client.move_node(&uid, &new_parent_uid))
+                {
+                    Ok(()) => break Ok(()),
+                    Err(e)
+                        if newname != name
+                            && api_code(&e) == Some(ResponseCode::InvalidRequirements)
+                            && attempts < 20 =>
+                    {
+                        attempts += 1;
+                        // Requirement propagation routinely takes longer than
+                        // three seconds. Keep a bounded ten-second window; a
+                        // successful POSIX reply must mean both remote halves
+                        // landed, not merely that the second half was queued.
+                        std::thread::sleep(Duration::from_millis(500));
+                    }
+                    Err(e) => break Err(e),
+                }
+            };
+            if let Err(e) = moved {
+                error!(%uid, attempts, error = %e, "move after rename failed");
+                // The rename half landed in the source directory.
+                let mut state = self.core.state.lock();
+                let old_parent_uid = state
+                    .entries
+                    .get(&parent)
+                    .map(|entry| entry.uid.clone())
+                    .unwrap_or_else(|| uid.clone());
+                state.rename_in_place(ino, parent, &old_parent_uid, newname);
+                drop(state);
+                self.core.restore_replaced(victim.as_ref(), newname);
+                reply.error(Errno::EIO);
+                return;
+            }
+        }
+        self.core
+            .state
+            .lock()
+            .relocate(ino, parent, newparent, &new_parent_uid, newname);
+        reply.ok();
+    }
+
+    /// Expose a file's server-side thumbnail/preview as an extended attribute, so
+    /// a previewing client can fetch it without downloading the whole file. The
+    /// bytes are fetched on demand and cached; absence yields `ENODATA`.
+    /// Answer with an inode's current attributes, or `ENOENT` if it went away
+    /// while the caller was doing something slower.
+    fn reply_attr(&self, ino: u64, reply: ReplyAttr) {
+        let st = self.core.state.lock();
+        match st.entries.get(&ino) {
+            Some(e) => {
+                let attr = self.attr(ino, &e.node);
+                reply.attr(&TTL, &attr);
+            }
+            None => reply.error(Errno::ENOENT),
+        }
+    }
+
     fn trash_child(&self, parent: u64, name: &str, reply: ReplyEmpty) {
         let (ino, uid) = match self.core.lookup_child(parent, name) {
             Ok(x) => x,

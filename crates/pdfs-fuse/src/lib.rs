@@ -47,24 +47,26 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use fuser::ReplyXattr;
 use fuser::{
-    BackgroundSession, BsdFileFlags, Config, Errno, FileAttr, FileHandle, FileType, Filesystem,
-    FopenFlags, Generation, INodeNo, IoctlFlags, LockOwner, MountOption, Notifier, OpenAccMode,
-    OpenFlags, RenameFlags, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty,
-    ReplyEntry, ReplyIoctl, ReplyOpen, ReplyWrite, Request, Session, TimeOrNow, WriteFlags,
+    BackgroundSession, BsdFileFlags, Config, CopyFileRangeFlags, Errno, FileAttr, FileHandle,
+    FileType, Filesystem, FopenFlags, Generation, INodeNo, IoctlFlags, LockOwner, MountOption,
+    Notifier, OpenAccMode, OpenFlags, RenameFlags, ReplyAttr, ReplyCreate, ReplyData,
+    ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyIoctl, ReplyLseek, ReplyOpen, ReplyWrite, Request,
+    Session, TimeOrNow, WriteFlags,
 };
 use pdfs_core::cache::{BLOCK_SIZE, Baseline, ContentCache, StagedWrite};
-use pdfs_core::config::AppDirs;
+use pdfs_core::config::{AppDirs, SweepMode};
 use pdfs_core::control::{
     ActivityEntry, ActivityKind, DirEntry, ErrorKind, LocalHit, PhotoKind, PublicLinkInfo,
     SearchFilters, SearchHit, SearchSource, SyncFolderInfo, SyncPhase, SyncProgress,
     TransferDirection,
 };
 use pdfs_core::db::{
-    Db, LOCAL_VOLUME, OP_CREATE, OP_MKDIR, OP_RENAME, OP_REVISION, OP_TRASH, PendingOp, StoredNode,
-    StoredSyncFolder, StoredTrash,
+    Db, LOCAL_VOLUME, OP_CREATE, OP_MKDIR, OP_RENAME, OP_REVISION, OP_TRASH, PARK_UNTIL, PendingOp,
+    StoredNode, StoredSyncFolder, StoredTrash,
 };
 use pdfs_core::localindex;
 use pdfs_core::search::relevance_score;
+use pdfs_core::syncignore::is_transient_name;
 use pdfs_core::{CoreError, CoreResult};
 use proton_drive_rs::proton_sdk::api::ResponseCode;
 use proton_drive_rs::proton_sdk::error::ProtonError;
@@ -87,13 +89,14 @@ mod profile;
 mod reads;
 mod sharing;
 mod state;
+mod sweep;
 mod sync;
 mod transfers;
 mod upload;
 mod workers;
 use background::{run_event_sync, run_local_index};
 pub(crate) use mount::is_stale_mount;
-pub use mount::{MountOutcome, mount};
+pub use mount::{MountOptions, MountOutcome, mount};
 use mount::{SecondaryMount, clear_stale_mount, fuse_connection_id, umount_session_unblocked};
 use reads::{ReaderSlot, STREAM_BYPASS_MIN, StreamRing};
 use state::{Entry, Intervals, PendingRevision, State, WriteHandle};
@@ -237,6 +240,27 @@ struct Core {
     /// off one refresh rather than one per request.
     timeline_refreshing: Arc<AtomicBool>,
     trash_refreshing: Arc<AtomicBool>,
+    /// Conflict copies the sweep has already flagged as needing attention this
+    /// run, so a divergent `(sync-conflict …)` file is logged once rather than
+    /// on every sweep pass. See [`Core::run_conflict_sweep_loop`].
+    conflict_notified: Arc<Mutex<HashSet<NodeUid>>>,
+    /// Whether the conflict sweep may actually trash the duplicates it finds, or
+    /// only report them. Resolved once at mount from config + environment
+    /// ([`AppConfig::resolved_conflict_sweep`]); [`SweepMode::Off`] means the
+    /// sweep thread is never spawned at all. See `docs/BUGS.md` B71.
+    sweep_mode: SweepMode,
+    /// The latest server revision id this daemon has itself sealed, keyed by
+    /// node. A queued write whose baseline names an *earlier* revision would
+    /// normally fork into a `(sync-conflict)` copy when the drain finds the
+    /// remote already moved on — but if the remote sits at a revision *we*
+    /// sealed, no other device touched the file: it is a single-writer
+    /// stall→resume (a browser download that closed and reopened its fd, then
+    /// rewrote the whole file). [`Core::revision_conflict`] consults this to
+    /// adopt our own revision as the base and supersede instead of forking
+    /// (docs/BUGS.md B70, layer B). One entry per written node, overwritten as
+    /// the node advances and dropped when it is trashed; lost on restart, which
+    /// only widens the (already narrow) fork window across a daemon bounce.
+    own_sealed_revs: Arc<Mutex<HashMap<NodeUid, String>>>,
     /// Photos whose missing thumbnail is being generated right now. A tile that is
     /// still on screen asks for its thumbnail again every few seconds, and each of
     /// those downloads is a full-size photo — so an in-flight uid is never started
@@ -296,6 +320,147 @@ struct Core {
     /// uploading that same tree — the engine would upload files as they vanish
     /// and then walk the FUSE mount as if it were local.
     sync_locks: Arc<Mutex<HashMap<i64, Arc<Mutex<()>>>>>,
+    /// Nodes this daemon changed on the remote itself, and how many echoes of
+    /// those changes the event feed still owes us.
+    ///
+    /// The feed replays our own writes back at us seconds later, and a
+    /// `NodeUpdated` carries no revision id — nothing in it distinguishes "another
+    /// device changed this file" from "you changed this file". Treating the echo
+    /// as foreign is not free: it evicts the content blob we just uploaded, so the
+    /// next read re-downloads a revision the API may not be serving yet. That is
+    /// how a SQLite database written on the mount came back `malformed`, and how a
+    /// mount doing bulk uploads spent its time re-fetching its own bytes.
+    ///
+    /// So the first event for a node we changed ourselves, within
+    /// [`SELF_CHANGE_TTL_MS`], is consumed rather than applied: the tree already
+    /// holds what that event describes, because [`Core::refresh_after_upload`] put
+    /// it there. Anything beyond that applies normally, which bounds the staleness
+    /// a genuine remote change can suffer to one event.
+    ///
+    /// Shared across forks like `pending`: the drain that records the change and
+    /// the event task that consumes the echo are both per-daemon.
+    self_changes: Arc<Mutex<HashMap<NodeUid, SelfChange>>>,
+    /// Every live inode space: this mount's own `state` plus one per on-demand
+    /// fork ([`Core::fork_state`]). Shared by every fork, unlike `state` itself.
+    ///
+    /// There is exactly **one** drain thread per daemon, owned by the primary
+    /// mount, and it serves the whole `pending_op` table — including ops queued
+    /// by a forked mount, which keeps its nodes in its own `state`. So a drain
+    /// that reaches for `self.state` looks in the wrong inode space and silently
+    /// finds nothing: the fork's entry keeps its `local~` placeholder uid
+    /// forever, and every read of it short-circuits to empty because
+    /// [`Core::read_range`] refuses to ask the API about a `local~` uid. That
+    /// was `docs/BUGS.md` B74. Background work that rewrites node identity must
+    /// walk this instead ([`Core::for_each_state`]).
+    ///
+    /// `Weak`, so an unmounted fork's state is dropped rather than pinned here.
+    states: Arc<StateRegistry>,
+}
+
+/// How long a change this daemon made stays recognisable as its own. Generous
+/// against a feed that can lag, but finite: past it, an event for the node is
+/// applied like any other. See [`Core::self_changes`].
+const SELF_CHANGE_TTL_MS: i64 = 120_000;
+
+/// A remote change this daemon made, awaiting its echo from the event feed.
+struct SelfChange {
+    /// When we made it, in the same epoch millis as [`now_millis`].
+    at_ms: i64,
+    /// Echoes not yet seen. More than one because a single file can be created
+    /// and then have a revision uploaded, and the feed reports both.
+    echoes: u32,
+}
+
+/// Record one remote change this daemon made. Split from [`Core`] so the
+/// expiry and echo-counting rules can be tested against a clock the test owns.
+fn note_self_change(changes: &mut HashMap<NodeUid, SelfChange>, uid: &NodeUid, now_ms: i64) {
+    // Echoes that never arrived — a node trashed before its event came round, a
+    // feed that skipped it — would otherwise accumulate for the life of the
+    // daemon. Pruning on write keeps the map the size of the recent queue.
+    changes.retain(|_, c| now_ms - c.at_ms < SELF_CHANGE_TTL_MS);
+    let change = changes.entry(uid.clone()).or_insert(SelfChange {
+        at_ms: now_ms,
+        echoes: 0,
+    });
+    change.at_ms = now_ms;
+    change.echoes += 1;
+}
+
+/// Claim one echo, per [`Core::take_self_change`].
+fn take_self_change(
+    changes: &mut HashMap<NodeUid, SelfChange>,
+    uid: &NodeUid,
+    now_ms: i64,
+) -> bool {
+    let Some(change) = changes.get_mut(uid) else {
+        return false;
+    };
+    // Too old to attribute: the feed is far enough behind that this is as likely
+    // to be someone else's change as ours, and guessing wrong here costs the user
+    // a stale file.
+    if now_ms - change.at_ms >= SELF_CHANGE_TTL_MS {
+        changes.remove(uid);
+        return false;
+    }
+    change.echoes -= 1;
+    if change.echoes == 0 {
+        changes.remove(uid);
+    }
+    true
+}
+
+/// One live inode space, as published to the shared registry.
+///
+/// The notifier travels with the state because the two are only meaningful
+/// together: an inode number names a different node in every mount, so telling
+/// the kernel to drop inode 42 is only correct on the session that minted it.
+/// Background work that invalidates as well as mutates needs the matching pair,
+/// which is what [`Core::for_each_mount`] hands it.
+type LiveMount = (Arc<Mutex<State>>, Arc<OnceLock<Notifier>>);
+
+struct MountedState {
+    /// `Weak`, so an unmounted fork's state is dropped rather than pinned here;
+    /// a dead entry is reaped on the next registry walk.
+    state: std::sync::Weak<Mutex<State>>,
+    /// This mount's kernel notification channel — the same cell as
+    /// [`Core::notifier`], still empty until its session is spawned.
+    notifier: Arc<OnceLock<Notifier>>,
+}
+
+/// Every mounted inode space in the daemon, shared by the primary `Core` and
+/// every [`Core::fork_state`] clone of it.
+///
+/// Split out from `Core` so the reap-and-walk rule can be tested on its own: a
+/// fork that fails to appear here, or one that lingers after unmount, is exactly
+/// the failure `docs/BUGS.md` B74 was.
+#[derive(Default)]
+struct StateRegistry(Mutex<Vec<MountedState>>);
+
+impl StateRegistry {
+    /// Publish an inode space and the channel to the session that owns it.
+    ///
+    /// Registering the same `state` twice would make every walk visit it twice;
+    /// callers register exactly once, at mount time.
+    fn register(&self, state: &Arc<Mutex<State>>, notifier: Arc<OnceLock<Notifier>>) {
+        let mut states = self.0.lock();
+        states.retain(|m| m.state.strong_count() > 0);
+        states.push(MountedState {
+            state: Arc::downgrade(state),
+            notifier,
+        });
+    }
+
+    /// Every live mount, reaping the entries whose session has gone. Returns
+    /// owned handles so callers take the per-state locks one at a time rather
+    /// than holding the registry lock across the work.
+    fn live(&self) -> Vec<LiveMount> {
+        let mut states = self.0.lock();
+        states.retain(|m| m.state.strong_count() > 0);
+        states
+            .iter()
+            .filter_map(|m| Some((m.state.upgrade()?, m.notifier.clone())))
+            .collect()
+    }
 }
 
 /// Why [`Core::apply_sync_folder_mode`] did not switch a folder. The two cases are
@@ -310,6 +475,54 @@ enum SwitchBlocked {
 }
 
 impl Core {
+    /// Register an inode space so background work can reach it. Called once for
+    /// the primary mount and once per on-demand fork.
+    fn register_state(&self) {
+        self.states.register(&self.state, self.notifier.clone());
+    }
+
+    /// Run `apply` against every live inode space — this daemon's primary mount
+    /// and each on-demand fork — one lock at a time.
+    ///
+    /// The drain and the sync engine are per-daemon but node state is per-mount,
+    /// so anything they change about a node has to be offered to whichever mount
+    /// actually holds it. Which one that is cannot be known from the op: a
+    /// `pending_op` row records a uid, not the session that queued it. Applying
+    /// to all of them is correct because a uid is unique across mounts — at most
+    /// one state has an entry for it, and the rest are no-ops.
+    fn for_each_state(&self, mut apply: impl FnMut(&mut State)) {
+        for (state, _) in self.states.live() {
+            apply(&mut state.lock());
+        }
+    }
+
+    /// Like [`Core::for_each_state`], but also hands over the mount's kernel
+    /// notification channel, so work that invalidates cached metadata reaches
+    /// the session that actually minted the inodes it is naming.
+    ///
+    /// `None` for a mount whose session has not been spawned yet — there is
+    /// nothing to invalidate in a kernel that has never been told about it.
+    fn for_each_mount(&self, mut apply: impl FnMut(&mut State, Option<&Notifier>)) {
+        for (state, notifier) in self.states.live() {
+            apply(&mut state.lock(), notifier.get());
+        }
+    }
+
+    /// Record that this daemon just changed `uid` on the remote, so the event
+    /// feed's echo of that change is recognised instead of re-applied. Called
+    /// from the drain once the remote has actually accepted the change and the
+    /// tree has been brought level with it. See [`Core::self_changes`].
+    pub(crate) fn note_self_change(&self, uid: &NodeUid) {
+        note_self_change(&mut self.self_changes.lock(), uid, now_millis());
+    }
+
+    /// Claim one outstanding echo for `uid`, reporting whether this event is one
+    /// this daemon caused. Consuming rather than merely testing is what bounds
+    /// the suppression: the next event for the node applies normally.
+    fn take_self_change(&self, uid: &NodeUid) -> bool {
+        take_self_change(&mut self.self_changes.lock(), uid, now_millis())
+    }
+
     /// Rehydrate the in-memory `State` maps from the DB on mount, so a cold
     /// start serves previously-seen metadata (stable inodes, instant listings)
     /// without re-hitting the API. The root inode is already installed by
@@ -1146,7 +1359,12 @@ impl Core {
             base_mtime: h.base_mtime,
             complete: authored == [(0, h.len)],
             authored,
-            based_on: self.remote_baseline(&h.uid, h.base_mtime, h.base_size),
+            based_on: self.remote_baseline(
+                &h.uid,
+                h.base_mtime,
+                h.base_size,
+                h.base_revision_id.clone(),
+            ),
         };
         self.enqueue_staged_write(&h.uid, h.ino, &h.path, meta)?;
         debug!(uid = %h.uid, len = h.len, complete = filled, "queued revision upload");
@@ -1167,7 +1385,13 @@ impl Core {
     ///
     /// `None` for a node that has never existed remotely: there is no revision
     /// to conflict with until its create drains.
-    fn remote_baseline(&self, uid: &NodeUid, base_mtime: i64, base_size: u64) -> Option<Baseline> {
+    fn remote_baseline(
+        &self,
+        uid: &NodeUid,
+        base_mtime: i64,
+        base_size: u64,
+        base_revision_id: Option<String>,
+    ) -> Option<Baseline> {
         if is_local_uid(uid) {
             return None;
         }
@@ -1177,6 +1401,7 @@ impl Core {
                 mtime: base_mtime,
                 size: base_size,
                 hash: None,
+                revision_id: base_revision_id,
             }),
         }
     }
@@ -1293,12 +1518,15 @@ impl Core {
     /// - Shrinking authors nothing: every remaining byte still comes from the
     ///   base, so it is the drain that has to fetch it.
     fn queue_truncate(&self, ino: u64, size: u64) -> Result<(), Errno> {
-        let (uid, base_mtime, base_size) = {
+        let (uid, base_mtime, base_size, base_revision_id) = {
             let st = self.state.lock();
             match st.entries.get(&ino) {
-                Some(e) if e.node.is_file() => {
-                    (e.uid.clone(), e.node.modification_time, node_size(&e.node))
-                }
+                Some(e) if e.node.is_file() => (
+                    e.uid.clone(),
+                    e.node.modification_time,
+                    node_size(&e.node),
+                    node_revision_id(&e.node),
+                ),
                 Some(_) => return Err(Errno::EISDIR),
                 None => return Err(Errno::ENOENT),
             }
@@ -1374,7 +1602,7 @@ impl Core {
                 base_mtime,
                 authored,
                 complete,
-                based_on: self.remote_baseline(&uid, base_mtime, base_size),
+                based_on: self.remote_baseline(&uid, base_mtime, base_size, base_revision_id),
             },
         };
         self.enqueue_staged_write(&uid, ino, &path, meta)?;
@@ -1394,6 +1622,7 @@ impl Core {
         parent_uid: &NodeUid,
         name: &str,
         is_dir: bool,
+        hold: bool,
     ) -> Result<Node, Errno> {
         let uid = mint_local_uid();
         let op = PendingOp {
@@ -1407,7 +1636,10 @@ impl Core {
             created_at: now_millis(),
             attempts: 0,
             last_error: None,
-            next_attempt_at: 0,
+            // Parked when the name is transient: its bytes ride on this create
+            // (via `attach_blob_to_create`) and must not upload until a rename to
+            // the finished name un-parks it (docs/BUGS.md B70).
+            next_attempt_at: if hold { PARK_UNTIL } else { 0 },
         };
         self.db.enqueue_op(&op).map_err(|e| {
             error!(%parent_uid, name, error = %e, "queueing local node failed");
@@ -1495,7 +1727,14 @@ impl Core {
             Errno::EIO
         })?;
         self.hidden.lock().insert(uid.clone());
-        self.state.lock().forget(uid);
+        // Withdrawn from every mount, not just the one the unlink came through:
+        // a sync folder maps a remote folder that also exists under My Files, so
+        // the same uid can be interned in two inode spaces at once and the other
+        // one would go on serving a file the user just trashed
+        // (`docs/BUGS.md` B74).
+        self.for_each_state(|st| {
+            st.forget(uid);
+        });
         self.cache.evict(uid);
         self.evict_reader(uid);
         self.wake_drain();
@@ -2112,7 +2351,11 @@ impl Core {
         self.rt
             .block_on(self.client.rename_node(&uid, new_name, None))
             .map_err(|e| CoreError::from_api(&e, "rename"))?;
-        self.state.lock().forget(&uid);
+        // Every mount, so a fork showing the same node re-interns it under the
+        // new name instead of keeping the old one (`docs/BUGS.md` B74).
+        self.for_each_state(|st| {
+            st.forget(&uid);
+        });
         self.invalidate_parent_listing(rel);
         Ok(new_name.to_string())
     }
@@ -2173,7 +2416,9 @@ impl Core {
     fn remove_replaced(&self, uid: &NodeUid, name: &str) -> Result<(), Errno> {
         if is_local_uid(uid) {
             self.discard_queued_ops(uid);
-            self.state.lock().forget(uid);
+            self.for_each_state(|st| {
+                st.forget(uid);
+            });
             debug!(%uid, name, "replaced a node whose create was still queued");
             return Ok(());
         }
@@ -2186,7 +2431,11 @@ impl Core {
             return Err(Errno::EIO);
         }
         self.discard_queued_ops(uid);
-        self.state.lock().forget(uid);
+        // The node was trashed on the server; withdraw it from every inode
+        // space that had it, not only the mount the rename came through.
+        self.for_each_state(|st| {
+            st.forget(uid);
+        });
         self.cache.evict(uid);
         self.evict_reader(uid);
         self.invalidate_trash();
@@ -2371,14 +2620,15 @@ impl Core {
                 hidden.remove(uid);
             }
         }
-        {
-            let mut st = self.state.lock();
-            for parent in parents {
-                if let Some(&ino) = st.by_uid.get(&parent) {
+        // Keyed by uid, so it applies to every mount: a restored node reappears
+        // in whichever inode spaces show its parent, not only the primary one.
+        self.for_each_state(|st| {
+            for parent in &parents {
+                if let Some(&ino) = st.by_uid.get(parent) {
                     st.invalidate_listing(ino);
                 }
             }
-        }
+        });
         self.invalidate_trash();
         Ok(parsed.len())
     }
@@ -2414,11 +2664,15 @@ impl Core {
     /// Forget every trace of nodes that no longer exist anywhere: their inode and
     /// DB row, and their cached content.
     fn drop_local(&self, uids: &[NodeUid]) {
-        let mut st = self.state.lock();
-        for uid in uids {
-            st.forget(uid);
-        }
-        drop(st);
+        // Every mount: these nodes are gone from the server, and a sync-folder
+        // fork showing the same uid would otherwise keep serving them
+        // (`docs/BUGS.md` B74). A uid is unique across inode spaces, so this is
+        // a no-op in every mount but the one that holds it.
+        self.for_each_state(|st| {
+            for uid in uids {
+                st.forget(uid);
+            }
+        });
         for uid in uids {
             self.cache.evict(uid);
             self.evict_reader(uid);
@@ -2725,6 +2979,8 @@ fn local_node(uid: NodeUid, parent_uid: NodeUid, name: String, is_dir: bool) -> 
                 total_size_on_storage: 0,
                 // No revision has been sealed: nothing has been uploaded yet.
                 active_revision_state: None,
+                active_revision_id: None,
+                content_sha1: None,
                 claimed_size: Some(0),
                 claimed_modification_time: None,
             }
@@ -2930,6 +3186,27 @@ fn node_size(node: &Node) -> u64 {
             total_size_on_storage,
             ..
         } => claimed_size.unwrap_or(*total_size_on_storage).max(0) as u64,
+    }
+}
+
+/// The server revision id of a node's active revision, if it is a file that has
+/// one. The stable identity the drain conflict-checks against (see [`Baseline`]).
+fn node_revision_id(node: &Node) -> Option<String> {
+    match &node.kind {
+        NodeKind::Folder => None,
+        NodeKind::File {
+            active_revision_id, ..
+        } => active_revision_id.clone(),
+    }
+}
+
+/// The plaintext content SHA-1 of a file node, if its active revision carried one.
+/// A download-free content fingerprint the conflict sweep uses to prove two files
+/// hold identical bytes before it removes one.
+fn node_content_sha1(node: &Node) -> Option<String> {
+    match &node.kind {
+        NodeKind::Folder => None,
+        NodeKind::File { content_sha1, .. } => content_sha1.clone(),
     }
 }
 
@@ -3290,6 +3567,8 @@ mod pending_size_tests {
                 media_type: "text/plain".into(),
                 total_size_on_storage: 0,
                 active_revision_state: None,
+                active_revision_id: None,
+                content_sha1: None,
                 claimed_size: Some(claimed),
                 claimed_modification_time: None,
             },
@@ -3356,10 +3635,119 @@ mod pending_size_tests {
 #[cfg(test)]
 mod tests {
     use super::{
-        Intervals, PendingRevision, conflict_name, copy_pending_for_truncate, fuse_name,
-        is_stale_mount, node_visible, rename_needs_queue,
+        HashMap, Intervals, PendingRevision, SELF_CHANGE_TTL_MS, StateRegistry, conflict_name,
+        copy_pending_for_truncate, fuse_name, is_stale_mount, node_visible, note_self_change,
+        parse_node_uid, rename_needs_queue, take_self_change,
     };
     use pdfs_core::cache::{Baseline, StagedWrite};
+
+    /// The registry every mount publishes itself into is what lets the daemon's
+    /// single drain thread reach a node living in an on-demand fork's inode
+    /// space. A fork missing from it reads as an empty file for the life of the
+    /// daemon (`docs/BUGS.md` B74), so the walk has to see *every* registered
+    /// mount — and only the ones still mounted.
+    #[test]
+    fn state_registry_walks_every_live_mount_and_reaps_the_rest() {
+        let registry = StateRegistry::default();
+        assert!(registry.live().is_empty(), "a fresh registry has no mounts");
+
+        // The primary mount plus two on-demand forks.
+        let (primary, _p) = state_test_helper();
+        let (fork_a, _a) = state_test_helper();
+        let (fork_b, _b) = state_test_helper();
+        let primary = std::sync::Arc::new(parking_lot::Mutex::new(primary));
+        let fork_a = std::sync::Arc::new(parking_lot::Mutex::new(fork_a));
+        let fork_b = std::sync::Arc::new(parking_lot::Mutex::new(fork_b));
+        for state in [&primary, &fork_a, &fork_b] {
+            registry.register(state, std::sync::Arc::new(std::sync::OnceLock::new()));
+        }
+        assert_eq!(registry.live().len(), 3, "every registered mount is walked");
+
+        // `live()` must not itself pin a mount alive, or an unmounted fork could
+        // never be reaped.
+        assert_eq!(
+            std::sync::Arc::strong_count(&fork_a),
+            1,
+            "the registry holds forks weakly"
+        );
+
+        // Unmounting a fork drops its state; the dead entry goes on the next walk.
+        drop(fork_a);
+        assert_eq!(registry.live().len(), 2, "an unmounted fork is dropped");
+        assert_eq!(
+            registry.0.lock().len(),
+            2,
+            "and its slot is reaped, not merely skipped"
+        );
+
+        drop(primary);
+        drop(fork_b);
+        assert!(
+            registry.live().is_empty(),
+            "the last mount going away empties the registry"
+        );
+    }
+
+    /// An event feed carries no revision id, so the only thing that tells a
+    /// remote change apart from the echo of one this daemon just made is this
+    /// bookkeeping. Getting it wrong is expensive in both directions: too eager
+    /// and we evict the bytes we uploaded and re-download them from an API that
+    /// may still be serving the previous revision (a SQLite file on the mount
+    /// read back `malformed`); too generous and a real change from another device
+    /// is ignored.
+    #[test]
+    fn a_self_change_is_claimed_once_and_expires() {
+        let mut changes = HashMap::new();
+        let uid = parse_node_uid("vol~link").unwrap();
+        let other = parse_node_uid("vol~other").unwrap();
+        let t0 = 1_000_000;
+
+        assert!(
+            !take_self_change(&mut changes, &uid, t0),
+            "a node we never touched is never ours"
+        );
+
+        note_self_change(&mut changes, &uid, t0);
+        assert!(
+            take_self_change(&mut changes, &uid, t0 + 5_000),
+            "the echo of our own change is claimed"
+        );
+        assert!(
+            !take_self_change(&mut changes, &uid, t0 + 6_000),
+            "and only once, so a later foreign change still applies"
+        );
+
+        // A create followed by a revision upload is two changes to one node, and
+        // the feed reports both.
+        note_self_change(&mut changes, &uid, t0);
+        note_self_change(&mut changes, &uid, t0);
+        assert!(take_self_change(&mut changes, &uid, t0 + 1));
+        assert!(take_self_change(&mut changes, &uid, t0 + 2));
+        assert!(!take_self_change(&mut changes, &uid, t0 + 3));
+
+        // Past the window the attribution is a guess, and a wrong guess leaves
+        // the user looking at a stale file.
+        note_self_change(&mut changes, &uid, t0);
+        assert!(!take_self_change(
+            &mut changes,
+            &uid,
+            t0 + SELF_CHANGE_TTL_MS
+        ));
+        assert!(
+            !changes.contains_key(&uid),
+            "an expired change is dropped, not left to be re-tested"
+        );
+
+        // An echo that never arrives must not accumulate for the life of the
+        // daemon; the next recorded change prunes it.
+        note_self_change(&mut changes, &uid, t0);
+        note_self_change(&mut changes, &other, t0 + SELF_CHANGE_TTL_MS);
+        assert_eq!(
+            changes.len(),
+            1,
+            "recording a change prunes the ones whose echo never came"
+        );
+    }
 
     /// The predicate must answer *only* for a dead FUSE connection. A healthy
     /// directory and an absent path are both "not stale" — widening it to any
@@ -3486,6 +3874,7 @@ mod tests {
                     mtime: 42,
                     size: 3,
                     hash: None,
+                    revision_id: None,
                 }),
             },
         }
@@ -3661,6 +4050,8 @@ mod tests {
                     media_type: "text/plain".into(),
                     total_size_on_storage: 0,
                     active_revision_state: None,
+                    active_revision_id: None,
+                    content_sha1: None,
                     claimed_size: Some(0),
                     claimed_modification_time: None,
                 }

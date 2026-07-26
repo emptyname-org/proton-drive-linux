@@ -573,6 +573,11 @@ pub enum ActivityKind {
     Share,
     PublicLink,
     Unshare,
+    /// A `(sync-conflict …)` copy that needs the user's attention: it diverges
+    /// from the live file (or has no sibling), so the auto-sweep left it in place
+    /// rather than removing it. An auto-*removed* identical copy is logged as a
+    /// [`ActivityKind::Trash`] instead, since that is what happened to it.
+    Conflict,
 }
 
 /// One line in the daemon's activity log (in [`Response::Activity`]). Newest

@@ -42,7 +42,7 @@ pub use local::LocalFileHit;
 pub use maintenance::{DbStats, VacuumOutcome};
 pub use nodes::{SearchHit, StoredNode};
 pub use ops::{
-    AttachedBlob, LOCAL_VOLUME, OP_CREATE, OP_MKDIR, OP_RENAME, OP_REVISION, OP_TRASH,
+    AttachedBlob, LOCAL_VOLUME, OP_CREATE, OP_MKDIR, OP_RENAME, OP_REVISION, OP_TRASH, PARK_UNTIL,
     PendingCounts, PendingOp, op_supersedes,
 };
 pub use photos::{StoredPhoto, THUMB_HAVE, THUMB_NONE, THUMB_UNKNOWN};

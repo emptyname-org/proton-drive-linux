@@ -20,6 +20,59 @@ pub const KEYRING_SERVICE: &str = "proton-drive-linux";
 /// blobs back under this; pinned files are exempt. See [`crate::cache`].
 pub const DEFAULT_CACHE_BUDGET_BYTES: u64 = 5 * 1024 * 1024 * 1024;
 
+/// Environment override for [`AppConfig::resolved_conflict_sweep`]. Exists so a
+/// support case can disable the sweep without editing the config file or
+/// reinstalling — it wins over the stored setting.
+pub const CONFLICT_SWEEP_ENV: &str = "PDFS_CONFLICT_SWEEP";
+
+/// What the background conflict sweep (`pdfs-fuse`'s `pdfs-conflict-sweep`
+/// thread) is allowed to do about a `(sync-conflict …)` copy it believes is a
+/// redundant duplicate.
+///
+/// Defaults to [`SweepMode::Report`]: the sweep's whole reason to exist is that
+/// the *previous* revision-identity check was wrong (B69), so the replacement is
+/// not trusted with deletion until it has a release cycle of field evidence
+/// behind it. See `docs/BUGS.md` B71.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum SweepMode {
+    /// Do not run the sweep at all — the thread is never spawned.
+    Off,
+    /// Run, and log what it *would* remove, but never trash anything. Divergent
+    /// and orphaned copies are still surfaced to the activity feed as usual.
+    #[default]
+    Report,
+    /// Trash copies proven identical to their live sibling.
+    Enforce,
+}
+
+impl SweepMode {
+    /// Parse an operator-supplied value ([`CONFLICT_SWEEP_ENV`] or a CLI flag).
+    /// `None` for anything unrecognised, so a typo falls back to the stored
+    /// setting rather than silently picking a mode the operator did not ask for.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "off" | "no" | "false" | "0" | "disabled" => Some(Self::Off),
+            "report" | "dry-run" | "dryrun" | "observe" => Some(Self::Report),
+            "enforce" | "on" | "yes" | "true" | "1" => Some(Self::Enforce),
+            _ => None,
+        }
+    }
+
+    /// Whether this mode is allowed to trash a duplicate.
+    pub fn is_enforcing(self) -> bool {
+        matches!(self, Self::Enforce)
+    }
+}
+
+/// Precedence for [`AppConfig::resolved_conflict_sweep`], split out from the
+/// environment read so it can be unit-tested without mutating process state.
+fn resolve_sweep_mode(env: Option<&str>, stored: Option<SweepMode>) -> SweepMode {
+    env.and_then(SweepMode::parse)
+        .or(stored)
+        .unwrap_or_default()
+}
+
 /// Configuration structure allowing the user to customize client identification headers.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct AppConfig {
@@ -48,6 +101,11 @@ pub struct AppConfig {
     /// by hostname". Defaulted for configs predating the field.
     #[serde(default)]
     pub device_uid: Option<String>,
+    /// What the background conflict sweep may do. `None` means "use
+    /// [`SweepMode::default`]" (report-only). Defaulted for configs predating
+    /// the field, and overridable at runtime via [`CONFLICT_SWEEP_ENV`].
+    #[serde(default)]
+    pub conflict_sweep: Option<SweepMode>,
 }
 
 impl Default for AppConfig {
@@ -59,6 +117,7 @@ impl Default for AppConfig {
             mountpoint: None,
             ignore_patterns: None,
             device_uid: None,
+            conflict_sweep: None,
         }
     }
 }
@@ -68,6 +127,20 @@ impl AppConfig {
     /// [`DEFAULT_CACHE_BUDGET_BYTES`] when unset.
     pub fn resolved_cache_budget(&self) -> u64 {
         self.cache_budget.unwrap_or(DEFAULT_CACHE_BUDGET_BYTES)
+    }
+
+    /// The effective conflict-sweep mode: the [`CONFLICT_SWEEP_ENV`] override if
+    /// it parses, then the user's stored choice, then [`SweepMode::default`].
+    ///
+    /// The environment wins so a support case can stop a destructive background
+    /// loop without editing config or reinstalling (`docs/BUGS.md` B71). An
+    /// unparseable value is ignored rather than treated as "off", so a typo
+    /// cannot silently change behaviour in either direction.
+    pub fn resolved_conflict_sweep(&self) -> SweepMode {
+        resolve_sweep_mode(
+            std::env::var(CONFLICT_SWEEP_ENV).ok().as_deref(),
+            self.conflict_sweep,
+        )
     }
 
     /// The effective global sync ignore patterns: the user's explicit list, or
@@ -374,6 +447,7 @@ mod tests {
             mountpoint: Some("/tmp/x".to_string()),
             ignore_patterns: Some(vec!["build/".to_string()]),
             device_uid: Some("dev-uid".to_string()),
+            conflict_sweep: Some(SweepMode::Enforce),
         };
         let json = serde_json::to_string(&config).unwrap();
         let decoded: AppConfig = serde_json::from_str(&json).unwrap();
@@ -386,6 +460,62 @@ mod tests {
         let default_config = AppConfig::default();
         assert_eq!(default_config.app_version, APP_VERSION);
         assert_eq!(default_config.user_agent, USER_AGENT);
+    }
+
+    #[test]
+    fn sweep_mode_defaults_to_report_only() {
+        // The sweep trashes user files, so an installed config that has never
+        // heard of the setting must not get the enforcing behaviour.
+        assert_eq!(SweepMode::default(), SweepMode::Report);
+        assert!(!SweepMode::default().is_enforcing());
+        assert_eq!(resolve_sweep_mode(None, None), SweepMode::Report);
+    }
+
+    #[test]
+    fn sweep_mode_parses_operator_spellings() {
+        for s in ["off", "OFF", " no ", "false", "0", "disabled"] {
+            assert_eq!(SweepMode::parse(s), Some(SweepMode::Off), "{s}");
+        }
+        for s in ["report", "dry-run", "dryrun", "observe"] {
+            assert_eq!(SweepMode::parse(s), Some(SweepMode::Report), "{s}");
+        }
+        for s in ["enforce", "on", "yes", "true", "1"] {
+            assert_eq!(SweepMode::parse(s), Some(SweepMode::Enforce), "{s}");
+        }
+        // A typo must not resolve to anything, so it falls through to the config.
+        assert_eq!(SweepMode::parse("offf"), None);
+        assert_eq!(SweepMode::parse(""), None);
+    }
+
+    #[test]
+    fn sweep_mode_env_overrides_config_but_a_typo_does_not() {
+        let stored = Some(SweepMode::Enforce);
+        // The point of the override: kill a destructive loop without editing config.
+        assert_eq!(resolve_sweep_mode(Some("off"), stored), SweepMode::Off);
+        // Unrecognised value falls back to the stored choice rather than guessing.
+        assert_eq!(resolve_sweep_mode(Some("nope"), stored), SweepMode::Enforce);
+        assert_eq!(resolve_sweep_mode(None, stored), SweepMode::Enforce);
+        // No env, no stored value: report-only.
+        assert_eq!(resolve_sweep_mode(Some("nope"), None), SweepMode::Report);
+    }
+
+    #[test]
+    fn a_config_predating_conflict_sweep_still_loads() {
+        let json = r#"{"app_version":"v","user_agent":"u"}"#;
+        let decoded: AppConfig = serde_json::from_str(json).unwrap();
+        assert!(decoded.conflict_sweep.is_none());
+    }
+
+    #[test]
+    fn sweep_mode_round_trips_through_the_config_file() {
+        let config = AppConfig {
+            conflict_sweep: Some(SweepMode::Enforce),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        assert!(json.contains(r#""conflict_sweep":"enforce""#), "{json}");
+        let decoded: AppConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.conflict_sweep, Some(SweepMode::Enforce));
     }
 
     #[test]

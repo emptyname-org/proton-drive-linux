@@ -1002,6 +1002,7 @@ fn activity_verb(kind: pdfs_core::control::ActivityKind) -> &'static str {
         Share => "share",
         PublicLink => "link",
         Unshare => "unshare",
+        Conflict => "conflict",
     }
 }
 
@@ -1290,7 +1291,10 @@ fn mount_once(mountpoint: Option<PathBuf>) -> Result<pdfs_fuse::MountOutcome> {
         cache,
         &control_socket,
         db,
-        username,
+        pdfs_fuse::MountOptions {
+            username,
+            sweep_mode: config.resolved_conflict_sweep(),
+        },
     );
 
     // Clean unmount check (as a best-effort final backup).

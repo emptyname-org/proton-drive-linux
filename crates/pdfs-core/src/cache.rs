@@ -150,15 +150,23 @@ pub struct StagedWrite {
     pub based_on: Option<Baseline>,
 }
 
-/// The identity of a remote revision, as far as we can observe it: a file whose
-/// size and mtime both still match the ones a queued change was made against has
-/// not been rewritten by anyone else in the meantime.
+/// The identity of a remote revision, as far as we can observe it.
+///
+/// `revision_id` is the authoritative identity when present: the server assigns a
+/// fresh id to every sealed revision, so an unchanged id proves no one rewrote
+/// the file — even when the server re-stamped its `mtime` on the *same* revision,
+/// which is the drift that used to cut spurious conflict copies (B16/B25).
+/// `mtime`/`size` remain the fallback for a baseline recorded before the id was
+/// observable, or a node read through a surface that does not carry it.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct Baseline {
     pub mtime: i64,
     pub size: u64,
     #[serde(default)]
     pub hash: Option<String>,
+    /// Server revision id this change was made against (`None` if unknown).
+    #[serde(default)]
+    pub revision_id: Option<String>,
 }
 
 /// Content cache rooted at a directory, with a sibling pin-registry file.
@@ -1873,6 +1881,7 @@ mod tests {
                 mtime: 100,
                 size: 40,
                 hash: None,
+                revision_id: None,
             }),
         };
         let staged = c.stage_write(&meta, &scratch).unwrap();

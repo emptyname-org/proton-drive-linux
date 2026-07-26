@@ -36,8 +36,8 @@ use super::state::Intervals;
 use super::transfers::CountingReader;
 use super::{
     Core, DRAIN_BACKOFF_MAX, DRAIN_BACKOFF_MIN, DRAIN_IDLE_POLL, ROOT_INO, conflict_name,
-    is_already_exists, is_gone, is_local_uid_str, media_type_for, node_size, now_millis, now_secs,
-    parse_node_uid,
+    is_already_exists, is_gone, is_local_uid_str, media_type_for, node_revision_id, node_size,
+    now_millis, now_secs, parse_node_uid,
 };
 
 impl Core {
@@ -229,6 +229,7 @@ impl Core {
             }
         }
         self.db.delete_op(op.id)?;
+        self.note_self_change(&uid);
         info!(%uid, name = %landed, "pending rename landed");
         Ok(())
     }
@@ -252,6 +253,7 @@ impl Core {
             Err(e) => return Err(e.into()),
         }
         self.db.delete_op(op.id)?;
+        self.own_sealed_revs.lock().remove(&uid);
         self.invalidate_trash();
         self.log_activity(ActivityKind::Trash, &name, "trashed", true);
         info!(%uid, name, "pending trash landed");
@@ -262,18 +264,19 @@ impl Core {
     /// it away from the one the user asked for. Best effort: the event sync
     /// would correct the tree anyway, but not before the user has looked at it.
     pub(crate) fn adopt_drained_name(&self, uid: &NodeUid, name: &str) {
-        let mut st = self.state.lock();
-        let Some(&ino) = st.by_uid.get(uid) else {
-            return;
-        };
-        let Some(entry) = st.entries.get_mut(&ino) else {
-            return;
-        };
-        entry.node.name = name.to_string();
-        let node = entry.node.clone();
-        if let Err(e) = st.db.upsert_node(&node) {
-            warn!(%uid, error = %e, "db upsert_node failed after a conflict rename");
-        }
+        self.for_each_state(|st| {
+            let Some(&ino) = st.by_uid.get(uid) else {
+                return;
+            };
+            let Some(entry) = st.entries.get_mut(&ino) else {
+                return;
+            };
+            entry.node.name = name.to_string();
+            let node = entry.node.clone();
+            if let Err(e) = st.db.upsert_node(&node) {
+                warn!(%uid, error = %e, "db upsert_node failed after a conflict rename");
+            }
+        });
     }
 
     /// Make a node that so far exists only on this machine real, and adopt the
@@ -342,6 +345,9 @@ impl Core {
         // sync, whereas a surviving op would create the file a second time.
         self.db.delete_op(op.id)?;
         self.adopt_real_uid(&local, &real)?;
+        // The feed will report this create back to us; the tree already has it
+        // under its real uid, so that event is ours to ignore (`Core::self_changes`).
+        self.note_self_change(&real);
         if let Some(blob) = op.blob_path.as_deref() {
             self.cache.discard_staged(Path::new(blob));
         }
@@ -418,6 +424,14 @@ impl Core {
     ///
     /// The inode is deliberately kept, so anything already holding the file open
     /// keeps working across the drain.
+    ///
+    /// Applied to **every** live inode space, not just this Core's. A node
+    /// created inside an on-demand sync folder lives in that fork's `state`,
+    /// while the drain that lands its create belongs to the primary mount — so
+    /// reaching for `self.state` here found nothing and left the fork's entry on
+    /// its `local~` uid, which reads as an empty file for as long as the daemon
+    /// runs (`docs/BUGS.md` B74). A uid is unique across mounts, so at most one
+    /// of them matches and the others are no-ops.
     pub(crate) fn adopt_real_uid(
         &self,
         local: &NodeUid,
@@ -430,8 +444,10 @@ impl Core {
         self.db
             .remap_local_uid(&local.to_string(), &real.to_string())?;
 
-        let mut st = self.state.lock();
-        if let Some(ino) = st.by_uid.remove(local) {
+        self.for_each_state(|st| {
+            let Some(ino) = st.by_uid.remove(local) else {
+                return;
+            };
             st.by_uid.insert(real.clone(), ino);
             if let Some(e) = st.entries.get_mut(&ino) {
                 e.uid = real.clone();
@@ -459,8 +475,7 @@ impl Core {
                     kids.push(ino);
                 }
             }
-        }
-        drop(st);
+        });
         // Write the real node through, now that nothing points at the old uid.
         if let Err(e) = self.db.upsert_node(&node) {
             warn!(%real, error = %e, "db upsert_node failed after remap");
@@ -503,15 +518,23 @@ impl Core {
         if node.trashed {
             return Ok(Some("the file was trashed remotely".into()));
         }
-        let (mtime, size) = (node.modification_time, node_size(&node));
-        if mtime != base.mtime || size != base.size {
-            return Ok(Some(format!(
-                "the remote revision changed under the queued write \
-                 (expected {} bytes at mtime {}, found {size} at {mtime})",
-                base.size, base.mtime
-            )));
+        let Some(reason) = revision_changed(base, &node) else {
+            return Ok(None);
+        };
+        // The remote moved on from the baseline — normally a conflict. But if it
+        // sits at a revision *this daemon* sealed, no other device changed the
+        // file: it is a single-writer stall→resume (a browser that closed and
+        // reopened its download fd; B70 layer B). Chain onto it — supersede
+        // instead of forking — so the finished bytes win the name rather than
+        // being exiled to a `(sync-conflict)` copy.
+        let remote_rev = node_revision_id(&node);
+        let own_rev = self.own_sealed_revs.lock().get(uid).cloned();
+        if is_own_self_supersede(meta.complete, remote_rev.as_deref(), own_rev.as_deref()) {
+            debug!(%uid, ?remote_rev,
+                   "queued write chains onto our own sealed revision; not a conflict");
+            return Ok(None);
         }
-        Ok(None)
+        Ok(Some(reason))
     }
 
     /// Land a queued write that can no longer be applied to its own node as a
@@ -595,11 +618,11 @@ impl Core {
         self.cache.evict(uid);
         self.evict_reader(uid);
         // The conflict copy is a node the tree has never seen.
-        let mut st = self.state.lock();
-        if let Some(&ino) = st.by_uid.get(&parent) {
-            st.invalidate_listing(ino);
-        }
-        drop(st);
+        self.for_each_state(|st| {
+            if let Some(&ino) = st.by_uid.get(&parent) {
+                st.invalidate_listing(ino);
+            }
+        });
         self.log_activity(
             ActivityKind::Upload,
             &name,
@@ -653,13 +676,25 @@ impl Core {
 
     /// A node's parent uid and name, as the tree currently has them.
     pub(crate) fn node_place(&self, uid: &NodeUid) -> Option<(NodeUid, String)> {
-        {
-            let st = self.state.lock();
+        // Across every mount: the drain runs on the primary Core, but a node
+        // written inside a sync folder is interned in that fork's inode space,
+        // so asking `self.state` alone always missed it and fell through to the
+        // DB. That still gave the right answer — the fallback below exists for
+        // exactly this shape of miss — but it went to disk for something already
+        // in memory, and only *because* of the fallback was it not a bug.
+        let mut found = None;
+        self.for_each_state(|st| {
+            if found.is_some() {
+                return;
+            }
             if let Some(entry) = st.by_uid.get(uid).and_then(|ino| st.entries.get(ino))
                 && let Some(parent) = entry.node.parent_uid.clone()
             {
-                return Some((parent, entry.node.name.clone()));
+                found = Some((parent, entry.node.name.clone()));
             }
+        });
+        if found.is_some() {
+            return found;
         }
         // The in-memory tree only holds what has been walked to since the daemon
         // started, and the drain routinely runs before anything has walked to
@@ -814,6 +849,11 @@ impl Core {
                 return;
             }
         };
+        // This function's whole job is to bring the tree level with the revision
+        // we just sealed, so the feed's report of that revision has nothing left
+        // to tell us. Claimed here rather than at the upload call so it is only
+        // recorded when the node was actually re-read (`Core::self_changes`).
+        self.note_self_change(uid);
         // Rebase any *open* write handles targeting this node. A handle opened
         // before this upload carries a stale base — its `base_mtime`/`base_size`
         // name the revision we just replaced. Without this update,
@@ -826,15 +866,25 @@ impl Core {
         {
             let sealed_mtime = node.modification_time;
             let sealed_size = node_size(&node);
-            let mut st = self.state.lock();
-            for aw in st.active_writes.values_mut() {
-                if aw.uid == *uid {
-                    aw.base_mtime = sealed_mtime;
-                    aw.base_size = sealed_size;
-                    debug!(%uid, mtime = sealed_mtime, size = sealed_size,
-                           "rebased open write handle onto the revision just uploaded");
-                }
+            let sealed_rev = node_revision_id(&node);
+            // Remember it as ours, so a queued write that opened over an earlier
+            // revision recognises this as a self-supersede rather than a foreign
+            // change and does not fork (B70 layer B; consulted in
+            // `revision_conflict`).
+            if let Some(rev) = sealed_rev.clone() {
+                self.own_sealed_revs.lock().insert(uid.clone(), rev);
             }
+            self.for_each_state(|st| {
+                for aw in st.active_writes.values_mut() {
+                    if aw.uid == *uid {
+                        aw.base_mtime = sealed_mtime;
+                        aw.base_size = sealed_size;
+                        aw.base_revision_id = sealed_rev.clone();
+                        debug!(%uid, mtime = sealed_mtime, size = sealed_size,
+                               "rebased open write handle onto the revision just uploaded");
+                    }
+                }
+            });
         }
         // Ordered so that a write queued *during* the fetch above is still
         // caught: it took its baseline from the node's optimistic stamp, and
@@ -842,16 +892,17 @@ impl Core {
         if self.rebaseline_pending(uid, &node) {
             return;
         }
-        let mut st = self.state.lock();
-        let Some(parent) = st
-            .by_uid
-            .get(uid)
-            .and_then(|ino| st.entries.get(ino))
-            .map(|e| e.parent)
-        else {
-            return;
-        };
-        st.intern(parent, node);
+        self.for_each_state(|st| {
+            let Some(parent) = st
+                .by_uid
+                .get(uid)
+                .and_then(|ino| st.entries.get(ino))
+                .map(|e| e.parent)
+            else {
+                return;
+            };
+            st.intern(parent, node.clone());
+        });
     }
 
     /// Point a still-queued write at the revision this upload just sealed, and
@@ -875,6 +926,7 @@ impl Core {
             mtime: sealed.modification_time,
             size: node_size(sealed),
             hash: None,
+            revision_id: node_revision_id(sealed),
         };
         let mut pending = self.pending.lock();
         let Some(p) = pending.get_mut(uid) else {
@@ -894,5 +946,155 @@ impl Core {
         debug!(%uid, mtime = base.mtime, size = base.size,
                "queued write rebaselined onto the revision just uploaded");
         true
+    }
+}
+
+/// Whether the remote `node` moved on from the revision a queued write was
+/// `base`d on — the reason string when it did, `None` when the write can still be
+/// applied. Pure so it is testable without a live remote (the trashed/gone checks
+/// stay in [`Core::revision_conflict`], which does the fetch).
+///
+/// The revision id is the authoritative identity: it advances iff a *new* revision
+/// was sealed. When both sides carry one, it alone decides — the server re-stamps
+/// the *same* revision's mtime, and reading that drift as a change is exactly what
+/// diverted a write into a conflict copy of its own base (B16/B25). Only when
+/// there is no id to compare (an old sidecar, or a surface that omits it) does it
+/// fall back to the observable `(mtime, size)` tuple.
+fn revision_changed(base: &Baseline, node: &Node) -> Option<String> {
+    if let (Some(base_rev), Some(remote_rev)) = (&base.revision_id, node_revision_id(node)) {
+        return (*base_rev != remote_rev).then(|| {
+            format!(
+                "the remote revision changed under the queued write \
+                 (based on revision {base_rev}, remote now at {remote_rev})"
+            )
+        });
+    }
+    let (mtime, size) = (node.modification_time, node_size(node));
+    (mtime != base.mtime || size != base.size).then(|| {
+        format!(
+            "the remote revision changed under the queued write \
+             (expected {} bytes at mtime {}, found {size} at {mtime})",
+            base.size, base.mtime
+        )
+    })
+}
+
+/// Whether a queued write that found the remote moved on ([`revision_changed`]
+/// fired) is nonetheless a single-writer self-supersede rather than a foreign
+/// conflict — the remote sits at a revision this daemon sealed itself, so
+/// chaining onto it is safe and forking would be wrong (B70 layer B).
+///
+/// `remote_rev` is the id the remote currently holds, `own_rev` this node's
+/// latest own-sealed id. Requires a `complete` blob: an incomplete one's gaps
+/// still refer to the stale base, so it must take the non-destructive
+/// conflict-copy path instead of overwriting. A `None` remote id never matches
+/// (there is nothing to prove it was ours), so absence falls through to a fork.
+fn is_own_self_supersede(complete: bool, remote_rev: Option<&str>, own_rev: Option<&str>) -> bool {
+    complete && remote_rev.is_some() && remote_rev == own_rev
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use proton_drive_rs::NodeKind;
+    use proton_drive_rs::proton_sdk::ids::{LinkId, VolumeId};
+
+    fn file_node(mtime: i64, size: i64, rev: Option<&str>) -> Node {
+        Node {
+            uid: NodeUid::new(VolumeId::from("v"), LinkId::from("l")),
+            parent_uid: None,
+            kind: NodeKind::File {
+                media_type: "text/plain".into(),
+                total_size_on_storage: size,
+                active_revision_state: None,
+                active_revision_id: rev.map(String::from),
+                claimed_size: Some(size),
+                claimed_modification_time: None,
+                content_sha1: None,
+            },
+            name: "f.txt".into(),
+            creation_time: 0,
+            modification_time: mtime,
+            trashed: false,
+            is_shared: false,
+            is_shared_publicly: false,
+            signature_email: None,
+            verification: Default::default(),
+        }
+    }
+
+    fn baseline(mtime: i64, size: u64, rev: Option<&str>) -> Baseline {
+        Baseline {
+            mtime,
+            size,
+            hash: None,
+            revision_id: rev.map(String::from),
+        }
+    }
+
+    #[test]
+    fn same_revision_id_is_not_a_conflict_despite_mtime_drift() {
+        // The exact shape of the reported bug: same revision, server re-stamped
+        // its mtime (1784897777 -> 1784897780), same size. Must NOT conflict.
+        let base = baseline(1_784_897_777, 87_438, Some("rev-A"));
+        let remote = file_node(1_784_897_780, 87_438, Some("rev-A"));
+        assert_eq!(revision_changed(&base, &remote), None);
+    }
+
+    #[test]
+    fn a_new_revision_id_is_a_conflict_even_at_the_same_size() {
+        // A same-size edit by another device advances the revision id: this is a
+        // real conflict the id catches where (mtime, size) alone could miss it.
+        let base = baseline(100, 40, Some("rev-A"));
+        let remote = file_node(100, 40, Some("rev-B"));
+        assert!(revision_changed(&base, &remote).is_some());
+    }
+
+    #[test]
+    fn without_ids_it_falls_back_to_mtime_and_size() {
+        // Old sidecar (no revision id): the (mtime, size) tuple still governs.
+        let base = baseline(100, 40, None);
+        assert_eq!(revision_changed(&base, &file_node(100, 40, None)), None);
+        assert!(revision_changed(&base, &file_node(101, 40, None)).is_some());
+        assert!(revision_changed(&base, &file_node(100, 41, None)).is_some());
+    }
+
+    #[test]
+    fn a_complete_write_over_our_own_sealed_revision_chains_not_forks() {
+        // B70 layer B: the partial we sealed ourselves (rev-mine) is what the
+        // remote holds; the resume rewrote the whole file. Not a foreign change.
+        assert!(is_own_self_supersede(
+            true,
+            Some("rev-mine"),
+            Some("rev-mine")
+        ));
+    }
+
+    #[test]
+    fn a_move_to_a_revision_we_did_not_seal_still_forks() {
+        // Another device wrote rev-theirs; we only ever sealed rev-mine. Fork.
+        assert!(!is_own_self_supersede(
+            true,
+            Some("rev-theirs"),
+            Some("rev-mine")
+        ));
+    }
+
+    #[test]
+    fn an_incomplete_blob_never_self_supersedes() {
+        // Its gaps still refer to the stale base; overwriting would mix
+        // revisions, so it must take the conflict-copy path even over our seal.
+        assert!(!is_own_self_supersede(
+            false,
+            Some("rev-mine"),
+            Some("rev-mine")
+        ));
+    }
+
+    #[test]
+    fn a_missing_remote_id_never_self_supersedes() {
+        // No id to prove the revision was ours: fall through to a fork rather
+        // than matching None==None.
+        assert!(!is_own_self_supersede(true, None, None));
     }
 }
