@@ -2504,9 +2504,9 @@ seconds after `pending create landed`, and at the same moment
 uid at all. `/proc/<pid>/task/*/comm` showed 1 `pdfs-drain` against 8 fuser
 sessions.
 
-**Fix:** `Core` gained a `states: Arc<Mutex<Vec<Weak<Mutex<State>>>>>` registry
-that every mount publishes itself into (`Core::register_state`, called from
-`mount.rs` for the primary and from `fork_state` for each fork), plus
+**Fix:** `Core` gained a `states: Arc<StateRegistry>` — a `Vec` of weakly-held
+mounts that every mount publishes itself into (`Core::register_state`, called
+from `mount.rs` for the primary and from `fork_state` for each fork), plus
 `Core::for_each_state`, which walks every live inode space one lock at a time.
 A uid is unique across mounts, so at most one state matches and the rest are
 no-ops. Five drain sites were converted: `adopt_real_uid`, `adopt_drained_name`,
@@ -2523,13 +2523,126 @@ diagnosis that relies on the journal or on queue state will not see this.
 live runs before the fix and passes after it. The pre-existing B70 case failed on
 the same cause and now passes too.
 
-**Remaining work.** `drain.rs` still has fork-blind *reads* (`node_place`,
-`root_uid`, `parent_is_gone`) and `lib.rs` has ~31 direct `state.lock()` sites;
-any of them reached from a background thread has the same shape of problem.
-Worth an audit, and worth a unit test over `for_each_state` so a future fork
-cannot silently drop out of the registry.
+**Audit of the rest of the daemon.** Every background-thread `state.lock()` was
+reviewed for the same shape. The rule that came out of it: **a uid is unique
+across mounts, so uid-keyed work must be broadcast; an inode number is only
+meaningful to the mount that minted it, so inode-keyed work must not be.** What
+changed:
+
+| file | site | why |
+|---|---|---|
+| `background.rs` | `apply_event` | the read-side twin of this bug — remote deletes, trashes and renames only ever reached the primary mount's tree |
+| `sweep.rs` | conflict-copy `forget_or_unlink` | a conflict copy inside a sync folder lives in that fork's inode space |
+| `sweep.rs` | `is_busy` | answered "idle" for every file open on a fork, letting the sweep delete one with a writer attached |
+| `sharing.rs` | `rel_path_for_uid` | a share of a node in a sync folder could not be named |
+| `drain.rs` | `node_place` | fell through to a DB lookup for fork-resident nodes |
+| `lib.rs` | `queue_trash`, `rename`, `remove_replaced` (×2), `drop_local`, `restore` | uid-keyed `forget`/invalidate |
+
+Deliberately left on `self.state`: `upload.rs` (`parent_ino`/`pino` are inode
+numbers), the size-upgrade path in `lib.rs`, and `drain.rs`'s `root_uid`, which
+is correctly primary-only. The 38 `filesystem.rs` sites are FUSE callbacks —
+they already run on the right mount's session thread. `parent_is_gone` never
+touches state at all; an earlier note here saying it did was wrong.
+
+The registry is now a `StateRegistry` type with a unit test
+(`state_registry_walks_every_live_mount_and_reaps_the_rest`) covering the case
+this bug was: a fork that fails to appear in the walk, or one that lingers after
+unmount.
+
+**One regression came out of the audit, and is fixed.** Broadcasting
+`apply_event`'s parent-listing invalidation meant forks started receiving
+invalidations they had never received — and it invalidated a folder once per
+event, while a burst of our own uploads produces one event per file all naming
+the *same* folder. Every following lookup in that folder then re-enumerated it
+from the API: quadratic in the folder's size.
+
+Two mitigations, both in `background.rs`. A batch is collapsed to one
+invalidation per folder — `apply_event` records the parent in `DirtyParents` and
+`flush_dirty_parents` publishes it once after the batch loop (every `break` path
+falls through to it). And a change the daemon made *itself* is recognised as its
+own echo rather than treated as foreign: the drain records it
+(`Core::note_self_change`, consumed once within `SELF_CHANGE_TTL_MS`), which
+stops the feed's report of our own upload from evicting the content blob we just
+sent. Neither weakens the result — the state after a batch is what it always was.
+
+**The hang that showed up alongside this was a different bug, and this entry
+originally misattributed it.** `readdir stability` at 133.94 s and a concurrency
+case that blew past its timeout were blamed here on the invalidation storm. They
+were not: the mount was freezing because network work runs on fuser's single
+dispatch thread, which is B75. Fixing that took the concurrency case from two
+timeouts in three runs to 16.9 / 24.1 / 29.1 s and `readdir stability` to 62.9 s.
+The coalescing above is still worth having — it is a real amplification — but it
+was never the stall.
 
 **Note on B70:** B70's own fix was never implicated. The `.crdownload` park/un-park
 behaves correctly in isolation; the empty read arrived with the rename, on the
 same path a plain temp file takes. B70's live validation was blocked on this and
 is now unblocked — its acceptance case passes.
+
+## B75 — Network work on fuser's single dispatch thread freezes the whole mount
+
+**Status:** Fixed in-tree 2026-07-26 — live-validated. Found 2026-07-26 while
+chasing what was thought to be a B74 regression.
+**Impact:** any burst of concurrent writes froze the entire mount — not the
+files being written, the *mount*. `ls` on an unrelated directory of it timed out
+for minutes. The daemon itself stayed healthy throughout: the primary mount and
+the control socket answered normally while a sync-folder mount was unreachable.
+
+**Root cause.** `mount.rs` and `devices.rs` both build their session from
+`Config::default()`, which leaves `n_threads` unset, and fuser 0.17 defaults it
+to 1 (`session.rs:254`). One dispatch thread per mount reads a request, runs the
+handler to completion, and only then reads the next. Six handlers were handed to
+the [`Workers`] pool — `lookup`, `getattr`, `readdir`, `read`, `getxattr` and the
+slow `serve_lookup` — and everything else ran inline, including handlers that
+block on the API:
+
+| handler | blocking work |
+|---|---|
+| `create` | `upload_file` to mint the node, then `fetch_node` — two round trips |
+| `mkdir` | `create_folder`, then `fetch_node` |
+| `rename` | `rename_node`, then `move_node`, plus a trash on the replaced-destination path |
+| `unlink` / `rmdir` | `trash_nodes`; `rmdir` enumerates the folder first |
+| `setattr` (path truncate) | `queue_truncate` → `fill_gaps`, which reads the kept prefix from the remote |
+
+So eight applications each creating a file served one create at a time, and
+every `read`, `open` and `lookup` on that mount queued behind them.
+
+**Measured**, acceptance suite's `independent and shared-file concurrency` (8
+threads × 16 files), and a 3-second `ls` of the mount root sampled every 4 s
+throughout:
+
+| | before | after |
+|---|---|---|
+| concurrency case | 200 s watchdog ×2, 37 s ×1 | 16.9 / 24.1 / 29.1 s, all pass |
+| `ls` of the mount during the run | 33 of 55 probes timed out | 0 of 85 |
+| `readdir stability` | 148.8 s | 62.9 s |
+| `namespace operations` | 31.3 s | 15.7 s |
+
+**Fix:** each of those handlers now parses its arguments inline — cheap, and it
+keeps the error paths prompt — and hands the body to the worker pool as a
+`serve_*` method, the pattern `lookup`/`readdir` already used. Metadata work
+takes `Lane::Meta`; the truncate path takes `Lane::Transfer` because it can pull
+a whole file.
+
+**`release` was deliberately left inline, and this is load-bearing.** Moving it
+too made all three concurrency runs fail with `concurrent file 1 mismatch`. The
+kernel does not wait for a `release` reply before letting `close(2)` return, so
+the only thing sequencing the staging of the written bytes against the `open` +
+`read` an application issues immediately afterwards is that both are served by
+the same dispatch loop. From a worker, the read overtakes the staging and is
+answered from the remote's older revision. Taking `release` off the loop — worth
+doing, since `queue_revision` gap-fills a partial write from the network — needs
+a per-node "staging in flight" barrier that reads wait on, not the dispatch
+loop's accidental ordering.
+
+**Not fixed here.** `n_threads` is still 1; with the blocking handlers moved off,
+the loop is short enough that raising it is a separate question. Related findings
+from the same audit, still open: cache/reader validity is keyed on
+`(mtime, size)` while the revision identity is `active_revision_id`
+(`cache.rs:84` — two same-size revisions within one mtime second collide, which
+is what a SQLite page rewrite looks like); `local_finish_scan` holds the daemon's
+one SQLite connection across a full FTS5 trigram rebuild (`db/local.rs:79`);
+`earliest_due_at` has no `<= now` filter where `next_due_op` does, so the drain
+busy-spins when offline with a due op (`db/ops.rs:385` vs `:421`); and
+`drain_local_node` deletes its op before the fallible `adopt_real_uid`
+(`drain.rs:346`).

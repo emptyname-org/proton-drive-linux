@@ -320,6 +320,26 @@ struct Core {
     /// uploading that same tree — the engine would upload files as they vanish
     /// and then walk the FUSE mount as if it were local.
     sync_locks: Arc<Mutex<HashMap<i64, Arc<Mutex<()>>>>>,
+    /// Nodes this daemon changed on the remote itself, and how many echoes of
+    /// those changes the event feed still owes us.
+    ///
+    /// The feed replays our own writes back at us seconds later, and a
+    /// `NodeUpdated` carries no revision id — nothing in it distinguishes "another
+    /// device changed this file" from "you changed this file". Treating the echo
+    /// as foreign is not free: it evicts the content blob we just uploaded, so the
+    /// next read re-downloads a revision the API may not be serving yet. That is
+    /// how a SQLite database written on the mount came back `malformed`, and how a
+    /// mount doing bulk uploads spent its time re-fetching its own bytes.
+    ///
+    /// So the first event for a node we changed ourselves, within
+    /// [`SELF_CHANGE_TTL_MS`], is consumed rather than applied: the tree already
+    /// holds what that event describes, because [`Core::refresh_after_upload`] put
+    /// it there. Anything beyond that applies normally, which bounds the staleness
+    /// a genuine remote change can suffer to one event.
+    ///
+    /// Shared across forks like `pending`: the drain that records the change and
+    /// the event task that consumes the echo are both per-daemon.
+    self_changes: Arc<Mutex<HashMap<NodeUid, SelfChange>>>,
     /// Every live inode space: this mount's own `state` plus one per on-demand
     /// fork ([`Core::fork_state`]). Shared by every fork, unlike `state` itself.
     ///
@@ -335,6 +355,58 @@ struct Core {
     ///
     /// `Weak`, so an unmounted fork's state is dropped rather than pinned here.
     states: Arc<StateRegistry>,
+}
+
+/// How long a change this daemon made stays recognisable as its own. Generous
+/// against a feed that can lag, but finite: past it, an event for the node is
+/// applied like any other. See [`Core::self_changes`].
+const SELF_CHANGE_TTL_MS: i64 = 120_000;
+
+/// A remote change this daemon made, awaiting its echo from the event feed.
+struct SelfChange {
+    /// When we made it, in the same epoch millis as [`now_millis`].
+    at_ms: i64,
+    /// Echoes not yet seen. More than one because a single file can be created
+    /// and then have a revision uploaded, and the feed reports both.
+    echoes: u32,
+}
+
+/// Record one remote change this daemon made. Split from [`Core`] so the
+/// expiry and echo-counting rules can be tested against a clock the test owns.
+fn note_self_change(changes: &mut HashMap<NodeUid, SelfChange>, uid: &NodeUid, now_ms: i64) {
+    // Echoes that never arrived — a node trashed before its event came round, a
+    // feed that skipped it — would otherwise accumulate for the life of the
+    // daemon. Pruning on write keeps the map the size of the recent queue.
+    changes.retain(|_, c| now_ms - c.at_ms < SELF_CHANGE_TTL_MS);
+    let change = changes.entry(uid.clone()).or_insert(SelfChange {
+        at_ms: now_ms,
+        echoes: 0,
+    });
+    change.at_ms = now_ms;
+    change.echoes += 1;
+}
+
+/// Claim one echo, per [`Core::take_self_change`].
+fn take_self_change(
+    changes: &mut HashMap<NodeUid, SelfChange>,
+    uid: &NodeUid,
+    now_ms: i64,
+) -> bool {
+    let Some(change) = changes.get_mut(uid) else {
+        return false;
+    };
+    // Too old to attribute: the feed is far enough behind that this is as likely
+    // to be someone else's change as ours, and guessing wrong here costs the user
+    // a stale file.
+    if now_ms - change.at_ms >= SELF_CHANGE_TTL_MS {
+        changes.remove(uid);
+        return false;
+    }
+    change.echoes -= 1;
+    if change.echoes == 0 {
+        changes.remove(uid);
+    }
+    true
 }
 
 /// One live inode space, as published to the shared registry.
@@ -434,6 +506,21 @@ impl Core {
         for (state, notifier) in self.states.live() {
             apply(&mut state.lock(), notifier.get());
         }
+    }
+
+    /// Record that this daemon just changed `uid` on the remote, so the event
+    /// feed's echo of that change is recognised instead of re-applied. Called
+    /// from the drain once the remote has actually accepted the change and the
+    /// tree has been brought level with it. See [`Core::self_changes`].
+    pub(crate) fn note_self_change(&self, uid: &NodeUid) {
+        note_self_change(&mut self.self_changes.lock(), uid, now_millis());
+    }
+
+    /// Claim one outstanding echo for `uid`, reporting whether this event is one
+    /// this daemon caused. Consuming rather than merely testing is what bounds
+    /// the suppression: the next event for the node applies normally.
+    fn take_self_change(&self, uid: &NodeUid) -> bool {
+        take_self_change(&mut self.self_changes.lock(), uid, now_millis())
     }
 
     /// Rehydrate the in-memory `State` maps from the DB on mount, so a cold
@@ -3548,8 +3635,9 @@ mod pending_size_tests {
 #[cfg(test)]
 mod tests {
     use super::{
-        Intervals, PendingRevision, StateRegistry, conflict_name, copy_pending_for_truncate,
-        fuse_name, is_stale_mount, node_visible, rename_needs_queue,
+        HashMap, Intervals, PendingRevision, SELF_CHANGE_TTL_MS, StateRegistry, conflict_name,
+        copy_pending_for_truncate, fuse_name, is_stale_mount, node_visible, note_self_change,
+        parse_node_uid, rename_needs_queue, take_self_change,
     };
     use pdfs_core::cache::{Baseline, StagedWrite};
 
@@ -3597,6 +3685,67 @@ mod tests {
         assert!(
             registry.live().is_empty(),
             "the last mount going away empties the registry"
+        );
+    }
+
+    /// An event feed carries no revision id, so the only thing that tells a
+    /// remote change apart from the echo of one this daemon just made is this
+    /// bookkeeping. Getting it wrong is expensive in both directions: too eager
+    /// and we evict the bytes we uploaded and re-download them from an API that
+    /// may still be serving the previous revision (a SQLite file on the mount
+    /// read back `malformed`); too generous and a real change from another device
+    /// is ignored.
+    #[test]
+    fn a_self_change_is_claimed_once_and_expires() {
+        let mut changes = HashMap::new();
+        let uid = parse_node_uid("vol~link").unwrap();
+        let other = parse_node_uid("vol~other").unwrap();
+        let t0 = 1_000_000;
+
+        assert!(
+            !take_self_change(&mut changes, &uid, t0),
+            "a node we never touched is never ours"
+        );
+
+        note_self_change(&mut changes, &uid, t0);
+        assert!(
+            take_self_change(&mut changes, &uid, t0 + 5_000),
+            "the echo of our own change is claimed"
+        );
+        assert!(
+            !take_self_change(&mut changes, &uid, t0 + 6_000),
+            "and only once, so a later foreign change still applies"
+        );
+
+        // A create followed by a revision upload is two changes to one node, and
+        // the feed reports both.
+        note_self_change(&mut changes, &uid, t0);
+        note_self_change(&mut changes, &uid, t0);
+        assert!(take_self_change(&mut changes, &uid, t0 + 1));
+        assert!(take_self_change(&mut changes, &uid, t0 + 2));
+        assert!(!take_self_change(&mut changes, &uid, t0 + 3));
+
+        // Past the window the attribution is a guess, and a wrong guess leaves
+        // the user looking at a stale file.
+        note_self_change(&mut changes, &uid, t0);
+        assert!(!take_self_change(
+            &mut changes,
+            &uid,
+            t0 + SELF_CHANGE_TTL_MS
+        ));
+        assert!(
+            !changes.contains_key(&uid),
+            "an expired change is dropped, not left to be re-tested"
+        );
+
+        // An echo that never arrives must not accumulate for the life of the
+        // daemon; the next recorded change prunes it.
+        note_self_change(&mut changes, &uid, t0);
+        note_self_change(&mut changes, &other, t0 + SELF_CHANGE_TTL_MS);
+        assert_eq!(
+            changes.len(),
+            1,
+            "recording a change prunes the ones whose echo never came"
         );
     }
 

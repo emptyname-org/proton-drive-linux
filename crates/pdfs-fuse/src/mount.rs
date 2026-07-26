@@ -212,6 +212,7 @@ pub fn mount(
         conflict_notified: Arc::new(Mutex::new(HashSet::new())),
         sweep_mode,
         own_sealed_revs: Arc::new(Mutex::new(HashMap::new())),
+        self_changes: Arc::new(Mutex::new(HashMap::new())),
         thumb_gen: Arc::new(Mutex::new(HashSet::new())),
         no_thumbnail: Arc::new(Mutex::new(HashMap::new())),
         size_upgrades: Arc::new(Mutex::new(HashMap::new())),

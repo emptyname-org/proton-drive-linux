@@ -229,6 +229,7 @@ impl Core {
             }
         }
         self.db.delete_op(op.id)?;
+        self.note_self_change(&uid);
         info!(%uid, name = %landed, "pending rename landed");
         Ok(())
     }
@@ -344,6 +345,9 @@ impl Core {
         // sync, whereas a surviving op would create the file a second time.
         self.db.delete_op(op.id)?;
         self.adopt_real_uid(&local, &real)?;
+        // The feed will report this create back to us; the tree already has it
+        // under its real uid, so that event is ours to ignore (`Core::self_changes`).
+        self.note_self_change(&real);
         if let Some(blob) = op.blob_path.as_deref() {
             self.cache.discard_staged(Path::new(blob));
         }
@@ -845,6 +849,11 @@ impl Core {
                 return;
             }
         };
+        // This function's whole job is to bring the tree level with the revision
+        // we just sealed, so the feed's report of that revision has nothing left
+        // to tell us. Claimed here rather than at the upload call so it is only
+        // recorded when the node was actually re-read (`Core::self_changes`).
+        self.note_self_change(uid);
         // Rebase any *open* write handles targeting this node. A handle opened
         // before this upload carries a stale base — its `base_mtime`/`base_size`
         // name the revision we just replaced. Without this update,
