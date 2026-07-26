@@ -222,7 +222,11 @@ pub fn mount(
         sync_tx,
         mounts: Arc::new(Mutex::new(HashMap::new())),
         sync_locks: Arc::new(Mutex::new(HashMap::new())),
+        states: Arc::new(StateRegistry::default()),
     };
+    // Before anything can queue work against it: the drain thread below reaches
+    // every mount's inode space through this registry, not through `core.state`.
+    core.register_state();
 
     // Writes queued by a previous run (or left behind by a crash) are still owed
     // an upload, and reads must be served from their staged blobs until they land.
@@ -341,15 +345,7 @@ pub fn mount(
     // Same channel, kept on the `Core` so background work (a size upgrade, say)
     // can invalidate kernel-cached metadata without threading a handle through.
     let _ = core.notifier.set(notifier.clone());
-    rt.spawn(run_event_sync(
-        client,
-        scope,
-        core.state,
-        core.cache,
-        core.db,
-        core.pending,
-        notifier,
-    ));
+    rt.spawn(run_event_sync(client, scope, core.clone()));
 
     // Stop signals (SIGTERM from `systemctl --user stop`, SIGINT from Ctrl-C)
     // are delivered onto the async runtime; bridge them onto a sync channel so

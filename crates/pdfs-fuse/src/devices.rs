@@ -505,6 +505,11 @@ impl Core {
         fork.notifier = Arc::new(OnceLock::new());
         // Size upgrades are keyed by inode, which is per-fork too.
         fork.size_upgrades = Arc::new(Mutex::new(HashMap::new()));
+        // The daemon's single drain thread belongs to the primary mount, but it
+        // drains ops for nodes that live *here*. Publishing this inode space is
+        // what lets it find them; without it a queued create's node keeps its
+        // `local~` uid after the upload lands and reads it as empty (B74).
+        fork.register_state();
         fork
     }
 

@@ -153,7 +153,13 @@ impl Core {
                 return;
             }
         }
-        self.state.lock().forget_or_unlink(uid);
+        // Every mount, not just the primary: a conflict copy inside a sync
+        // folder lives in that fork's inode space, and leaving it hooked up
+        // there keeps a node we have just trashed remotely visible and
+        // readable there (`docs/BUGS.md` B74).
+        self.for_each_state(|st| {
+            st.forget_or_unlink(uid);
+        });
         self.discard_queued_ops(uid);
         self.cache.evict(uid);
         self.evict_reader(uid);
@@ -232,12 +238,21 @@ impl Core {
     /// Whether a node has a write in flight or a file handle open against it.
     /// Read-only opens use fh 0 and are not tracked, so this is specifically the
     /// writer/holder check.
+    /// Asked across **every** mount. The sweep runs on the primary Core but
+    /// trashes nodes anywhere in the tree, and a file open inside a sync folder
+    /// is tracked in that fork's `State` — so consulting `self.state` alone
+    /// answered "idle" for every such file and let the sweep delete one with a
+    /// writer attached (`docs/BUGS.md` B74). Busy anywhere means busy.
     fn is_busy(&self, uid: &NodeUid) -> bool {
-        let state = self.state.lock();
-        let Some(&ino) = state.by_uid.get(uid) else {
-            return false;
-        };
-        state.active_writes.contains_key(&ino) || state.handles.values().any(|&held| held == ino)
+        let mut busy = false;
+        self.for_each_state(|st| {
+            let Some(&ino) = st.by_uid.get(uid) else {
+                return;
+            };
+            busy |=
+                st.active_writes.contains_key(&ino) || st.handles.values().any(|&held| held == ino);
+        });
+        busy
     }
 
     /// Surface a conflict copy that needs the user's attention, at most once per

@@ -2,19 +2,48 @@
 
 use super::*;
 
+/// Drop `uid` from one mount's tree and tell that mount's kernel session the
+/// entry is gone. Shared by the trash and delete paths, which differ only in
+/// which event carried them.
+///
+/// Returns whether this mount actually held the node, so the caller can evict
+/// its content blob once if *any* mount did.
+fn forget_and_notify(st: &mut State, notifier: Option<&Notifier>, uid: &NodeUid) -> bool {
+    // Capture the inode before `forget` clears the uid mapping.
+    let child = st.by_uid.get(uid).copied();
+    let Some((parent, name)) = st.forget(uid) else {
+        return false;
+    };
+    if let Some(notifier) = notifier {
+        match child {
+            Some(child) => {
+                let _ = notifier.delete(INodeNo(parent), INodeNo(child), OsStr::new(&name));
+            }
+            None => {
+                let _ = notifier.inval_entry(INodeNo(parent), OsStr::new(&name));
+            }
+        }
+    }
+    true
+}
+
 /// Apply one remote event to the local cache and notify the kernel so it drops
 /// any stale cached metadata/data for the affected inodes.
 ///
 /// The cache is authoritative-by-absence: dropping a directory's `children`
 /// entry forces the next `lookup`/`readdir` to re-enumerate from the remote, so
 /// most events only need to invalidate listings rather than re-fetch eagerly.
-fn apply_event(
-    state: &Mutex<State>,
-    content: &ContentCache,
-    pending: &Mutex<HashMap<NodeUid, PendingRevision>>,
-    notifier: &Notifier,
-    event: &DriveEvent,
-) {
+///
+/// Applied to **every** mounted inode space, not just the primary one. This task
+/// is per-daemon while node state is per-mount, and a `DriveEvent` names a uid,
+/// not a mount — so a file trashed from another device has to be withdrawn from
+/// whichever of our sessions is showing it, which for anything under a sync
+/// folder is a [`Core::fork_state`] fork rather than `core.state`. Reaching for
+/// the primary state alone left forks serving a deleted file indefinitely, the
+/// read-side twin of `docs/BUGS.md` B74. Inode numbers are per-mount, so each
+/// mount must be notified through its **own** channel; that pairing is what
+/// [`Core::for_each_mount`] exists to preserve.
+fn apply_event(core: &Core, event: &DriveEvent) {
     match event {
         DriveEvent::NodeUpdated {
             node_uid,
@@ -22,74 +51,69 @@ fn apply_event(
             is_trashed,
             ..
         } => {
-            let mut st = state.lock();
-            if *is_trashed {
-                // Trashing makes a node vanish from its parent listing.
-                let child = st.by_uid.get(node_uid).copied();
-                if let Some((parent, name)) = st.forget(node_uid) {
-                    content.evict(node_uid);
-                    match child {
-                        Some(child) => {
-                            let _ =
-                                notifier.delete(INodeNo(parent), INodeNo(child), OsStr::new(&name));
-                        }
-                        None => {
-                            let _ = notifier.inval_entry(INodeNo(parent), OsStr::new(&name));
-                        }
+            // A node we owe an upload for is *ahead* of the remote, not behind
+            // it: this event is almost always the echo of our own empty-file
+            // create, and re-fetching would replace the size and mtime of the
+            // write we just accepted with the stale revision's — making a file
+            // that was copied in seconds ago read as empty until its upload
+            // lands (offline.md Phase 3). The parent listing is still refreshed
+            // below; it is only the node itself that is ours to define.
+            let ours = !*is_trashed && core.pending.lock().contains_key(node_uid);
+            if ours {
+                debug!(uid = %node_uid, "ignoring remote event for a node with a queued write");
+            }
+            let mut had_node = false;
+            core.for_each_mount(|st, notifier| {
+                if *is_trashed {
+                    // Trashing makes a node vanish from its parent listing.
+                    had_node |= forget_and_notify(st, notifier, node_uid);
+                } else if !ours && let Some(&ino) = st.by_uid.get(node_uid) {
+                    // Known node changed: drop its cached attrs/data (and
+                    // listing if it is a directory) so the next access
+                    // re-fetches. Its content blob may now be stale too.
+                    had_node = true;
+                    st.invalidate_listing(ino);
+                    if let Some(notifier) = notifier {
+                        let _ = notifier.inval_inode(INodeNo(ino), 0, 0);
                     }
                 }
-            } else if pending.lock().contains_key(node_uid) {
-                // A node we owe an upload for is *ahead* of the remote, not
-                // behind it: this event is almost always the echo of our own
-                // empty-file create, and re-fetching would replace the size and
-                // mtime of the write we just accepted with the stale revision's
-                // — making a file that was copied in seconds ago read as empty
-                // until its upload lands (offline.md Phase 3).
-                debug!(uid = %node_uid, "ignoring remote event for a node with a queued write");
-            } else if let Some(&ino) = st.by_uid.get(node_uid) {
-                // Known node changed: drop its cached attrs/data (and listing if
-                // it is a directory) so the next access re-fetches. Its content
-                // blob may now be stale, so evict it too.
-                st.invalidate_listing(ino);
-                content.evict(node_uid);
-                let _ = notifier.inval_inode(INodeNo(ino), 0, 0);
-            }
-            // A create (or move-in) shows up as a change to the parent listing;
-            // drop it so the new child is picked up on the next readdir.
-            if let Some(parent_uid) = parent_node_uid
-                && let Some(&parent) = st.by_uid.get(parent_uid)
-            {
-                st.invalidate_listing(parent);
-                let _ = notifier.inval_inode(INodeNo(parent), 0, 0);
+                // A create (or move-in) shows up as a change to the parent
+                // listing; drop it so the new child is picked up on the next
+                // readdir.
+                if let Some(parent_uid) = parent_node_uid
+                    && let Some(&parent) = st.by_uid.get(parent_uid)
+                {
+                    st.invalidate_listing(parent);
+                    if let Some(notifier) = notifier {
+                        let _ = notifier.inval_inode(INodeNo(parent), 0, 0);
+                    }
+                }
+            });
+            // Once, not once per mount: the content cache is per-daemon.
+            if had_node {
+                core.cache.evict(node_uid);
             }
         }
         DriveEvent::NodeDeleted { node_uid, .. } => {
-            let mut st = state.lock();
-            // Capture the inode before `forget` clears the uid mapping.
-            let child = st.by_uid.get(node_uid).copied();
-            content.evict(node_uid);
-            if let Some((parent, name)) = st.forget(node_uid) {
-                match child {
-                    Some(child) => {
-                        let _ = notifier.delete(INodeNo(parent), INodeNo(child), OsStr::new(&name));
-                    }
-                    None => {
-                        let _ = notifier.inval_entry(INodeNo(parent), OsStr::new(&name));
-                    }
-                }
-            }
+            core.cache.evict(node_uid);
+            core.for_each_mount(|st, notifier| {
+                forget_and_notify(st, notifier, node_uid);
+            });
         }
         // Continuity or scope was lost: our cached listings may be arbitrarily
         // stale, so drop every listing and tell the kernel to forget all
         // metadata. Inodes stay stable; dirs simply re-enumerate on next access.
         DriveEvent::ContinuityLost { .. } | DriveEvent::ScopeAccessLost { .. } => {
             warn!("event continuity lost; dropping all cached listings, resyncing lazily");
-            let mut st = state.lock();
-            let dirs: Vec<u64> = st.children.keys().copied().collect();
-            for &ino in &dirs {
-                st.invalidate_listing(ino);
-                let _ = notifier.inval_inode(INodeNo(ino), 0, 0);
-            }
+            core.for_each_mount(|st, notifier| {
+                let dirs: Vec<u64> = st.children.keys().copied().collect();
+                for &ino in &dirs {
+                    st.invalidate_listing(ino);
+                    if let Some(notifier) = notifier {
+                        let _ = notifier.inval_inode(INodeNo(ino), 0, 0);
+                    }
+                }
+            });
         }
         // No substantive local change; the cursor advance is handled by the
         // caller persisting the event id.
@@ -102,15 +126,16 @@ fn apply_event(
 /// unmounted are applied; only a first-ever mount seeds from the server head.
 /// The cursor is persisted after every batch. Runs as a Tokio task; returns
 /// only on fatal error.
+///
+/// Takes the whole `Core` rather than the primary mount's pieces: an event has
+/// to be applied to every mounted inode space, and the registry that enumerates
+/// them lives on the `Core` (see [`apply_event`]).
 pub(super) async fn run_event_sync(
     client: ProtonDriveClient,
     scope: DriveEventScopeId,
-    state: Arc<Mutex<State>>,
-    content: Arc<ContentCache>,
-    db: Arc<Db>,
-    pending: Arc<Mutex<HashMap<NodeUid, PendingRevision>>>,
-    notifier: Notifier,
+    core: Core,
 ) {
+    let db = core.db.clone();
     let mut cursor: Option<DriveEventId> = match db.get_event_cursor() {
         // Resume: pick up exactly where the last run left off.
         Ok(Some(saved)) => Some(DriveEventId::from(saved)),
@@ -175,7 +200,7 @@ pub(super) async fn run_event_sync(
                 warn!(error = %e, "sdk cache invalidation for event failed; retaining cursor for retry");
                 break;
             }
-            apply_event(&state, &content, &pending, &notifier, event);
+            apply_event(&core, event);
             let applied = event.id().clone();
             if let Err(e) = db.set_event_cursor(applied.as_str()) {
                 warn!(error = %e, "persist event cursor failed; retaining prior cursor for retry");

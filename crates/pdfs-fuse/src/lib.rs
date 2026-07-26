@@ -47,10 +47,11 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use fuser::ReplyXattr;
 use fuser::{
-    BackgroundSession, BsdFileFlags, Config, Errno, FileAttr, FileHandle, FileType, Filesystem,
-    FopenFlags, Generation, INodeNo, IoctlFlags, LockOwner, MountOption, Notifier, OpenAccMode,
-    OpenFlags, RenameFlags, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty,
-    ReplyEntry, ReplyIoctl, ReplyOpen, ReplyWrite, Request, Session, TimeOrNow, WriteFlags,
+    BackgroundSession, BsdFileFlags, Config, CopyFileRangeFlags, Errno, FileAttr, FileHandle,
+    FileType, Filesystem, FopenFlags, Generation, INodeNo, IoctlFlags, LockOwner, MountOption,
+    Notifier, OpenAccMode, OpenFlags, RenameFlags, ReplyAttr, ReplyCreate, ReplyData,
+    ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyIoctl, ReplyLseek, ReplyOpen, ReplyWrite, Request,
+    Session, TimeOrNow, WriteFlags,
 };
 use pdfs_core::cache::{BLOCK_SIZE, Baseline, ContentCache, StagedWrite};
 use pdfs_core::config::{AppDirs, SweepMode};
@@ -319,6 +320,75 @@ struct Core {
     /// uploading that same tree — the engine would upload files as they vanish
     /// and then walk the FUSE mount as if it were local.
     sync_locks: Arc<Mutex<HashMap<i64, Arc<Mutex<()>>>>>,
+    /// Every live inode space: this mount's own `state` plus one per on-demand
+    /// fork ([`Core::fork_state`]). Shared by every fork, unlike `state` itself.
+    ///
+    /// There is exactly **one** drain thread per daemon, owned by the primary
+    /// mount, and it serves the whole `pending_op` table — including ops queued
+    /// by a forked mount, which keeps its nodes in its own `state`. So a drain
+    /// that reaches for `self.state` looks in the wrong inode space and silently
+    /// finds nothing: the fork's entry keeps its `local~` placeholder uid
+    /// forever, and every read of it short-circuits to empty because
+    /// [`Core::read_range`] refuses to ask the API about a `local~` uid. That
+    /// was `docs/BUGS.md` B74. Background work that rewrites node identity must
+    /// walk this instead ([`Core::for_each_state`]).
+    ///
+    /// `Weak`, so an unmounted fork's state is dropped rather than pinned here.
+    states: Arc<StateRegistry>,
+}
+
+/// One live inode space, as published to the shared registry.
+///
+/// The notifier travels with the state because the two are only meaningful
+/// together: an inode number names a different node in every mount, so telling
+/// the kernel to drop inode 42 is only correct on the session that minted it.
+/// Background work that invalidates as well as mutates needs the matching pair,
+/// which is what [`Core::for_each_mount`] hands it.
+type LiveMount = (Arc<Mutex<State>>, Arc<OnceLock<Notifier>>);
+
+struct MountedState {
+    /// `Weak`, so an unmounted fork's state is dropped rather than pinned here;
+    /// a dead entry is reaped on the next registry walk.
+    state: std::sync::Weak<Mutex<State>>,
+    /// This mount's kernel notification channel — the same cell as
+    /// [`Core::notifier`], still empty until its session is spawned.
+    notifier: Arc<OnceLock<Notifier>>,
+}
+
+/// Every mounted inode space in the daemon, shared by the primary `Core` and
+/// every [`Core::fork_state`] clone of it.
+///
+/// Split out from `Core` so the reap-and-walk rule can be tested on its own: a
+/// fork that fails to appear here, or one that lingers after unmount, is exactly
+/// the failure `docs/BUGS.md` B74 was.
+#[derive(Default)]
+struct StateRegistry(Mutex<Vec<MountedState>>);
+
+impl StateRegistry {
+    /// Publish an inode space and the channel to the session that owns it.
+    ///
+    /// Registering the same `state` twice would make every walk visit it twice;
+    /// callers register exactly once, at mount time.
+    fn register(&self, state: &Arc<Mutex<State>>, notifier: Arc<OnceLock<Notifier>>) {
+        let mut states = self.0.lock();
+        states.retain(|m| m.state.strong_count() > 0);
+        states.push(MountedState {
+            state: Arc::downgrade(state),
+            notifier,
+        });
+    }
+
+    /// Every live mount, reaping the entries whose session has gone. Returns
+    /// owned handles so callers take the per-state locks one at a time rather
+    /// than holding the registry lock across the work.
+    fn live(&self) -> Vec<LiveMount> {
+        let mut states = self.0.lock();
+        states.retain(|m| m.state.strong_count() > 0);
+        states
+            .iter()
+            .filter_map(|m| Some((m.state.upgrade()?, m.notifier.clone())))
+            .collect()
+    }
 }
 
 /// Why [`Core::apply_sync_folder_mode`] did not switch a folder. The two cases are
@@ -333,6 +403,39 @@ enum SwitchBlocked {
 }
 
 impl Core {
+    /// Register an inode space so background work can reach it. Called once for
+    /// the primary mount and once per on-demand fork.
+    fn register_state(&self) {
+        self.states.register(&self.state, self.notifier.clone());
+    }
+
+    /// Run `apply` against every live inode space — this daemon's primary mount
+    /// and each on-demand fork — one lock at a time.
+    ///
+    /// The drain and the sync engine are per-daemon but node state is per-mount,
+    /// so anything they change about a node has to be offered to whichever mount
+    /// actually holds it. Which one that is cannot be known from the op: a
+    /// `pending_op` row records a uid, not the session that queued it. Applying
+    /// to all of them is correct because a uid is unique across mounts — at most
+    /// one state has an entry for it, and the rest are no-ops.
+    fn for_each_state(&self, mut apply: impl FnMut(&mut State)) {
+        for (state, _) in self.states.live() {
+            apply(&mut state.lock());
+        }
+    }
+
+    /// Like [`Core::for_each_state`], but also hands over the mount's kernel
+    /// notification channel, so work that invalidates cached metadata reaches
+    /// the session that actually minted the inodes it is naming.
+    ///
+    /// `None` for a mount whose session has not been spawned yet — there is
+    /// nothing to invalidate in a kernel that has never been told about it.
+    fn for_each_mount(&self, mut apply: impl FnMut(&mut State, Option<&Notifier>)) {
+        for (state, notifier) in self.states.live() {
+            apply(&mut state.lock(), notifier.get());
+        }
+    }
+
     /// Rehydrate the in-memory `State` maps from the DB on mount, so a cold
     /// start serves previously-seen metadata (stable inodes, instant listings)
     /// without re-hitting the API. The root inode is already installed by
@@ -1537,7 +1640,14 @@ impl Core {
             Errno::EIO
         })?;
         self.hidden.lock().insert(uid.clone());
-        self.state.lock().forget(uid);
+        // Withdrawn from every mount, not just the one the unlink came through:
+        // a sync folder maps a remote folder that also exists under My Files, so
+        // the same uid can be interned in two inode spaces at once and the other
+        // one would go on serving a file the user just trashed
+        // (`docs/BUGS.md` B74).
+        self.for_each_state(|st| {
+            st.forget(uid);
+        });
         self.cache.evict(uid);
         self.evict_reader(uid);
         self.wake_drain();
@@ -2154,7 +2264,11 @@ impl Core {
         self.rt
             .block_on(self.client.rename_node(&uid, new_name, None))
             .map_err(|e| CoreError::from_api(&e, "rename"))?;
-        self.state.lock().forget(&uid);
+        // Every mount, so a fork showing the same node re-interns it under the
+        // new name instead of keeping the old one (`docs/BUGS.md` B74).
+        self.for_each_state(|st| {
+            st.forget(&uid);
+        });
         self.invalidate_parent_listing(rel);
         Ok(new_name.to_string())
     }
@@ -2215,7 +2329,9 @@ impl Core {
     fn remove_replaced(&self, uid: &NodeUid, name: &str) -> Result<(), Errno> {
         if is_local_uid(uid) {
             self.discard_queued_ops(uid);
-            self.state.lock().forget(uid);
+            self.for_each_state(|st| {
+                st.forget(uid);
+            });
             debug!(%uid, name, "replaced a node whose create was still queued");
             return Ok(());
         }
@@ -2228,7 +2344,11 @@ impl Core {
             return Err(Errno::EIO);
         }
         self.discard_queued_ops(uid);
-        self.state.lock().forget(uid);
+        // The node was trashed on the server; withdraw it from every inode
+        // space that had it, not only the mount the rename came through.
+        self.for_each_state(|st| {
+            st.forget(uid);
+        });
         self.cache.evict(uid);
         self.evict_reader(uid);
         self.invalidate_trash();
@@ -2413,14 +2533,15 @@ impl Core {
                 hidden.remove(uid);
             }
         }
-        {
-            let mut st = self.state.lock();
-            for parent in parents {
-                if let Some(&ino) = st.by_uid.get(&parent) {
+        // Keyed by uid, so it applies to every mount: a restored node reappears
+        // in whichever inode spaces show its parent, not only the primary one.
+        self.for_each_state(|st| {
+            for parent in &parents {
+                if let Some(&ino) = st.by_uid.get(parent) {
                     st.invalidate_listing(ino);
                 }
             }
-        }
+        });
         self.invalidate_trash();
         Ok(parsed.len())
     }
@@ -2456,11 +2577,15 @@ impl Core {
     /// Forget every trace of nodes that no longer exist anywhere: their inode and
     /// DB row, and their cached content.
     fn drop_local(&self, uids: &[NodeUid]) {
-        let mut st = self.state.lock();
-        for uid in uids {
-            st.forget(uid);
-        }
-        drop(st);
+        // Every mount: these nodes are gone from the server, and a sync-folder
+        // fork showing the same uid would otherwise keep serving them
+        // (`docs/BUGS.md` B74). A uid is unique across inode spaces, so this is
+        // a no-op in every mount but the one that holds it.
+        self.for_each_state(|st| {
+            for uid in uids {
+                st.forget(uid);
+            }
+        });
         for uid in uids {
             self.cache.evict(uid);
             self.evict_reader(uid);
@@ -3423,10 +3548,57 @@ mod pending_size_tests {
 #[cfg(test)]
 mod tests {
     use super::{
-        Intervals, PendingRevision, conflict_name, copy_pending_for_truncate, fuse_name,
-        is_stale_mount, node_visible, rename_needs_queue,
+        Intervals, PendingRevision, StateRegistry, conflict_name, copy_pending_for_truncate,
+        fuse_name, is_stale_mount, node_visible, rename_needs_queue,
     };
     use pdfs_core::cache::{Baseline, StagedWrite};
+
+    /// The registry every mount publishes itself into is what lets the daemon's
+    /// single drain thread reach a node living in an on-demand fork's inode
+    /// space. A fork missing from it reads as an empty file for the life of the
+    /// daemon (`docs/BUGS.md` B74), so the walk has to see *every* registered
+    /// mount — and only the ones still mounted.
+    #[test]
+    fn state_registry_walks_every_live_mount_and_reaps_the_rest() {
+        let registry = StateRegistry::default();
+        assert!(registry.live().is_empty(), "a fresh registry has no mounts");
+
+        // The primary mount plus two on-demand forks.
+        let (primary, _p) = state_test_helper();
+        let (fork_a, _a) = state_test_helper();
+        let (fork_b, _b) = state_test_helper();
+        let primary = std::sync::Arc::new(parking_lot::Mutex::new(primary));
+        let fork_a = std::sync::Arc::new(parking_lot::Mutex::new(fork_a));
+        let fork_b = std::sync::Arc::new(parking_lot::Mutex::new(fork_b));
+        for state in [&primary, &fork_a, &fork_b] {
+            registry.register(state, std::sync::Arc::new(std::sync::OnceLock::new()));
+        }
+        assert_eq!(registry.live().len(), 3, "every registered mount is walked");
+
+        // `live()` must not itself pin a mount alive, or an unmounted fork could
+        // never be reaped.
+        assert_eq!(
+            std::sync::Arc::strong_count(&fork_a),
+            1,
+            "the registry holds forks weakly"
+        );
+
+        // Unmounting a fork drops its state; the dead entry goes on the next walk.
+        drop(fork_a);
+        assert_eq!(registry.live().len(), 2, "an unmounted fork is dropped");
+        assert_eq!(
+            registry.0.lock().len(),
+            2,
+            "and its slot is reaped, not merely skipped"
+        );
+
+        drop(primary);
+        drop(fork_b);
+        assert!(
+            registry.live().is_empty(),
+            "the last mount going away empties the registry"
+        );
+    }
 
     /// The predicate must answer *only* for a dead FUSE connection. A healthy
     /// directory and an absent path are both "not stale" — widening it to any

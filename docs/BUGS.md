@@ -2148,7 +2148,10 @@ default (B71) precisely so that stays true until there is field evidence.
 
 ## B70 — Browser in-flight temp files uploaded and conflict-forked on the on-demand mount
 
-**Status:** Layers A + B fixed in-tree 2026-07-25 — offline-tested; **live validation pending**.
+**Status:** Layers A + B fixed in-tree 2026-07-25 — **live-validated 2026-07-26**.
+Validation was blocked until B74 was fixed (its scenario ends in a rename, which
+B74 made read back as empty); with that out of the way the acceptance case
+`regression B70: transient download name is not sealed` passes live.
 **Found:** triaging the divergent conflict copies B69 left behind. In `~/Downloads`
 (an on-demand mount) the complete files had been forked into `(sync-conflict)`
 copies while their truncated partials kept the canonical name — e.g.
@@ -2362,3 +2365,171 @@ or the CLI's response read in `crates/pdfs-cli/src/main.rs`.
 **Impact:** the trash listing is the user's recovery path after any destructive
 operation, including the B71 sweep. It needs to work before the sweep is allowed
 to trash anything.
+
+## B73 — Unimplemented FUSE handlers log a WARN per probe
+
+**Status:** Fixed in-tree 2026-07-26 — live-validated. Found 2026-07-26 by the
+expanded acceptance suite.
+**Found:** `scripts/fuse-acceptance.sh --live` step "unsupported operations refuse
+cleanly". Each probe produced a multi-line `fuser` warning in the daemon journal:
+
+```
+WARN fuser: [Not Implemented] symlink(parent: INodeNo(0x2d), link_name: "symlink", target: "link-target")
+WARN fuser: [Not Implemented] link(ino: INodeNo(0x94), newparent: INodeNo(0x2d), newname: "hardlink")
+WARN fuser: [Not Implemented] mknod(parent: INodeNo(0x2d), name: "fifo", mode: 4516, umask: 0x12, rdev: 0)
+WARN fuser: [Not Implemented] setxattr(ino: INodeNo(0x91), name: "user.pdfs.probe", flags: 0x0, position: 0)
+WARN fuser: [Not Implemented] lseek(ino: INodeNo(0x93), fh: 0, offset: 0, whence: 3)
+```
+
+**Cause:** `ProtonFs` does not implement these callbacks, so `fuser`'s default
+trait method answers `ENOSYS` *and logs at WARN*. The refusal is correct — the
+acceptance suite accepts every one of them as a clean refusal — but the logging
+is not conditional on anything the user did wrong.
+**Impact:** cosmetic, but these are not exotic calls: `git` probes symlinks,
+`cp -a` probes hard links, `tar` and `cp --sparse` probe `SEEK_HOLE`/`SEEK_DATA`
+(`whence: 3` above is `SEEK_DATA`), and any xattr-aware tool probes `setxattr`.
+Warnings that look like faults bury real ones and make both `--journal-check`
+and manual triage noisier.
+**Measured** across two full acceptance runs against one daemon lifetime (PID
+887441, mount never remounted):
+
+| op | warnings | behaviour |
+|---|---|---|
+| `link` | 11 | repeats on every call |
+| `symlink` | 4 | repeats on every call |
+| `mknod` | 2 | repeats on every call |
+| `setxattr` | 1 | kernel cached the `ENOSYS`; never asked again |
+| `lseek` | 1 | cached |
+| `copy_file_range` | 1 | cached |
+| `fsyncdir` | 1 | cached |
+
+So the FUSE kernel module remembers `ENOSYS` for the file-level operations and
+stops issuing them for the lifetime of the mount, but not for the namespace
+operations, which are re-issued forever.
+
+`link` leads for a sharper reason than "tools probe it": git uses `link()` to
+place **every loose object**, falling back to `rename()` when it fails. In one
+workloads run, 9 of 10 `link` warnings carried a 38-hex-character name — the
+`.git/objects/ab/<38 hex>` layout — from just 3 commits over 3 files. The volume
+is therefore proportional to work done, not a fixed startup cost: a `git clone`
+of a real repository emits one multi-line warning per object. The lone `symlink`
+that is not the acceptance probe is git's `core.symlinks` detection at
+`git init` (a random name pointing at `testing`).
+
+That moves this from cosmetic to a genuine operational problem: ordinary use of
+git inside a mount can bury every other log line.
+
+**Fix (applied):** all seven callbacks are now implemented explicitly in
+`crates/pdfs-fuse/src/filesystem.rs`, each answering with **the same errno
+`fuser`'s default would** and nothing else — no WARN. Following `ioctl`
+(which already used this pattern and says why in its comment), the errno
+contract is unchanged, so the acceptance suite's clean-refusal assertions hold
+byte for byte:
+
+| op | errno | why that one |
+|---|---|---|
+| `symlink`, `link` | `EPERM` | meaningful operation, unrepresentable on Drive; git falls back to `rename()` |
+| `mknod` | `ENOSYS` | no devices/FIFOs/sockets; regular files arrive via `create` |
+| `setxattr` | `ENOSYS` | surfaces as `EOPNOTSUPP`; reads stay implemented for the thumbnail interface |
+| `fsyncdir` | `ENOSYS` | kernel absorbs it and reports success; dir changes are already durable in SQLite |
+| `lseek`, `copy_file_range` | `ENOSYS` | **must stay** `ENOSYS` — it is what makes the kernel emulate `SEEK_HOLE`/`SEEK_DATA` and coreutils fall back to read/write instead of failing |
+
+Only the three namespace ops were strictly required (the other four silence
+themselves once the kernel caches `ENOSYS`), but implementing all seven keeps the
+refusal explicit and documented at the call site rather than inherited.
+
+**Verified:** full live acceptance run after the fix — 19 pass / 1 skip, the
+capability diff identical to the pre-fix run, and **0** `Not Implemented` lines
+in the journal across the whole run (was 17, 10 of them `link`).
+**Regression cover:** the acceptance suite's clean-refusal probes assert the
+errno contract; they pass unchanged.
+
+## B74 — A drained create never reaches a sync-folder mount's inode space, so the file reads as empty
+
+**Status:** Fixed in-tree 2026-07-26 — live-validated. Found 2026-07-26 by the
+expanded acceptance suite (`regression B70` case), then isolated to a broader
+trigger.
+**Impact:** on a *sync folder* mount (not `~/ProtonDrive`), a file whose create
+was still queued reads back as **0 bytes for as long as the daemon runs**, even
+though the bytes are on Drive intact. This is the write-to-temp-then-rename
+pattern used by every browser download, most editor saves, `rsync`, and `git`.
+
+**Not data loss.** An earlier revision of this entry called it permanent data
+loss; that was wrong and is corrected here. The uploaded revision is complete and
+correct: for every "lost" file the node row carried the right `size` and
+`active_revision_state: "Active"`, and a daemon restart made all of them read
+back with the expected sha256. Nothing had to be recovered. The defect was
+entirely local and entirely in the read path.
+
+**Reproduction** (on an on-demand mount, per file: write, close, rename, wait for
+`pdfs status` to report the queue drained, then read back):
+
+| scenario | result |
+|---|---|
+| plain name, never renamed | content intact |
+| plain name, renamed after close | **0 bytes until restart** |
+| `.crdownload`, renamed after close | **0 bytes until restart** |
+| `.crdownload`, never renamed | content intact |
+| already-settled file, renamed | content intact |
+| any of the above, after a daemon restart | content intact |
+
+The gap between `close()` and `rename()` does not matter — 0 s, 2 s and 20 s all
+behave the same. The boundary is not timing but state: the affected node is one
+whose **create op was still queued**, on a mount that is not the primary one.
+
+**Root cause — one drain thread, many inode spaces.** The daemon mounts
+`~/ProtonDrive` plus one FUSE session per `ondemand` sync folder. Each of those
+is a `Core::fork_state` clone with its **own** `State` — its own `entries`,
+`by_uid`, `children`, `next_ino` — while sharing `db`, `cache`, `pending` and
+`client`. There is exactly **one** `pdfs-drain` thread in the process, owned by
+the primary mount, and it serves the whole shared `pending_op` table.
+
+So when a create queued by a sync-folder mount lands, the drain calls
+`adopt_real_uid` — which looked only at `self.state`, the *primary* mount's inode
+space. The fork's entry keeps its `local~…` placeholder uid forever. And
+`Core::read_range` (`crates/pdfs-fuse/src/reads.rs:314`) short-circuits a local
+uid to an empty vec:
+
+```rust
+if is_local_uid(uid) { return Ok(Vec::new()); }
+```
+
+which is why the read is silent, instant, and zero-length. A restart rebuilds
+every state from the DB, where `remap_local_uid` had already written the real
+uid, so the file reads correctly from then on.
+
+Confirmed live: `read handler uid=local~1785067300752-0 fsize=140000` three
+seconds after `pending create landed`, and at the same moment
+`adopt_real_uid … hit=None strays=[]` — the primary state had no entry for the
+uid at all. `/proc/<pid>/task/*/comm` showed 1 `pdfs-drain` against 8 fuser
+sessions.
+
+**Fix:** `Core` gained a `states: Arc<Mutex<Vec<Weak<Mutex<State>>>>>` registry
+that every mount publishes itself into (`Core::register_state`, called from
+`mount.rs` for the primary and from `fork_state` for each fork), plus
+`Core::for_each_state`, which walks every live inode space one lock at a time.
+A uid is unique across mounts, so at most one state matches and the rest are
+no-ops. Five drain sites were converted: `adopt_real_uid`, `adopt_drained_name`,
+the conflict-copy `invalidate_listing`, the `active_writes` baseline rebase in
+`refresh_after_upload`, and that function's closing `intern`.
+
+**It was completely silent.** No `ERROR`, no `WARN`, no failed op, no conflict
+copy, no retry — `pdfs status` reported the queue drained, because it had. Any
+diagnosis that relies on the journal or on queue state will not see this.
+
+**Regression cover:** `scripts/fuse-acceptance.py`, case
+`regression B74: rename after close keeps its content` — the narrowest form
+(plain names, no overwrite, no transient suffix). It failed in two consecutive
+live runs before the fix and passes after it. The pre-existing B70 case failed on
+the same cause and now passes too.
+
+**Remaining work.** `drain.rs` still has fork-blind *reads* (`node_place`,
+`root_uid`, `parent_is_gone`) and `lib.rs` has ~31 direct `state.lock()` sites;
+any of them reached from a background thread has the same shape of problem.
+Worth an audit, and worth a unit test over `for_each_state` so a future fork
+cannot silently drop out of the registry.
+
+**Note on B70:** B70's own fix was never implicated. The `.crdownload` park/un-park
+behaves correctly in isolation; the empty read arrived with the rename, on the
+same path a plain temp file takes. B70's live validation was blocked on this and
+is now unblocked — its acceptance case passes.

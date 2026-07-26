@@ -263,18 +263,19 @@ impl Core {
     /// it away from the one the user asked for. Best effort: the event sync
     /// would correct the tree anyway, but not before the user has looked at it.
     pub(crate) fn adopt_drained_name(&self, uid: &NodeUid, name: &str) {
-        let mut st = self.state.lock();
-        let Some(&ino) = st.by_uid.get(uid) else {
-            return;
-        };
-        let Some(entry) = st.entries.get_mut(&ino) else {
-            return;
-        };
-        entry.node.name = name.to_string();
-        let node = entry.node.clone();
-        if let Err(e) = st.db.upsert_node(&node) {
-            warn!(%uid, error = %e, "db upsert_node failed after a conflict rename");
-        }
+        self.for_each_state(|st| {
+            let Some(&ino) = st.by_uid.get(uid) else {
+                return;
+            };
+            let Some(entry) = st.entries.get_mut(&ino) else {
+                return;
+            };
+            entry.node.name = name.to_string();
+            let node = entry.node.clone();
+            if let Err(e) = st.db.upsert_node(&node) {
+                warn!(%uid, error = %e, "db upsert_node failed after a conflict rename");
+            }
+        });
     }
 
     /// Make a node that so far exists only on this machine real, and adopt the
@@ -419,6 +420,14 @@ impl Core {
     ///
     /// The inode is deliberately kept, so anything already holding the file open
     /// keeps working across the drain.
+    ///
+    /// Applied to **every** live inode space, not just this Core's. A node
+    /// created inside an on-demand sync folder lives in that fork's `state`,
+    /// while the drain that lands its create belongs to the primary mount — so
+    /// reaching for `self.state` here found nothing and left the fork's entry on
+    /// its `local~` uid, which reads as an empty file for as long as the daemon
+    /// runs (`docs/BUGS.md` B74). A uid is unique across mounts, so at most one
+    /// of them matches and the others are no-ops.
     pub(crate) fn adopt_real_uid(
         &self,
         local: &NodeUid,
@@ -431,8 +440,10 @@ impl Core {
         self.db
             .remap_local_uid(&local.to_string(), &real.to_string())?;
 
-        let mut st = self.state.lock();
-        if let Some(ino) = st.by_uid.remove(local) {
+        self.for_each_state(|st| {
+            let Some(ino) = st.by_uid.remove(local) else {
+                return;
+            };
             st.by_uid.insert(real.clone(), ino);
             if let Some(e) = st.entries.get_mut(&ino) {
                 e.uid = real.clone();
@@ -460,8 +471,7 @@ impl Core {
                     kids.push(ino);
                 }
             }
-        }
-        drop(st);
+        });
         // Write the real node through, now that nothing points at the old uid.
         if let Err(e) = self.db.upsert_node(&node) {
             warn!(%real, error = %e, "db upsert_node failed after remap");
@@ -604,11 +614,11 @@ impl Core {
         self.cache.evict(uid);
         self.evict_reader(uid);
         // The conflict copy is a node the tree has never seen.
-        let mut st = self.state.lock();
-        if let Some(&ino) = st.by_uid.get(&parent) {
-            st.invalidate_listing(ino);
-        }
-        drop(st);
+        self.for_each_state(|st| {
+            if let Some(&ino) = st.by_uid.get(&parent) {
+                st.invalidate_listing(ino);
+            }
+        });
         self.log_activity(
             ActivityKind::Upload,
             &name,
@@ -662,13 +672,25 @@ impl Core {
 
     /// A node's parent uid and name, as the tree currently has them.
     pub(crate) fn node_place(&self, uid: &NodeUid) -> Option<(NodeUid, String)> {
-        {
-            let st = self.state.lock();
+        // Across every mount: the drain runs on the primary Core, but a node
+        // written inside a sync folder is interned in that fork's inode space,
+        // so asking `self.state` alone always missed it and fell through to the
+        // DB. That still gave the right answer — the fallback below exists for
+        // exactly this shape of miss — but it went to disk for something already
+        // in memory, and only *because* of the fallback was it not a bug.
+        let mut found = None;
+        self.for_each_state(|st| {
+            if found.is_some() {
+                return;
+            }
             if let Some(entry) = st.by_uid.get(uid).and_then(|ino| st.entries.get(ino))
                 && let Some(parent) = entry.node.parent_uid.clone()
             {
-                return Some((parent, entry.node.name.clone()));
+                found = Some((parent, entry.node.name.clone()));
             }
+        });
+        if found.is_some() {
+            return found;
         }
         // The in-memory tree only holds what has been walked to since the daemon
         // started, and the drain routinely runs before anything has walked to
@@ -843,16 +865,17 @@ impl Core {
             if let Some(rev) = sealed_rev.clone() {
                 self.own_sealed_revs.lock().insert(uid.clone(), rev);
             }
-            let mut st = self.state.lock();
-            for aw in st.active_writes.values_mut() {
-                if aw.uid == *uid {
-                    aw.base_mtime = sealed_mtime;
-                    aw.base_size = sealed_size;
-                    aw.base_revision_id = sealed_rev.clone();
-                    debug!(%uid, mtime = sealed_mtime, size = sealed_size,
-                           "rebased open write handle onto the revision just uploaded");
+            self.for_each_state(|st| {
+                for aw in st.active_writes.values_mut() {
+                    if aw.uid == *uid {
+                        aw.base_mtime = sealed_mtime;
+                        aw.base_size = sealed_size;
+                        aw.base_revision_id = sealed_rev.clone();
+                        debug!(%uid, mtime = sealed_mtime, size = sealed_size,
+                               "rebased open write handle onto the revision just uploaded");
+                    }
                 }
-            }
+            });
         }
         // Ordered so that a write queued *during* the fetch above is still
         // caught: it took its baseline from the node's optimistic stamp, and
@@ -860,16 +883,17 @@ impl Core {
         if self.rebaseline_pending(uid, &node) {
             return;
         }
-        let mut st = self.state.lock();
-        let Some(parent) = st
-            .by_uid
-            .get(uid)
-            .and_then(|ino| st.entries.get(ino))
-            .map(|e| e.parent)
-        else {
-            return;
-        };
-        st.intern(parent, node);
+        self.for_each_state(|st| {
+            let Some(parent) = st
+                .by_uid
+                .get(uid)
+                .and_then(|ino| st.entries.get(ino))
+                .map(|e| e.parent)
+            else {
+                return;
+            };
+            st.intern(parent, node.clone());
+        });
     }
 
     /// Point a still-queued write at the revision this upload just sealed, and

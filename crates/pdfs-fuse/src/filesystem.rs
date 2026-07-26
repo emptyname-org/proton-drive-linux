@@ -1264,6 +1264,124 @@ impl Filesystem for ProtonFs {
         // fuser warning logs when applications probe file descriptors.
         reply.error(Errno::ENOTTY);
     }
+
+    // The callbacks below are deliberately unsupported. Each answers with the
+    // same errno `fuser`'s default would, minus the `[Not Implemented]` WARN it
+    // logs on every call — a probe is a normal thing for an application to do,
+    // not an incident. git alone emits one `link` per loose object, which
+    // buried real diagnostics in the journal (`docs/BUGS.md` B73). The errno
+    // contract these keep is asserted by the acceptance suite's clean-refusal
+    // case, so it must not drift.
+
+    fn mknod(
+        &self,
+        _req: &Request,
+        _parent: INodeNo,
+        _name: &OsStr,
+        _mode: u32,
+        _umask: u32,
+        _rdev: u32,
+        reply: ReplyEntry,
+    ) {
+        // Drive stores files and folders; devices, FIFOs and sockets have no
+        // representation. Regular files arrive through `create`, never here.
+        reply.error(Errno::ENOSYS);
+    }
+
+    fn symlink(
+        &self,
+        _req: &Request,
+        _parent: INodeNo,
+        _link_name: &OsStr,
+        _target: &Path,
+        reply: ReplyEntry,
+    ) {
+        // EPERM, not ENOSYS: the operation is meaningful, Drive simply cannot
+        // represent it, and callers treat EPERM as a definite "no" rather than
+        // retrying against an older interface.
+        reply.error(Errno::EPERM);
+    }
+
+    fn link(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        _newparent: INodeNo,
+        _newname: &OsStr,
+        reply: ReplyEntry,
+    ) {
+        // A node has exactly one parent on Drive, so there are no hard links.
+        // git falls back to rename() on EPERM, which this filesystem supports.
+        reply.error(Errno::EPERM);
+    }
+
+    fn fsyncdir(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        _fh: FileHandle,
+        _datasync: bool,
+        reply: ReplyEmpty,
+    ) {
+        // ENOSYS, which the kernel absorbs: it clears its fsyncdir probe and
+        // reports success to the caller. There is no dirty directory buffer to
+        // flush — directory changes are durable in SQLite before the callback
+        // that made them returns.
+        reply.error(Errno::ENOSYS);
+    }
+
+    fn setxattr(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        _name: &OsStr,
+        _value: &[u8],
+        _flags: i32,
+        _position: u32,
+        reply: ReplyEmpty,
+    ) {
+        // Drive has no user-extended-attribute store. ENOSYS reaches userspace
+        // as EOPNOTSUPP, the errno callers expect from a filesystem without
+        // xattrs. Reads (`getxattr`/`listxattr`) are implemented, since the
+        // thumbnail interface is exposed that way.
+        reply.error(Errno::ENOSYS);
+    }
+
+    fn lseek(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        _fh: FileHandle,
+        _offset: i64,
+        _whence: i32,
+        reply: ReplyLseek,
+    ) {
+        // Must stay ENOSYS. A file's holes are not knowable without fetching
+        // its blocks, and ENOSYS is what makes the kernel stop asking and
+        // emulate SEEK_DATA/SEEK_HOLE itself. Any other errno would surface to
+        // the caller as a failed seek.
+        reply.error(Errno::ENOSYS);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn copy_file_range(
+        &self,
+        _req: &Request,
+        _ino_in: INodeNo,
+        _fh_in: FileHandle,
+        _offset_in: u64,
+        _ino_out: INodeNo,
+        _fh_out: FileHandle,
+        _offset_out: u64,
+        _len: u64,
+        _flags: CopyFileRangeFlags,
+        reply: ReplyWrite,
+    ) {
+        // Also must stay ENOSYS: there is no server-side copy, and this is the
+        // errno that sends coreutils (and the kernel) down the read/write path
+        // instead of failing the copy outright.
+        reply.error(Errno::ENOSYS);
+    }
 }
 
 /// The Proton Drive VFS. FUSE callbacks are synchronous, so the Tokio handle

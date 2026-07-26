@@ -466,15 +466,33 @@ impl Core {
     /// been seen through the mount (e.g. shared but not browsed to this session) —
     /// the caller then leaves the path empty.
     pub(crate) fn rel_path_for_uid(&self, uid: &NodeUid) -> Option<String> {
-        let st = self.state.lock();
-        let mut ino = *st.by_uid.get(uid)?;
-        let mut parts = Vec::new();
-        while ino != ROOT_INO {
-            let entry = st.entries.get(&ino)?;
-            parts.push(entry.node.name.clone());
-            ino = entry.parent;
-        }
-        parts.reverse();
-        Some(parts.join("/"))
+        // Searched across every mount: a node browsed through a sync folder is
+        // interned in that fork's inode space, so the primary state alone had no
+        // entry for it and the caller silently showed an empty path
+        // (`docs/BUGS.md` B74). The path is relative to whichever mount holds
+        // it, which is the one the user reached it through.
+        let mut path = None;
+        self.for_each_state(|st| {
+            if path.is_some() {
+                return;
+            }
+            path = walk_to_root(st, uid);
+        });
+        path
     }
+}
+
+/// Walk one inode space from `uid` up to its root, building the path. `None` if
+/// that mount has never interned the node, or if the chain breaks partway —
+/// a broken chain is a missing path, never a partial one.
+fn walk_to_root(st: &super::State, uid: &NodeUid) -> Option<String> {
+    let mut ino = *st.by_uid.get(uid)?;
+    let mut parts = Vec::new();
+    while ino != ROOT_INO {
+        let entry = st.entries.get(&ino)?;
+        parts.push(entry.node.name.clone());
+        ino = entry.parent;
+    }
+    parts.reverse();
+    Some(parts.join("/"))
 }
