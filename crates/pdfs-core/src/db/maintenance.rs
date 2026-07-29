@@ -81,6 +81,7 @@ const REPORTED_TABLES: &[&str] = &[
     "pending_op",
     "activity",
     "local_files",
+    "share_access",
 ];
 
 impl Db {

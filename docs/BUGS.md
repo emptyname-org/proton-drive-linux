@@ -1432,11 +1432,21 @@ added later, but it must retain the row and blob.
 
 ## B34 — Writable POSIX Exposure of Read-Only Shared Folders (MED-07)
 
-**Status:** Open  
+**Status:** Fixed in code by P2 (2026-07-29); live credentialed shared-tree and second-account
+acceptance pending P3/P7
 **Found:** 2026-07-21, multi-agent permissions audit (`audit_bugs.md` MED-07)  
 **Where:** `crates/pdfs-fuse/src/lib.rs`, `crates/pdfs-fuse/src/sharing.rs`
 
 **Cause:** Shared "Viewer" (read-only) folders are exposed via POSIX with write permissions (`0755`). Local writes succeed initially on the mount but fail perpetually during background online drain with `403 Forbidden` errors.
+
+**Fix:** P2 persists share authority in schema V17 `share_access`, inherits it through resident
+entries, exposes read-only POSIX modes, and gates mutations at handler, queue, and drain boundaries.
+Downgrades fail closed and are not acknowledged past failed durable state updates.
+
+**Verification:** The local workspace passes formatting, locked checks, clippy with warnings denied,
+and all 324 workspace tests, including access inheritance, mutation gating, queued-operation
+authorization, and downgrade failure paths. Live credentialed shared-tree and second-account
+acceptance cannot run until P3 exposes the tree and remains required in P7.
 
 ---
 

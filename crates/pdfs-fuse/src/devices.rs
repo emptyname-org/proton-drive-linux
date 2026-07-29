@@ -489,6 +489,7 @@ impl Core {
     /// (devices.md Phase 3).
     pub(crate) fn fork_state(&self) -> Core {
         let mut fork = self.clone();
+        let share_access = self.state.lock().share_access.clone();
         fork.state = Arc::new(Mutex::new(State {
             entries: HashMap::new(),
             by_uid: HashMap::new(),
@@ -497,6 +498,8 @@ impl Core {
             active_writes: HashMap::new(),
             handles: HashMap::new(),
             next_fh: 1,
+            access_changes: std::collections::HashSet::new(),
+            share_access,
             db: self.db.clone(),
         }));
         // A fresh inode space needs a fresh notification channel: this fork's

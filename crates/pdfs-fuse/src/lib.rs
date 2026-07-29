@@ -47,9 +47,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use fuser::ReplyXattr;
 use fuser::{
-    BackgroundSession, BsdFileFlags, Config, CopyFileRangeFlags, Errno, FileAttr, FileHandle,
-    FileType, Filesystem, FopenFlags, Generation, INodeNo, IoctlFlags, LockOwner, MountOption,
-    Notifier, OpenAccMode, OpenFlags, RenameFlags, ReplyAttr, ReplyCreate, ReplyData,
+    AccessFlags, BackgroundSession, BsdFileFlags, Config, CopyFileRangeFlags, Errno, FileAttr,
+    FileHandle, FileType, Filesystem, FopenFlags, Generation, INodeNo, IoctlFlags, LockOwner,
+    MountOption, Notifier, OpenAccMode, OpenFlags, RenameFlags, ReplyAttr, ReplyCreate, ReplyData,
     ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyIoctl, ReplyLseek, ReplyOpen, ReplyWrite, Request,
     Session, TimeOrNow, WriteFlags,
 };
@@ -62,12 +62,12 @@ use pdfs_core::control::{
 };
 use pdfs_core::db::{
     Db, LOCAL_VOLUME, OP_CREATE, OP_MKDIR, OP_RENAME, OP_REVISION, OP_TRASH, PARK_UNTIL, PendingOp,
-    StoredNode, StoredSyncFolder, StoredTrash,
+    RenameMeta, StoredNode, StoredSyncFolder, StoredTrash,
 };
 use pdfs_core::localindex;
 use pdfs_core::search::relevance_score;
 use pdfs_core::syncignore::is_transient_name;
-use pdfs_core::{CoreError, CoreResult};
+use pdfs_core::{Access, CoreError, CoreResult, perm_bits};
 use proton_drive_rs::proton_sdk::api::ResponseCode;
 use proton_drive_rs::proton_sdk::error::ProtonError;
 use proton_drive_rs::proton_sdk::ids::{DriveEventId, LinkId, NodeUid, VolumeId};
@@ -512,8 +512,13 @@ impl Core {
     /// to all of them is correct because a uid is unique across mounts — at most
     /// one state has an entry for it, and the rest are no-ops.
     fn for_each_state(&self, mut apply: impl FnMut(&mut State)) {
-        for (state, _) in self.states.live() {
-            apply(&mut state.lock());
+        for (state, notifier) in self.states.live() {
+            let changed = {
+                let mut state = state.lock();
+                apply(&mut state);
+                state.take_access_changes()
+            };
+            notify_access_changes(notifier.get(), &changed);
         }
     }
 
@@ -529,6 +534,131 @@ impl Core {
         }
     }
 
+    /// Publish access changes accumulated by an intern/root refresh. The State
+    /// lock is released before notifying the kernel because notifier callbacks
+    /// may synchronously provoke more filesystem work.
+    fn flush_access_changes(&self) {
+        let changed = self.state.lock().take_access_changes();
+        notify_access_changes(self.notifier.get(), &changed);
+    }
+
+    fn require_writable(&self, ino: u64) -> Result<(), Errno> {
+        self.state.lock().require_writable(ino)
+    }
+
+    /// Mutation admission point. Persisted and every resident authority must
+    /// agree that the node is writable. A check completed before a downgrade is
+    /// admitted; later queued attempts are caught by drain. No global lock is
+    /// held across a network call.
+    ///
+    /// The intersection closes both halves of an access-refresh race: a DB
+    /// downgrade cannot be hidden by stale live state, and a live downgrade
+    /// cannot be hidden by a restored DB row. Missing UIDs fail closed.
+    fn require_uid_writable(&self, uid: &NodeUid) -> Result<(), Errno> {
+        let mut live_access = Vec::new();
+        {
+            let state = self.state.lock();
+            if let Some(access) = state.access_by_uid(uid) {
+                live_access.push(access);
+            }
+        }
+        for (state, _) in self.states.live() {
+            if Arc::ptr_eq(&state, &self.state) {
+                continue;
+            }
+            if let Some(access) = state.lock().access_by_uid(uid) {
+                live_access.push(access);
+            }
+        }
+        require_uid_access(&self.db, uid, &live_access)
+    }
+}
+
+fn require_uid_access(db: &Db, uid: &NodeUid, live_access: &[Access]) -> Result<(), Errno> {
+    let persisted = match db.effective_node_access(uid) {
+        Ok(Some(access)) => access,
+        Ok(None) => return Err(Errno::EACCES),
+        Err(error) => {
+            error!(%uid, %error, "db effective access lookup failed");
+            return Err(Errno::EACCES);
+        }
+    };
+    (persisted.writable() && live_access.iter().all(|access| access.writable()))
+        .then_some(())
+        .ok_or(Errno::EACCES)
+}
+
+fn notify_access_changes(notifier: Option<&Notifier>, changed: &[u64]) {
+    let Some(notifier) = notifier else { return };
+    for &ino in changed {
+        let _ = notifier.inval_inode(INodeNo(ino), 0, 0);
+    }
+}
+
+fn require_rename_access(
+    require: impl Fn(&NodeUid) -> Result<(), Errno>,
+    uid: &NodeUid,
+    old_parent_uid: &NodeUid,
+    new_parent_uid: &NodeUid,
+) -> Result<(), Errno> {
+    for authority in [uid, old_parent_uid, new_parent_uid] {
+        require(authority)?;
+    }
+    Ok(())
+}
+
+fn require_node_parent_access(
+    require: impl Fn(&NodeUid) -> Result<(), Errno>,
+    uid: &NodeUid,
+    parent_uid: &NodeUid,
+) -> Result<(), Errno> {
+    require(uid)?;
+    require(parent_uid)
+}
+
+fn preserve_on_access_denied(
+    access: Result<(), Errno>,
+    accepted_bytes: bool,
+    preserve: impl FnOnce(),
+) -> Result<(), Errno> {
+    if let Err(error) = access {
+        if error.code() == libc::EACCES && accepted_bytes {
+            preserve();
+        }
+        return Err(error);
+    }
+    Ok(())
+}
+
+/// Retire the last resident reference to an unlinked inode without touching its
+/// persisted node row. The namespace path already chose whether that row is
+/// disposable or retained as queued-trash authority.
+fn release_unlinked_entry(state: &mut State, ino: u64) -> Option<NodeUid> {
+    let entry = state.entries.get_mut(&ino)?;
+    entry.open_count = entry.open_count.saturating_sub(1);
+    if entry.open_count != 0 || !entry.unlinked {
+        return None;
+    }
+    let uid = entry.uid.clone();
+    state.forget_mem(&uid);
+    Some(uid)
+}
+
+fn release_must_retain_queued_trash(db: &Db, uid: &NodeUid) -> pdfs_core::Result<bool> {
+    db.has_pending_op(&uid.to_string(), OP_TRASH)
+}
+
+fn release_can_discard_unlinked(db: &Db, uid: &NodeUid) -> bool {
+    match release_must_retain_queued_trash(db, uid) {
+        Ok(retain) => !retain,
+        Err(error) => {
+            warn!(%uid, %error, "queued-trash lookup failed; retaining unlinked state");
+            false
+        }
+    }
+}
+
+impl Core {
     /// Record that this daemon just changed `uid` on the remote, so the event
     /// feed's echo of that change is recognised instead of re-applied. Called
     /// from the drain once the remote has actually accepted the change and the
@@ -575,11 +705,15 @@ impl Core {
                 .map(|(uid, pr)| (uid.clone(), pr.meta.len))
                 .collect()
         };
+        // `hydrate_pending` runs first and restores queued-trash tombstones.
+        // Their node rows remain persisted as drain-time access authority, but
+        // must not reappear in the mounted namespace after a restart.
+        let hidden = self.hidden.lock().clone();
         let mut st = self.state.lock();
 
         // Pass 1: assign a stable inode to every uid (root is already mapped).
         for sn in &stored {
-            if st.by_uid.contains_key(&sn.node.uid) {
+            if hidden.contains(&sn.node.uid) || st.by_uid.contains_key(&sn.node.uid) {
                 continue;
             }
             let ino = st.next_ino;
@@ -592,6 +726,9 @@ impl Core {
         let mut listed_dirs: Vec<u64> = Vec::new();
         for sn in stored {
             let StoredNode { mut node, listed } = sn;
+            if hidden.contains(&node.uid) {
+                continue;
+            }
             let Some(&ino) = st.by_uid.get(&node.uid) else {
                 continue;
             };
@@ -623,12 +760,14 @@ impl Core {
                     uid,
                     parent,
                     node,
+                    access: pdfs_core::Access::Unknown,
                     lookup_count: 1,
                     open_count: 0,
                     unlinked: false,
                 },
             );
         }
+        st.hydrate_access();
 
         // Pass 3: rebuild child listings for fully-enumerated folders. The root
         // is its own parent (that is what `..` resolves to), so it would match
@@ -671,6 +810,9 @@ impl Core {
                 let _ = self.db.delete_op(op.id);
                 continue;
             };
+            if op.kind == OP_TRASH {
+                self.hidden.lock().insert(uid.clone());
+            }
             restored += 1;
             // Only a revision must have a blob. A create carries none until
             // something is written to it (`touch` offline is a legitimate op
@@ -916,6 +1058,7 @@ impl Core {
                 }
                 st.children.insert(ino, child_inos);
                 drop(st);
+                self.flush_access_changes();
                 // Rows persisted from a cheap enumeration whose upgrade never
                 // ran (a restart in between, say) still owe their real sizes.
                 self.spawn_size_upgrade(ino, needs_size);
@@ -987,6 +1130,7 @@ impl Core {
             warn!(%folder_uid, error = %e, "db set_listed(true) failed");
         }
         drop(st);
+        self.flush_access_changes();
         self.spawn_size_upgrade(ino, needs_size);
         Ok(())
     }
@@ -1258,6 +1402,25 @@ impl Core {
             .map_err(|e| self.errno_error(e, &format!("could not resolve {}", rel.display())))
     }
 
+    fn source_parent_uid(&self, ino: u64, rel: &Path) -> CoreResult<NodeUid> {
+        let state = self.state.lock();
+        let entry = state
+            .entries
+            .get(&ino)
+            .ok_or_else(|| CoreError::not_found(format!("could not resolve {}", rel.display())))?;
+        entry
+            .node
+            .parent_uid
+            .clone()
+            .or_else(|| {
+                state
+                    .entries
+                    .get(&entry.parent)
+                    .map(|parent| parent.uid.clone())
+            })
+            .ok_or_else(|| CoreError::invalid("the mount root cannot be mutated"))
+    }
+
     /// Classify a failure that arrived as an `Errno`.
     ///
     /// The internal paths speak `Errno` because they also serve FUSE, where a
@@ -1324,6 +1487,23 @@ impl Core {
     /// The scratch file is *moved* into staging, never copied: it is the only
     /// copy of what the user wrote.
     fn queue_revision(&self, h: &WriteHandle) -> Result<(), Errno> {
+        // Closing an untouched writable handle is not a mutation. It remains
+        // valid after a downgrade and only owes cleanup of its empty scratch.
+        if !h.dirty {
+            self.cache.clear_scratch_durable(&h.path);
+            let _ = std::fs::remove_file(&h.path);
+            return Ok(());
+        }
+        preserve_on_access_denied(self.require_uid_writable(&h.uid), h.dirty, || {
+            let meta = self.recovery_meta(h);
+            self.stage_orphaned_write(
+                &h.uid,
+                h.ino,
+                &h.path,
+                &meta,
+                "access changed before the write could be queued",
+            );
+        })?;
         // The handle is being retired either way, so any durability sidecar an
         // `fsync` left has done its job: from here the bytes are tracked as a
         // staged write and a queued op, and a sidecar outliving them would offer
@@ -1331,10 +1511,6 @@ impl Core {
         self.cache.clear_scratch_durable(&h.path);
         if is_local_uid(&h.uid) && !self.db.has_create_op(&h.uid.to_string()).unwrap_or(true) {
             debug!(uid = %h.uid, "local node was unlinked before creation; dropping revision");
-            let _ = std::fs::remove_file(&h.path);
-            return Ok(());
-        }
-        if !h.dirty {
             let _ = std::fs::remove_file(&h.path);
             return Ok(());
         }
@@ -1392,6 +1568,35 @@ impl Core {
         Ok(())
     }
 
+    /// Describe the locally authored ranges without gap-filling them.
+    ///
+    /// Used when a write was accepted by the kernel but a queue-time access
+    /// check now denies it. Building this metadata is side-effect free, so the
+    /// permission guard still precedes cache, database, and tree mutation.
+    fn recovery_meta(&self, h: &WriteHandle) -> StagedWrite {
+        let authored: Vec<(u64, u64)> = h
+            .written
+            .segments(0, h.len)
+            .into_iter()
+            .filter(|&(_, _, authored)| authored)
+            .map(|(start, end, _)| (start, end))
+            .collect();
+        StagedWrite {
+            uid: h.uid.to_string(),
+            len: h.len,
+            base_size: h.base_size,
+            base_mtime: h.base_mtime,
+            complete: authored == [(0, h.len)],
+            authored,
+            based_on: self.remote_baseline(
+                &h.uid,
+                h.base_mtime,
+                h.base_size,
+                h.base_revision_id.clone(),
+            ),
+        }
+    }
+
     /// The remote revision a change to `uid` is being made against, for
     /// [`StagedWrite::based_on`].
     ///
@@ -1442,6 +1647,15 @@ impl Core {
         src: &Path,
         meta: StagedWrite,
     ) -> Result<(), Errno> {
+        preserve_on_access_denied(self.require_uid_writable(uid), true, || {
+            self.stage_orphaned_write(
+                uid,
+                ino,
+                src,
+                &meta,
+                "access changed before the staged write could be queued",
+            );
+        })?;
         // An incomplete blob's gaps refer to the *remote* base. If an earlier
         // write to this file is still queued, the remote no longer holds that
         // base — the previous staged blob does — so superseding it would fill
@@ -1450,7 +1664,13 @@ impl Core {
         // Only reachable offline, editing in place a file whose previous edit
         // has not drained and whose base is not cached.
         if !meta.complete && self.pending.lock().contains_key(uid) {
-            self.stage_orphaned_write(uid, ino, src, &meta);
+            self.stage_orphaned_write(
+                uid,
+                ino,
+                src,
+                &meta,
+                "write overlaps an undrained incomplete edit",
+            );
             return Err(Errno::EIO);
         }
         let path = self.cache.stage_write(&meta, src).map_err(|e| {
@@ -1552,6 +1772,7 @@ impl Core {
                 None => return Err(Errno::ENOENT),
             }
         };
+        self.require_uid_writable(&uid)?;
         if size == base_size {
             return Ok(());
         }
@@ -1645,6 +1866,7 @@ impl Core {
         is_dir: bool,
         hold: bool,
     ) -> Result<Node, Errno> {
+        self.require_uid_writable(parent_uid)?;
         let uid = mint_local_uid();
         let op = PendingOp {
             id: 0,
@@ -1690,10 +1912,56 @@ impl Core {
         &self,
         ino: u64,
         uid: &NodeUid,
+        old_parent_uid: &NodeUid,
         new_parent_ino: u64,
         new_parent_uid: &NodeUid,
         new_name: &str,
     ) -> Result<(), Errno> {
+        self.require_uid_writable(uid)?;
+        self.require_uid_writable(old_parent_uid)?;
+        self.require_uid_writable(new_parent_uid)?;
+        self.queue_rename_authorized(
+            ino,
+            uid,
+            old_parent_uid,
+            new_parent_ino,
+            new_parent_uid,
+            new_name,
+        )
+    }
+
+    /// Enqueue a rename whose access was linearized immediately before a
+    /// replacement victim was removed. Rechecking here could reject after that
+    /// destructive half had already completed.
+    fn queue_rename_authorized(
+        &self,
+        ino: u64,
+        uid: &NodeUid,
+        old_parent_uid: &NodeUid,
+        new_parent_ino: u64,
+        new_parent_uid: &NodeUid,
+        new_name: &str,
+    ) -> Result<(), Errno> {
+        let original_parent_uid = match self.db.pending_op_meta(&uid.to_string(), OP_RENAME) {
+            Ok(Some(json)) => serde_json::from_str::<RenameMeta>(&json)
+                .map(|meta| meta.original_parent_uid)
+                .map_err(|error| {
+                    error!(%uid, %error, "queued rename authority metadata is invalid");
+                    Errno::EIO
+                })?,
+            Ok(None) => old_parent_uid.to_string(),
+            Err(error) => {
+                error!(%uid, %error, "reading queued rename authority failed");
+                return Err(Errno::EIO);
+            }
+        };
+        let meta_json = serde_json::to_string(&RenameMeta {
+            original_parent_uid,
+        })
+        .map_err(|error| {
+            error!(%uid, %error, "serializing queued rename authority failed");
+            Errno::EIO
+        })?;
         let op = PendingOp {
             id: 0,
             kind: OP_RENAME.to_string(),
@@ -1701,7 +1969,7 @@ impl Core {
             parent_uid: Some(new_parent_uid.to_string()),
             name: Some(new_name.to_string()),
             blob_path: None,
-            meta_json: None,
+            meta_json: Some(meta_json),
             created_at: now_millis(),
             attempts: 0,
             last_error: None,
@@ -1729,24 +1997,18 @@ impl Core {
     /// un-uploaded file means, and the alternative (upload it, then trash it) is
     /// worse in every way.
     fn queue_trash(&self, uid: &NodeUid, name: &str) -> Result<(), Errno> {
-        self.discard_queued_ops(uid);
-        let op = PendingOp {
-            id: 0,
-            kind: OP_TRASH.to_string(),
-            uid: uid.to_string(),
-            parent_uid: None,
-            name: Some(name.to_string()),
-            blob_path: None,
-            meta_json: None,
-            created_at: now_millis(),
-            attempts: 0,
-            last_error: None,
-            next_attempt_at: 0,
-        };
-        self.db.enqueue_op(&op).map_err(|e| {
-            error!(%uid, error = %e, "queueing trash failed");
-            Errno::EIO
-        })?;
+        self.require_uid_writable(uid)?;
+        let (_, blobs) = self
+            .db
+            .replace_ops_with_trash(&uid.to_string(), name, now_millis())
+            .map_err(|e| {
+                error!(%uid, error = %e, "queueing trash failed");
+                Errno::EIO
+            })?;
+        for blob in blobs {
+            self.cache.discard_staged(Path::new(&blob));
+        }
+        self.pending.lock().remove(uid);
         self.hidden.lock().insert(uid.clone());
         // Withdrawn from every mount, not just the one the unlink came through:
         // a sync folder maps a remote folder that also exists under My Files, so
@@ -1754,7 +2016,7 @@ impl Core {
         // one would go on serving a file the user just trashed
         // (`docs/BUGS.md` B74).
         self.for_each_state(|st| {
-            st.forget(uid);
+            st.unlink_mem(uid);
         });
         self.cache.evict(uid);
         self.evict_reader(uid);
@@ -1764,16 +2026,16 @@ impl Core {
     }
 
     /// Drop every op queued against a node, and the staged bytes they own.
-    fn discard_queued_ops(&self, uid: &NodeUid) {
-        match self.db.delete_ops_for_uid(&uid.to_string()) {
-            Ok(blobs) => {
-                for blob in blobs {
-                    self.cache.discard_staged(Path::new(&blob));
-                }
-            }
-            Err(e) => error!(%uid, error = %e, "dropping queued ops failed"),
+    fn discard_queued_ops(&self, uid: &NodeUid) -> Result<(), Errno> {
+        let blobs = self.db.delete_ops_for_uid(&uid.to_string()).map_err(|e| {
+            error!(%uid, error = %e, "dropping queued ops failed");
+            Errno::EIO
+        })?;
+        for blob in blobs {
+            self.cache.discard_staged(Path::new(&blob));
         }
         self.pending.lock().remove(uid);
+        Ok(())
     }
 
     /// Nudge the drain worker to re-examine the queue now.
@@ -1785,13 +2047,22 @@ impl Core {
 
     /// Keep a write we cannot safely queue, so the bytes are recoverable even
     /// though the caller is getting an error. See [`Core::queue_revision`].
-    fn stage_orphaned_write(&self, uid: &NodeUid, ino: u64, src: &Path, meta: &StagedWrite) {
-        match self.cache.stage_write(meta, src) {
+    fn stage_orphaned_write(
+        &self,
+        uid: &NodeUid,
+        ino: u64,
+        src: &Path,
+        meta: &StagedWrite,
+        reason: &str,
+    ) {
+        match self.cache.preserve_write(meta, src) {
             Ok(staged) => {
+                self.cache.clear_scratch_durable(src);
                 error!(
                     %uid,
                     staged = %staged.display(),
-                    "cannot queue write over an undrained edit; bytes kept in staging"
+                    %reason,
+                    "cannot queue write; bytes kept in staging"
                 );
                 let name = {
                     let st = self.state.lock();
@@ -1803,20 +2074,23 @@ impl Core {
                 self.log_activity(
                     ActivityKind::Upload,
                     &name,
-                    format!("write not queued; changes kept at {}", staged.display()),
+                    format!(
+                        "write not queued ({reason}); changes kept at {}",
+                        staged.display()
+                    ),
                     false,
                 );
             }
             Err(e) => {
-                // `src` is the only known copy of bytes the kernel already
-                // accepted.  A failure to publish them into staging must never
-                // turn into permission to delete them: leave the scratch file
-                // in place so startup recovery or a human can still salvage it.
+                let surviving = e.surviving_path.clone();
+                let marker = e.marker_path.clone();
                 error!(
                     %uid,
                     error = %e,
-                    scratch = %src.display(),
-                    "staging write failed; retaining the only scratch copy"
+                    surviving = %surviving.display(),
+                    marker = ?marker,
+                    %reason,
+                    "write rescue was only partially published; bytes retained"
                 );
                 let name = {
                     let st = self.state.lock();
@@ -1829,8 +2103,8 @@ impl Core {
                     ActivityKind::Upload,
                     &name,
                     format!(
-                        "write not queued and could not be staged; recovery copy retained at {}",
-                        src.display()
+                        "write not queued ({reason}); changes retained at {}",
+                        surviving.display()
                     ),
                     false,
                 );
@@ -2368,7 +2642,15 @@ impl Core {
         if new_name.is_empty() || new_name.contains('/') {
             return Err(CoreError::invalid(format!("invalid name: {new_name:?}")));
         }
-        let (_ino, uid) = self.resolve(rel)?;
+        let (ino, uid) = self.resolve(rel)?;
+        let old_parent_uid = self.source_parent_uid(ino, rel)?;
+        require_rename_access(
+            |authority| self.require_uid_writable(authority),
+            &uid,
+            &old_parent_uid,
+            &old_parent_uid,
+        )
+        .map_err(|error| self.errno_error(error, "rename access"))?;
         self.rt
             .block_on(self.client.rename_node(&uid, new_name, None))
             .map_err(|e| CoreError::from_api(&e, "rename"))?;
@@ -2385,10 +2667,18 @@ impl Core {
     /// mountpoint-relative. Forgets the node and invalidates both the source and
     /// destination listings so each re-enumerates on next access.
     fn move_to(&self, rel: &Path, new_parent_rel: &Path) -> CoreResult<String> {
-        let (_ino, uid) = self.resolve(rel)?;
+        let (ino, uid) = self.resolve(rel)?;
+        let old_parent_uid = self.source_parent_uid(ino, rel)?;
         let (pino, new_parent_uid) = self
             .resolve_path(new_parent_rel)
             .map_err(|e| self.errno_error(e, "resolve new parent"))?;
+        require_rename_access(
+            |authority| self.require_uid_writable(authority),
+            &uid,
+            &old_parent_uid,
+            &new_parent_uid,
+        )
+        .map_err(|error| self.errno_error(error, "move access"))?;
         self.rt
             .block_on(self.client.move_node(&uid, &new_parent_uid))
             .map_err(|e| CoreError::from_api(&e, "move"))?;
@@ -2406,7 +2696,14 @@ impl Core {
     /// Trash a file or folder. `rel` is mountpoint-relative. Forgets the node,
     /// evicts any cached content, and invalidates the parent listing.
     fn delete(&self, rel: &Path) -> CoreResult<String> {
-        let (_ino, uid) = self.resolve(rel)?;
+        let (ino, uid) = self.resolve(rel)?;
+        let parent_uid = self.source_parent_uid(ino, rel)?;
+        require_node_parent_access(
+            |authority| self.require_uid_writable(authority),
+            &uid,
+            &parent_uid,
+        )
+        .map_err(|error| self.errno_error(error, "trash access"))?;
         self.rt
             .block_on(self.client.trash_nodes(std::slice::from_ref(&uid)))
             .map_err(|e| CoreError::from_api(&e, "trash"))?;
@@ -2436,13 +2733,14 @@ impl Core {
     /// it works offline.
     fn remove_replaced(&self, uid: &NodeUid, name: &str) -> Result<(), Errno> {
         if is_local_uid(uid) {
-            self.discard_queued_ops(uid);
+            self.discard_queued_ops(uid)?;
             self.for_each_state(|st| {
                 st.forget(uid);
             });
             debug!(%uid, name, "replaced a node whose create was still queued");
             return Ok(());
         }
+        self.require_uid_writable(uid)?;
         if let Err(e) = self
             .rt
             .block_on(self.client.trash_nodes(std::slice::from_ref(uid)))
@@ -2451,7 +2749,10 @@ impl Core {
             self.log_activity(ActivityKind::Trash, name, e.to_string(), false);
             return Err(Errno::EIO);
         }
-        self.discard_queued_ops(uid);
+        if let Err(error) = self.discard_queued_ops(uid) {
+            error!(%uid, "remote replacement landed but queued-op cleanup failed");
+            return Err(error);
+        }
         // The node was trashed on the server; withdraw it from every inode
         // space that had it, not only the mount the rename came through.
         self.for_each_state(|st| {
@@ -2780,6 +3081,8 @@ impl Core {
         let (pino, parent_uid) = self.resolve(parent_rel)?;
         self.ensure_children(pino)
             .map_err(|e| self.errno_error(e, "enumerate"))?;
+        self.require_uid_writable(&parent_uid)
+            .map_err(|error| self.errno_error(error, "create folder access"))?;
         let new_uid = self
             .rt
             .block_on(
@@ -2797,6 +3100,8 @@ impl Core {
         {
             kids.push(ino);
         }
+        drop(st);
+        self.flush_access_changes();
         Ok(name.to_string())
     }
     // ---- activity log -----------------------------------------------------
@@ -3084,6 +3389,7 @@ fn local_node(uid: NodeUid, parent_uid: NodeUid, name: String, is_dir: bool) -> 
         is_shared: false,
         is_shared_publicly: false,
         signature_email: None,
+        membership: None,
         // Nothing signed it: it has never been near the crypto layer.
         verification: Default::default(),
     }
@@ -3671,6 +3977,7 @@ mod pending_size_tests {
             is_shared: false,
             is_shared_publicly: false,
             signature_email: None,
+            membership: None,
             verification: Default::default(),
         }
     }
@@ -3727,11 +4034,16 @@ mod pending_size_tests {
 #[cfg(test)]
 mod tests {
     use super::{
-        HashMap, Intervals, PendingRevision, SELF_CHANGE_TTL_MS, StateRegistry, conflict_name,
-        copy_pending_for_truncate, fuse_name, is_stale_mount, node_visible, note_self_change,
-        parse_node_uid, rename_needs_queue, take_self_change,
+        Access, AccessFlags, Errno, HashMap, Intervals, PendingRevision, SELF_CHANGE_TTL_MS,
+        StateRegistry, conflict_name, copy_pending_for_truncate, fuse_name, is_stale_mount,
+        node_visible, note_self_change, parse_node_uid, preserve_on_access_denied,
+        release_can_discard_unlinked, release_must_retain_queued_trash, release_unlinked_entry,
+        rename_needs_queue, require_node_parent_access, require_rename_access, require_uid_access,
+        take_self_change,
     };
+    use crate::filesystem::access_allowed;
     use pdfs_core::cache::{Baseline, StagedWrite};
+    use pdfs_core::db::{OP_REVISION, OP_TRASH, PendingOp};
 
     /// The registry every mount publishes itself into is what lets the daemon's
     /// single drain thread reach a node living in an on-demand fork's inode
@@ -4065,6 +4377,250 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn denied_queue_guard_preserves_accepted_bytes_and_pending_count() {
+        use std::cell::Cell;
+
+        let (mut state, _dir) = state_test_helper();
+        let root = state.intern(0, node_helper("root", "none", "root", true));
+        let shared = state.intern(root, node_helper("shared", "root", "shared", true));
+        state.entries.get_mut(&shared).unwrap().access = Access::Viewer;
+        let uid = state.entries[&shared].uid.clone();
+        let db = state.db.clone();
+        let before = db.pending_ops().unwrap().len();
+
+        let preserved = Cell::new(false);
+        let result = preserve_on_access_denied(
+            require_uid_access(&db, &uid, &[Access::Viewer]),
+            true,
+            || preserved.set(true),
+        );
+        assert_eq!(result.unwrap_err().code(), libc::EACCES);
+        assert!(preserved.get(), "accepted bytes must enter recovery");
+        assert_eq!(db.pending_ops().unwrap().len(), before);
+
+        let untouched = Cell::new(false);
+        assert!(preserve_on_access_denied(Ok(()), true, || untouched.set(true)).is_ok());
+        assert!(
+            !untouched.get(),
+            "a permitted write must continue to the normal queue path"
+        );
+
+        // The same fail-closed rule applies before hydration and to a stale UID.
+        db.set_share_access(&uid, Access::Viewer).unwrap();
+        assert_eq!(
+            require_uid_access(&db, &uid, &[]).unwrap_err().code(),
+            libc::EACCES
+        );
+        let stale = NodeUid::new(VolumeId::from("vol"), LinkId::from("stale"));
+        assert_eq!(
+            require_uid_access(&db, &stale, &[]).unwrap_err().code(),
+            libc::EACCES
+        );
+        assert_eq!(db.pending_ops().unwrap().len(), before);
+    }
+
+    #[test]
+    fn persisted_and_live_queue_authorities_must_both_be_writable() {
+        let (mut state, _dir) = state_test_helper();
+        let root = state.intern(0, node_helper("root", "none", "root", true));
+        let node = state.intern(root, node_helper("shared", "root", "shared", true));
+        let uid = state.entries[&node].uid.clone();
+        let db = state.db.clone();
+
+        db.set_share_access(&uid, Access::Viewer).unwrap();
+        assert_eq!(
+            require_uid_access(&db, &uid, &[Access::Editor])
+                .unwrap_err()
+                .code(),
+            libc::EACCES,
+            "a persisted downgrade must beat stale writable live state"
+        );
+
+        db.set_share_access(&uid, Access::Editor).unwrap();
+        assert_eq!(
+            require_uid_access(&db, &uid, &[Access::Viewer])
+                .unwrap_err()
+                .code(),
+            libc::EACCES,
+            "a live downgrade must beat restored writable persisted state"
+        );
+        assert!(require_uid_access(&db, &uid, &[Access::Editor]).is_ok());
+    }
+
+    fn function_source<'a>(source: &'a str, signature: &str) -> &'a str {
+        let start = source.find(signature).expect("function signature exists");
+        let body = &source[start..];
+        let open = body.find('{').expect("function body starts");
+        let mut depth = 0usize;
+        for (offset, byte) in body.as_bytes()[open..].iter().enumerate() {
+            match byte {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return &body[..open + offset + 1];
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("function body closes")
+    }
+
+    fn assert_before(source: &str, first: &str, second: &str) {
+        let first = source.find(first).expect("first operation exists");
+        let second = source.find(second).expect("second operation exists");
+        assert!(first < second, "{first} must precede {second}");
+    }
+
+    #[test]
+    fn production_queue_guards_precede_mutating_work() {
+        let source = include_str!("lib.rs");
+
+        let revision = function_source(source, "fn queue_revision(");
+        assert_before(revision, "if !h.dirty", "preserve_on_access_denied");
+        assert_before(revision, "preserve_on_access_denied", "fill_gaps");
+
+        let staged = function_source(source, "fn enqueue_staged_write(");
+        assert_before(staged, "preserve_on_access_denied", "self.pending.lock()");
+        assert_before(
+            staged,
+            "preserve_on_access_denied",
+            "self.cache.stage_write",
+        );
+
+        let truncate = function_source(source, "fn queue_truncate(");
+        assert_before(truncate, "require_uid_writable", "self.pending.lock()");
+        assert_before(truncate, "require_uid_writable", "create_scratch");
+
+        for (signature, first_side_effect) in [
+            ("fn queue_local_node(", "mint_local_uid"),
+            ("fn queue_rename(", "queue_rename_authorized"),
+            ("fn queue_trash(", "replace_ops_with_trash"),
+        ] {
+            let function = function_source(source, signature);
+            assert_before(function, "require_uid_writable", first_side_effect);
+        }
+        let trash = function_source(source, "fn queue_trash(");
+        assert_before(trash, "replace_ops_with_trash", "discard_staged");
+
+        let filesystem = include_str!("filesystem.rs");
+        for signature in ["fn serve_unlink(", "fn serve_rmdir("] {
+            let function = function_source(filesystem, signature);
+            assert_before(function, "require_writable", "lookup_child");
+        }
+
+        let rename = function_source(filesystem, "fn serve_rename(");
+        assert_before(rename, "require_rename_access", "remove_replaced");
+        assert_before(rename, "remove_replaced", "queue_rename_authorized");
+        for (signature, gate, remote_call) in [
+            ("fn serve_create(", "require_uid_writable", "upload_file"),
+            ("fn serve_mkdir(", "require_uid_writable", "create_folder"),
+            ("fn trash_child(", "require_uid_writable", "trash_nodes"),
+            ("fn serve_rename(", "require_rename_access", "rename_node"),
+        ] {
+            let function = function_source(filesystem, signature);
+            assert_before(function, gate, remote_call);
+        }
+        let control_mkdir = function_source(source, "fn create_folder(");
+        assert_before(
+            control_mkdir,
+            "require_uid_writable",
+            ".create_folder(&parent_uid",
+        );
+        for (signature, gate, remote_call) in [
+            (
+                "fn rename(&self, rel: &Path",
+                "require_rename_access",
+                ".rename_node",
+            ),
+            (
+                "fn move_to(&self, rel: &Path",
+                "require_rename_access",
+                ".move_node",
+            ),
+            (
+                "fn delete(&self, rel: &Path",
+                "require_node_parent_access",
+                ".trash_nodes",
+            ),
+        ] {
+            let function = function_source(source, signature);
+            assert_before(function, "source_parent_uid", gate);
+            assert_before(function, gate, remote_call);
+        }
+    }
+
+    #[test]
+    fn replacement_rename_authorizes_source_and_both_parents() {
+        use std::cell::RefCell;
+
+        let source = NodeUid::new(VolumeId::from("vol"), LinkId::from("source"));
+        let old_parent = NodeUid::new(VolumeId::from("vol"), LinkId::from("old"));
+        let new_parent = NodeUid::new(VolumeId::from("vol"), LinkId::from("new"));
+        let checked = RefCell::new(Vec::new());
+
+        require_rename_access(
+            |uid| {
+                checked.borrow_mut().push(uid.to_string());
+                Ok(())
+            },
+            &source,
+            &old_parent,
+            &new_parent,
+        )
+        .unwrap();
+
+        assert_eq!(
+            checked.into_inner(),
+            vec!["vol~source", "vol~old", "vol~new"]
+        );
+    }
+
+    #[test]
+    fn writable_nested_node_cannot_mutate_a_viewer_parent_namespace() {
+        let source = NodeUid::new(VolumeId::from("vol"), LinkId::from("nested-editor"));
+        let viewer_parent = NodeUid::new(VolumeId::from("vol"), LinkId::from("viewer-parent"));
+        let writable_destination = NodeUid::new(VolumeId::from("vol"), LinkId::from("destination"));
+        let access = |uid: &NodeUid| {
+            if uid == &viewer_parent {
+                Err(Errno::EACCES)
+            } else {
+                Ok(())
+            }
+        };
+
+        assert_eq!(
+            require_node_parent_access(access, &source, &viewer_parent)
+                .unwrap_err()
+                .code(),
+            libc::EACCES,
+            "delete must authorize the source namespace"
+        );
+        assert_eq!(
+            require_rename_access(access, &source, &viewer_parent, &writable_destination,)
+                .unwrap_err()
+                .code(),
+            libc::EACCES,
+            "rename and move must authorize the original parent"
+        );
+    }
+
+    #[test]
+    fn access_handler_logic_matches_advertised_permissions() {
+        assert!(access_allowed(false, Access::Viewer, AccessFlags::F_OK));
+        assert!(access_allowed(false, Access::Viewer, AccessFlags::R_OK));
+        assert!(!access_allowed(false, Access::Viewer, AccessFlags::W_OK));
+        assert!(!access_allowed(false, Access::Owner, AccessFlags::X_OK));
+        assert!(access_allowed(true, Access::Viewer, AccessFlags::X_OK));
+        assert!(access_allowed(
+            true,
+            Access::Editor,
+            AccessFlags::R_OK | AccessFlags::W_OK | AccessFlags::X_OK
+        ));
+    }
+
     use proton_drive_rs::proton_sdk::ids::{LinkId, NodeUid, VolumeId};
     use proton_drive_rs::{Node, NodeKind};
 
@@ -4111,6 +4667,7 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir_path).unwrap();
         let db = pdfs_core::db::Db::open(&dir_path.join("cache.db")).unwrap();
+        let share_access = db.all_share_access().unwrap();
         let st = crate::state::State {
             entries: std::collections::HashMap::new(),
             by_uid: std::collections::HashMap::new(),
@@ -4119,9 +4676,92 @@ mod tests {
             active_writes: std::collections::HashMap::new(),
             handles: std::collections::HashMap::new(),
             next_fh: 1,
+            access_changes: std::collections::HashSet::new(),
+            share_access,
             db: std::sync::Arc::new(db),
         };
         (st, TestDir(dir_path))
+    }
+
+    #[test]
+    fn queued_trash_of_open_file_survives_last_release_until_atomic_completion() {
+        let (mut state, _dir) = state_test_helper();
+        let parent = state.intern(0, node_helper("parent", "none", "parent", true));
+        let file_node = node_helper("open-trash", "parent", "dirty.txt", false);
+        let uid = file_node.uid.clone();
+        let ino = state.intern(parent, file_node);
+        state.children.insert(parent, vec![ino]);
+        state.entries.get_mut(&ino).unwrap().open_count = 1;
+
+        // The typed DB operation atomically replaces the old revision with the
+        // one intent that must survive the open handle's final release.
+        state
+            .db
+            .enqueue_op(&PendingOp {
+                id: 0,
+                kind: OP_REVISION.to_string(),
+                uid: uid.to_string(),
+                parent_uid: None,
+                name: None,
+                blob_path: None,
+                meta_json: None,
+                created_at: 1,
+                attempts: 0,
+                last_error: None,
+                next_attempt_at: 0,
+            })
+            .unwrap();
+        let (_, blobs) = state
+            .db
+            .replace_ops_with_trash(&uid.to_string(), "dirty.txt", 2)
+            .unwrap();
+        assert!(blobs.is_empty());
+        let queued_counts = state.db.pending_op_counts().unwrap();
+
+        state.unlink_mem(&uid);
+        assert!(state.entries[&ino].unlinked);
+        assert!(!state.children[&parent].contains(&ino));
+        assert!(state.db.node_by_uid(&uid.to_string()).unwrap().is_some());
+
+        let released = release_unlinked_entry(&mut state, ino).unwrap();
+        assert_eq!(released, uid);
+        assert!(!state.by_uid.contains_key(&uid));
+        assert!(release_must_retain_queued_trash(&state.db, &uid).unwrap());
+        assert!(
+            state.db.node_by_uid(&uid.to_string()).unwrap().is_some(),
+            "last release keeps persisted drain authority"
+        );
+        let pending = state.db.pending_ops().unwrap();
+        assert_eq!(pending.len(), 1, "release must not add a revision");
+        assert_eq!(pending[0].kind, OP_TRASH);
+        let after_release = state.db.pending_op_counts().unwrap();
+        assert_eq!(after_release.uploads, 0);
+        assert_eq!(after_release.changes, 1);
+        assert_eq!(after_release.uploads, queued_counts.uploads);
+        assert_eq!(after_release.changes, queued_counts.changes);
+
+        state.db.complete_trash_op(pending[0].id, &uid).unwrap();
+        assert!(state.db.pending_ops().unwrap().is_empty());
+        assert!(state.db.node_by_uid(&uid.to_string()).unwrap().is_none());
+    }
+
+    #[test]
+    fn queued_trash_lookup_failure_conservatively_retains_unlinked_state() {
+        let (state, _dir) = state_test_helper();
+        let uid = NodeUid::new(VolumeId::from("vol"), LinkId::from("uncertain-trash"));
+        state
+            .db
+            .with_conn(|conn| {
+                conn.execute_batch("DROP TABLE pending_op")?;
+                Ok(())
+            })
+            .unwrap();
+
+        assert!(release_must_retain_queued_trash(&state.db, &uid).is_err());
+        assert!(
+            !release_can_discard_unlinked(&state.db, &uid),
+            "database uncertainty must retain the tombstone and authority row"
+        );
     }
 
     fn node_helper(id: &str, parent: &str, name: &str, is_dir: bool) -> Node {
@@ -4154,6 +4794,7 @@ mod tests {
             is_shared: false,
             is_shared_publicly: false,
             signature_email: None,
+            membership: None,
             verification: Default::default(),
         }
     }

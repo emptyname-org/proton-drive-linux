@@ -46,7 +46,7 @@ impl Filesystem for ProtonFs {
                         }
                     )
                     .then(|| (e.parent, e.uid.clone()));
-                    (self.attr(ino.0, &e.node), provisional)
+                    (self.attr(ino.0, &e.node, e.access), provisional)
                 }
                 None => {
                     reply.error(Errno::ENOENT);
@@ -79,7 +79,7 @@ impl Filesystem for ProtonFs {
             let attr = {
                 let st = fs.core.state.lock();
                 match st.entries.get(&ino.0) {
-                    Some(e) => fs.attr(ino.0, &e.node),
+                    Some(e) => fs.attr(ino.0, &e.node, e.access),
                     // Forgotten while we waited.
                     None => attr,
                 }
@@ -110,10 +110,15 @@ impl Filesystem for ProtonFs {
     }
 
     fn open(&self, _req: &Request, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
+        let write_requested = flags.acc_mode() != OpenAccMode::O_RDONLY;
         let (uid, base_mtime, base_size, base_revision_id) = {
             let mut st = self.core.state.lock();
             match st.entries.get_mut(&ino.0) {
                 Some(e) if e.node.is_file() => {
+                    if write_requested && !e.writable() {
+                        reply.error(Errno::EACCES);
+                        return;
+                    }
                     e.open_count = e.open_count.saturating_add(1);
                     (
                         e.uid.clone(),
@@ -315,6 +320,10 @@ impl Filesystem for ProtonFs {
         reply: ReplyCreate,
     ) {
         let parent = parent.0;
+        if let Err(error) = self.core.require_writable(parent) {
+            reply.error(error);
+            return;
+        }
         let name = match fuse_name(name) {
             Ok(name) => name,
             Err(error) => {
@@ -346,6 +355,10 @@ impl Filesystem for ProtonFs {
         _lock_owner: Option<LockOwner>,
         reply: ReplyWrite,
     ) {
+        if let Err(error) = self.core.require_writable(ino.0) {
+            reply.error(error);
+            return;
+        }
         let fh = fh.0;
         // Stage the bytes straight into the scratch file (no base download): only
         // the untouched remainder is pulled from the remote, and only at commit.
@@ -413,6 +426,10 @@ impl Filesystem for ProtonFs {
         _flags: Option<BsdFileFlags>,
         reply: ReplyAttr,
     ) {
+        if let Err(error) = self.core.require_writable(ino.0) {
+            reply.error(error);
+            return;
+        }
         // Only resizes change remote state; everything else (mode/owner/times) is
         // accepted and ignored so tools that chmod/utimes after writing succeed.
         if let Some(size) = size {
@@ -476,6 +493,10 @@ impl Filesystem for ProtonFs {
         mode: i32,
         reply: ReplyEmpty,
     ) {
+        if let Err(error) = self.core.require_writable(ino.0) {
+            reply.error(error);
+            return;
+        }
         let new_end = offset.saturating_add(length);
         let keep_size = (mode & 1) != 0; // FALLOC_FL_KEEP_SIZE
 
@@ -637,18 +658,7 @@ impl Filesystem for ProtonFs {
     ) {
         let (handle, unlinked_uid) = {
             let mut st = self.core.state.lock();
-            let unlinked_uid = if let Some(entry) = st.entries.get_mut(&_ino.0) {
-                entry.open_count = entry.open_count.saturating_sub(1);
-                if entry.open_count == 0 && entry.unlinked {
-                    let uid = entry.uid.clone();
-                    st.forget(&uid);
-                    Some(uid)
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
+            let unlinked_uid = release_unlinked_entry(&mut st, _ino.0);
             let ino = st.handles.remove(&fh.0);
             let h = ino.and_then(|i| {
                 let aw = st.active_writes.get_mut(&i)?;
@@ -679,6 +689,10 @@ impl Filesystem for ProtonFs {
 
     fn unlink(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
         let parent = parent.0;
+        if let Err(error) = self.core.require_writable(parent) {
+            reply.error(error);
+            return;
+        }
         let name_str = match fuse_name(name) {
             Ok(name) => name,
             Err(error) => {
@@ -695,6 +709,10 @@ impl Filesystem for ProtonFs {
 
     fn rmdir(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
         let parent = parent.0;
+        if let Err(error) = self.core.require_writable(parent) {
+            reply.error(error);
+            return;
+        }
         let name_str = match fuse_name(name) {
             Ok(name) => name,
             Err(error) => {
@@ -720,6 +738,10 @@ impl Filesystem for ProtonFs {
         reply: ReplyEntry,
     ) {
         let parent = parent.0;
+        if let Err(error) = self.core.require_writable(parent) {
+            reply.error(error);
+            return;
+        }
         let name = match fuse_name(name) {
             Ok(name) => name,
             Err(error) => {
@@ -748,6 +770,14 @@ impl Filesystem for ProtonFs {
     ) {
         let parent = parent.0;
         let newparent = newparent.0;
+        if let Err(error) = self
+            .core
+            .require_writable(parent)
+            .and_then(|()| self.core.require_writable(newparent))
+        {
+            reply.error(error);
+            return;
+        }
         let name = match fuse_name(name) {
             Ok(name) => name,
             Err(error) => {
@@ -769,6 +799,19 @@ impl Filesystem for ProtonFs {
         self.core.workers.run(Lane::Meta, move || {
             fs.serve_rename(parent, &name, newparent, &newname, flags, reply)
         });
+    }
+
+    fn access(&self, _req: &Request, ino: INodeNo, mask: AccessFlags, reply: ReplyEmpty) {
+        let state = self.core.state.lock();
+        let Some(entry) = state.entries.get(&ino.0) else {
+            reply.error(Errno::ENOENT);
+            return;
+        };
+        if !access_allowed(entry.node.is_folder(), entry.access, mask) {
+            reply.error(Errno::EACCES);
+        } else {
+            reply.ok();
+        }
     }
 
     fn getxattr(&self, _req: &Request, ino: INodeNo, name: &OsStr, size: u32, reply: ReplyXattr) {
@@ -935,6 +978,11 @@ pub struct ProtonFs {
     gid: u32,
 }
 
+pub(crate) fn access_allowed(is_dir: bool, access: Access, mask: AccessFlags) -> bool {
+    (!mask.contains(AccessFlags::W_OK) || access.writable())
+        && (!mask.contains(AccessFlags::X_OK) || is_dir)
+}
+
 impl ProtonFs {
     /// Build the filesystem rooted at `root` (the user's My Files folder).
     pub(super) fn new(core: Core, root: Node) -> Self {
@@ -944,12 +992,14 @@ impl ProtonFs {
                 warn!(uid = %root.uid, error = %e, "db upsert root failed");
             }
             st.by_uid.insert(root.uid.clone(), ROOT_INO);
+            let access = st.access_for_node(ROOT_INO, &root);
             st.entries.insert(
                 ROOT_INO,
                 Entry {
                     uid: root.uid.clone(),
                     parent: ROOT_INO,
                     node: root,
+                    access,
                     lookup_count: 1,
                     open_count: 0,
                     unlinked: false,
@@ -991,7 +1041,7 @@ impl ProtonFs {
                                 }
                             )
                             .then(|| (e.parent, e.uid.clone()));
-                            (ino, self.attr(ino, &e.node), provisional)
+                            (ino, self.attr(ino, &e.node, e.access), provisional)
                         })
                 })
             })
@@ -1023,7 +1073,7 @@ impl ProtonFs {
             let st = self.core.state.lock();
             st.entries
                 .get(&ino)
-                .map_or(attr, |e| self.attr(ino, &e.node))
+                .map_or(attr, |e| self.attr(ino, &e.node, e.access))
         };
         reply.entry(&TTL, &attr, Generation(0));
     }
@@ -1065,11 +1115,12 @@ impl ProtonFs {
         reply.ok();
     }
 
-    fn attr(&self, ino: u64, node: &Node) -> FileAttr {
-        let (kind, perm) = match node.kind {
-            NodeKind::Folder => (FileType::Directory, 0o755),
-            NodeKind::File { .. } => (FileType::RegularFile, 0o644),
+    fn attr(&self, ino: u64, node: &Node, access: Access) -> FileAttr {
+        let kind = match node.kind {
+            NodeKind::Folder => FileType::Directory,
+            NodeKind::File { .. } => FileType::RegularFile,
         };
+        let perm = perm_bits(node.is_folder(), access);
         let size = node_size(node);
         let mtime = unix_secs(node.modification_time);
         let crtime = unix_secs(node.creation_time);
@@ -1097,6 +1148,10 @@ impl ProtonFs {
     /// subtrees, so an `rmdir` of a non-empty dir behaves the same).
     /// The body of [`Filesystem::create`], run off the dispatch loop.
     fn serve_create(&self, parent: u64, name: &str, reply: ReplyCreate) {
+        if let Err(error) = self.core.require_writable(parent) {
+            reply.error(error);
+            return;
+        }
         if let Err(e) = self.core.ensure_children(parent) {
             reply.error(e);
             return;
@@ -1128,6 +1183,10 @@ impl ProtonFs {
         let node =
             if !transient && self.core.online.load(Ordering::Relaxed) && !is_local_uid(&parent_uid)
             {
+                if let Err(error) = self.core.require_uid_writable(&parent_uid) {
+                    reply.error(error);
+                    return;
+                }
                 // Create an empty file on the remote so it has a real uid immediately;
                 // written bytes are buffered and sealed as a new revision on close.
                 let new_uid = match self.core.rt.block_on(self.core.client.upload_file(
@@ -1211,7 +1270,10 @@ impl ProtonFs {
         });
         aw.open_count += 1;
         st.handles.insert(fh, ino);
-        let attr = self.attr(ino, &st.entries.get(&ino).unwrap().node);
+        let entry = st.entries.get(&ino).unwrap();
+        let attr = self.attr(ino, &entry.node, entry.access);
+        drop(st);
+        self.core.flush_access_changes();
         reply.created(
             &TTL,
             &attr,
@@ -1223,6 +1285,10 @@ impl ProtonFs {
 
     /// The body of [`Filesystem::mkdir`], run off the dispatch loop.
     fn serve_mkdir(&self, parent: u64, name: &str, reply: ReplyEntry) {
+        if let Err(error) = self.core.require_writable(parent) {
+            reply.error(error);
+            return;
+        }
         if let Err(e) = self.core.ensure_children(parent) {
             reply.error(e);
             return;
@@ -1245,6 +1311,10 @@ impl ProtonFs {
         // queued — the folder becomes a placeholder that the drain turns into a
         // real one (offline.md Phase 3b).
         let node = if self.core.online.load(Ordering::Relaxed) && !is_local_uid(&parent_uid) {
+            if let Err(error) = self.core.require_uid_writable(&parent_uid) {
+                reply.error(error);
+                return;
+            }
             let new_uid =
                 match self
                     .core
@@ -1292,12 +1362,19 @@ impl ProtonFs {
                 warn!(%uid, error = %e, "db set_listed(true) failed for local folder");
             }
         }
-        let attr = self.attr(ino, &st.entries.get(&ino).unwrap().node);
+        let entry = st.entries.get(&ino).unwrap();
+        let attr = self.attr(ino, &entry.node, entry.access);
+        drop(st);
+        self.core.flush_access_changes();
         reply.entry(&TTL, &attr, Generation(0));
     }
 
     /// The body of [`Filesystem::unlink`], run off the dispatch loop.
     fn serve_unlink(&self, parent: u64, name_str: &str, reply: ReplyEmpty) {
+        if let Err(error) = self.core.require_writable(parent) {
+            reply.error(error);
+            return;
+        }
         if let Ok((ino, _)) = self.core.lookup_child(parent, name_str) {
             let st = self.core.state.lock();
             if let Some(entry) = st.entries.get(&ino)
@@ -1312,6 +1389,10 @@ impl ProtonFs {
 
     /// The body of [`Filesystem::rmdir`], run off the dispatch loop.
     fn serve_rmdir(&self, parent: u64, name_str: &str, reply: ReplyEmpty) {
+        if let Err(error) = self.core.require_writable(parent) {
+            reply.error(error);
+            return;
+        }
         if let Ok((ino, _)) = self.core.lookup_child(parent, name_str) {
             {
                 let st = self.core.state.lock();
@@ -1348,10 +1429,18 @@ impl ProtonFs {
         reply: ReplyEmpty,
     ) {
         let was_unlinked = unlinked_uid.is_some();
-        if let Some(uid) = unlinked_uid {
-            self.core.discard_queued_ops(&uid);
-            self.core.cache.evict(&uid);
-            self.core.evict_reader(&uid);
+        if let Some(uid) = unlinked_uid
+            && release_can_discard_unlinked(&self.core.db, &uid)
+        {
+            if let Err(error) = self.core.discard_queued_ops(&uid) {
+                warn!(%uid, ?error, "queued-op cleanup failed; retaining unlinked state");
+            } else {
+                if let Err(error) = self.core.db.delete_node(&uid) {
+                    warn!(%uid, %error, "deleting released unlinked node state failed");
+                }
+                self.core.cache.evict(&uid);
+                self.core.evict_reader(&uid);
+            }
         }
         // Hand the bytes to the queue rather than uploading them here: the
         // scratch file is the only copy of what was just written, and blocking
@@ -1366,6 +1455,7 @@ impl ProtonFs {
                 {
                     warn!(path = %h.path.display(), error = %e, "discarding unlinked scratch file failed");
                 }
+                self.core.cache.clear_scratch_durable(&h.path);
                 reply.ok();
             }
             (Some(h), false) => match self.core.queue_revision(&h) {
@@ -1386,6 +1476,14 @@ impl ProtonFs {
         flags: RenameFlags,
         reply: ReplyEmpty,
     ) {
+        if let Err(error) = self
+            .core
+            .require_writable(parent)
+            .and_then(|()| self.core.require_writable(newparent))
+        {
+            reply.error(error);
+            return;
+        }
         let (ino, uid) = match self.core.lookup_child(parent, name) {
             Ok(x) => x,
             Err(e) => {
@@ -1413,11 +1511,11 @@ impl ProtonFs {
             reply.error(e);
             return;
         }
-        let new_parent_uid = {
+        let (old_parent_uid, new_parent_uid) = {
             let st = self.core.state.lock();
-            match st.entries.get(&newparent) {
-                Some(e) => e.uid.clone(),
-                None => {
+            match (st.entries.get(&parent), st.entries.get(&newparent)) {
+                (Some(old), Some(new)) => (old.uid.clone(), new.uid.clone()),
+                _ => {
                     reply.error(Errno::ENOENT);
                     return;
                 }
@@ -1446,7 +1544,7 @@ impl ProtonFs {
                 return;
             }
         };
-        if let Some((victim_ino, victim_uid)) = &victim {
+        let replacement_authorized = if let Some((victim_ino, victim_uid)) = &victim {
             if flags.contains(RenameFlags::RENAME_NOREPLACE) {
                 reply.error(Errno::EEXIST);
                 return;
@@ -1490,11 +1588,23 @@ impl ProtonFs {
                 reply.error(e);
                 return;
             }
+            if let Err(error) = require_rename_access(
+                |authority| self.core.require_uid_writable(authority),
+                &uid,
+                &old_parent_uid,
+                &new_parent_uid,
+            ) {
+                reply.error(error);
+                return;
+            }
             if let Err(e) = self.core.remove_replaced(victim_uid, newname) {
                 reply.error(e);
                 return;
             }
-        }
+            true
+        } else {
+            false
+        };
         // A node whose own creation is still queued has no server-side identity
         // to rename: the queued op *is* the node, so rewriting its target is the
         // whole rename. Nothing reaches the API, which is why this works offline
@@ -1557,10 +1667,26 @@ impl ProtonFs {
             newparent != parent,
             newname != name,
         ) {
-            match self
-                .core
-                .queue_rename(ino, &uid, newparent, &new_parent_uid, newname)
-            {
+            let queued = if replacement_authorized {
+                self.core.queue_rename_authorized(
+                    ino,
+                    &uid,
+                    &old_parent_uid,
+                    newparent,
+                    &new_parent_uid,
+                    newname,
+                )
+            } else {
+                self.core.queue_rename(
+                    ino,
+                    &uid,
+                    &old_parent_uid,
+                    newparent,
+                    &new_parent_uid,
+                    newname,
+                )
+            };
+            match queued {
                 Ok(()) => {
                     // Send the rename response first. Kernel-side rename cache
                     // updates happen while processing that response; notifying
@@ -1588,6 +1714,16 @@ impl ProtonFs {
         // A failure past this point has already trashed any node the rename was
         // replacing, so put it back rather than leaving the caller with neither
         // the source moved nor the destination intact.
+        if let Err(error) = require_rename_access(
+            |authority| self.core.require_uid_writable(authority),
+            &uid,
+            &old_parent_uid,
+            &new_parent_uid,
+        ) {
+            self.core.restore_replaced(victim.as_ref(), newname);
+            reply.error(error);
+            return;
+        }
         if newname != name
             && let Err(e) = self
                 .core
@@ -1655,7 +1791,7 @@ impl ProtonFs {
         let st = self.core.state.lock();
         match st.entries.get(&ino) {
             Some(e) => {
-                let attr = self.attr(ino, &e.node);
+                let attr = self.attr(ino, &e.node, e.access);
                 reply.attr(&TTL, &attr);
             }
             None => reply.error(Errno::ENOENT),
@@ -1663,6 +1799,10 @@ impl ProtonFs {
     }
 
     fn trash_child(&self, parent: u64, name: &str, reply: ReplyEmpty) {
+        if let Err(error) = self.core.require_writable(parent) {
+            reply.error(error);
+            return;
+        }
         let (ino, uid) = match self.core.lookup_child(parent, name) {
             Ok(x) => x,
             Err(e) => {
@@ -1681,8 +1821,9 @@ impl ProtonFs {
         // it just means its queued creation is no longer wanted. This works
         // offline, which the remote path below cannot (offline.md Phase 3b).
         if is_local_uid(&uid) {
-            if !open_now {
-                self.core.discard_queued_ops(&uid);
+            if !open_now && let Err(error) = self.core.discard_queued_ops(&uid) {
+                reply.error(error);
+                return;
             }
             self.core.state.lock().forget_or_unlink(&uid);
             debug!(%uid, name, "deleted a node that had not been created remotely yet");
@@ -1694,12 +1835,13 @@ impl ProtonFs {
         // command returns (offline.md Phase 3b).
         if !self.core.online.load(Ordering::Relaxed) {
             match self.core.queue_trash(&uid, name) {
-                Ok(()) => {
-                    self.core.state.lock().forget_or_unlink(&uid);
-                    reply.ok();
-                }
+                Ok(()) => reply.ok(),
                 Err(e) => reply.error(e),
             }
+            return;
+        }
+        if let Err(e) = self.core.require_uid_writable(&uid) {
+            reply.error(e);
             return;
         }
         if let Err(e) = self
@@ -1718,7 +1860,9 @@ impl ProtonFs {
         self.core.hidden.lock().insert(uid.clone());
         self.core.state.lock().forget_or_unlink(&uid);
         if !open_now {
-            self.core.discard_queued_ops(&uid);
+            if let Err(error) = self.core.discard_queued_ops(&uid) {
+                warn!(%uid, ?error, "remote trash landed but queued-op cleanup failed");
+            }
             self.core.cache.evict(&uid);
             self.core.evict_reader(&uid);
         }

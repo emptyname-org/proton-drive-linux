@@ -148,6 +148,32 @@ impl Db {
         Ok(())
     }
 
+    /// Atomically retire a landed trash operation and its retained authority.
+    ///
+    /// Queued trash keeps the node row so drain-time permission checks can
+    /// resolve its shared-tree access. Removing the op first could resurrect
+    /// that row after a crash; removing the row first could strand a now
+    /// unauthorizable op. One transaction closes both windows.
+    pub fn complete_trash_op(&self, op_id: i64, uid: &NodeUid) -> Result<()> {
+        let uid = uid.to_string();
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
+        let rowid: Option<i64> = tx
+            .query_row(
+                "SELECT rowid FROM nodes WHERE uid = ?1",
+                params![uid],
+                |row| row.get(0),
+            )
+            .optional()?;
+        tx.execute("DELETE FROM nodes WHERE uid = ?1", params![uid])?;
+        if let Some(rowid) = rowid {
+            tx.execute("DELETE FROM nodes_fts WHERE rowid = ?1", params![rowid])?;
+        }
+        tx.execute("DELETE FROM pending_op WHERE id = ?1", params![op_id])?;
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Check if a folder node has any non-trashed children in the database.
     pub fn has_children(&self, parent_uid: &NodeUid) -> Result<bool> {
         let uid_str = parent_uid.to_string();

@@ -17,6 +17,7 @@
 //! [`Node`]: proton_drive_rs::Node
 
 use std::collections::{BTreeMap, HashSet};
+use std::fmt;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -28,10 +29,11 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::db::{CacheEntryInput, Db};
-use crate::error::Result;
+use crate::error::{Error, Result};
 
 /// `cache_entries.kind` tag for whole-file content blobs.
 const KIND_BLOB: &str = "blob";
+static STAGING_N: AtomicU64 = AtomicU64::new(0);
 /// `cache_entries.kind` tag for on-demand block-cache chunks.
 const KIND_BLOCK: &str = "block";
 /// `cache_entries.kind` tag for cached thumbnails.
@@ -169,6 +171,35 @@ pub struct Baseline {
     pub revision_id: Option<String>,
 }
 
+/// A denied-write rescue that retained the bytes but could not fully publish
+/// their recovery metadata.
+#[derive(Debug)]
+pub struct PreserveWriteError {
+    /// The actual path that still contains the accepted bytes.
+    pub surviving_path: PathBuf,
+    /// The recovery metadata that still describes those bytes, when one could
+    /// be made durable. Callers must never clear this after an error.
+    pub marker_path: Option<PathBuf>,
+    error: Error,
+}
+
+impl fmt::Display for PreserveWriteError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "{} (bytes retained at {})",
+            self.error,
+            self.surviving_path.display()
+        )
+    }
+}
+
+impl std::error::Error for PreserveWriteError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.error)
+    }
+}
+
 /// Content cache rooted at a directory, with a sibling pin-registry file.
 pub struct ContentCache {
     /// Directory holding `<key>` blobs and `<key>.meta` tags.
@@ -225,6 +256,18 @@ pub struct ContentCache {
 }
 
 impl ContentCache {
+    fn staging_path(&self, meta: &StagedWrite) -> PathBuf {
+        // The uid goes in the name so a staged file can be tied back to its node
+        // without a database; `/` in a uid would otherwise open a path.
+        let safe_uid = meta.uid.replace(['/', '\\'], "_");
+        self.staging_dir.join(format!(
+            "{}-{}-{}",
+            safe_uid,
+            now_millis(),
+            STAGING_N.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
+
     /// Open (and create) a cache under `content_dir`, with the pin registry at
     /// `pins_path` and a `max_bytes` size cap (`0` = unlimited). Both parent
     /// directories are created if missing. `db` is the shared metadata database
@@ -910,16 +953,7 @@ impl ContentCache {
     pub fn stage_write(&self, meta: &StagedWrite, scratch: &Path) -> Result<PathBuf> {
         use std::io::Write as _;
 
-        static N: AtomicU64 = AtomicU64::new(0);
-        // The uid goes in the name so a staged file can be tied back to its node
-        // without a database; `/` in a uid would otherwise open a path.
-        let safe_uid = meta.uid.replace(['/', '\\'], "_");
-        let path = self.staging_dir.join(format!(
-            "{}-{}-{}",
-            safe_uid,
-            now_millis(),
-            N.fetch_add(1, Ordering::Relaxed)
-        ));
+        let path = self.staging_path(meta);
         let copied = if let Err(e) = std::fs::rename(scratch, &path) {
             if e.kind() != std::io::ErrorKind::CrossesDevices {
                 return Err(e.into());
@@ -947,6 +981,154 @@ impl ContentCache {
             std::fs::remove_file(scratch)?;
         }
         Ok(path)
+    }
+
+    /// Preserve accepted bytes which cannot be queued.
+    ///
+    /// Scratch and staging normally share a filesystem, so the normal path is
+    /// an atomic rename. If that is impossible, the source first receives a
+    /// durable recovery marker and remains in place until a copied destination,
+    /// its sidecar, and the staging directory are all synced.
+    pub fn preserve_write(
+        &self,
+        meta: &StagedWrite,
+        scratch: &Path,
+    ) -> std::result::Result<PathBuf, PreserveWriteError> {
+        let path = self.staging_path(meta);
+        self.preserve_write_at(meta, scratch, &path)
+    }
+
+    fn preserve_write_at(
+        &self,
+        meta: &StagedWrite,
+        scratch: &Path,
+        path: &Path,
+    ) -> std::result::Result<PathBuf, PreserveWriteError> {
+        use std::io::Write as _;
+
+        let retained = |surviving_path: &Path, error: Error| {
+            let adjacent = Self::scratch_sidecar(surviving_path);
+            let source = Self::scratch_sidecar(scratch);
+            let marker_path = [adjacent, source].into_iter().find(|path| path.is_file());
+            PreserveWriteError {
+                surviving_path: surviving_path.to_path_buf(),
+                marker_path,
+                error,
+            }
+        };
+        // If rename cannot happen, this marker is what lets the next open move
+        // the still-authoritative source into recovery instead of deleting it.
+        let marker_result = self.mark_scratch_durable(scratch, meta);
+        let side = path.with_extension("json");
+        let side_tmp = path.with_extension("json.tmp");
+        let publish_sidecar = || -> Result<()> {
+            let mut side_file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&side_tmp)?;
+            side_file.write_all(&serde_json::to_vec_pretty(meta)?)?;
+            side_file.sync_all()?;
+            drop(side_file);
+            std::fs::rename(&side_tmp, &side)?;
+            std::fs::File::open(&self.staging_dir)?.sync_all()?;
+            Ok(())
+        };
+
+        match std::fs::rename(scratch, path) {
+            Ok(()) => {
+                if let Err(error) = std::fs::File::open(path).and_then(|file| file.sync_all()) {
+                    if std::fs::rename(path, scratch).is_ok() {
+                        if !Self::scratch_sidecar(scratch).is_file() {
+                            let _ = self.mark_scratch_durable(scratch, meta);
+                        }
+                        let _ =
+                            std::fs::File::open(&self.scratch_dir).and_then(|dir| dir.sync_all());
+                        return Err(retained(scratch, error.into()));
+                    }
+                    return Err(retained(path, error.into()));
+                }
+                let scratch_side = Self::scratch_sidecar(scratch);
+                let side_result = if marker_result.is_ok() {
+                    std::fs::rename(&scratch_side, &side)
+                        .map_err(Error::from)
+                        .and_then(|()| {
+                            std::fs::File::open(&self.staging_dir)?
+                                .sync_all()
+                                .map_err(Error::from)
+                        })
+                } else {
+                    publish_sidecar()
+                };
+                if let Err(error) = side_result {
+                    let _ = std::fs::remove_file(&side_tmp);
+                    // Publication did not complete. Put the blob back beside
+                    // the source marker so startup recovery still has a
+                    // reconstructable pair, rather than an unexplained staging
+                    // blob and a marker whose source vanished.
+                    if std::fs::rename(path, scratch).is_ok() {
+                        if !Self::scratch_sidecar(scratch).is_file() {
+                            let _ = self.mark_scratch_durable(scratch, meta);
+                        }
+                        let _ =
+                            std::fs::File::open(&self.scratch_dir).and_then(|dir| dir.sync_all());
+                        return Err(retained(scratch, error));
+                    }
+                    return Err(retained(path, error));
+                }
+                Ok(path.to_path_buf())
+            }
+            Err(rename_error) => {
+                let source_marked =
+                    marker_result.is_ok() || Self::scratch_sidecar(scratch).exists();
+                if let Err(marker_error) = marker_result {
+                    tracing::warn!(
+                        error = %marker_error,
+                        path = %scratch.display(),
+                        "could not mark rescue source durable before copy fallback"
+                    );
+                }
+                if let Err(error) = std::fs::copy(scratch, path) {
+                    if !source_marked {
+                        let recovery = self.recovery_dir.join(
+                            path.file_name()
+                                .unwrap_or_else(|| std::ffi::OsStr::new("denied-write")),
+                        );
+                        if std::fs::rename(scratch, &recovery).is_ok() {
+                            let _ = std::fs::File::open(&self.recovery_dir)
+                                .and_then(|dir| dir.sync_all());
+                            return Err(retained(
+                                &recovery,
+                                Error::Other(format!(
+                                    "rename failed ({rename_error}); copy fallback failed ({error})"
+                                )),
+                            ));
+                        }
+                    }
+                    return Err(retained(
+                        scratch,
+                        Error::Other(format!(
+                            "rename failed ({rename_error}); copy fallback failed ({error})"
+                        )),
+                    ));
+                }
+                if let Err(error) = std::fs::File::open(path).and_then(|file| file.sync_all()) {
+                    let surviving = if source_marked { scratch } else { path };
+                    return Err(retained(surviving, error.into()));
+                }
+                if let Err(error) = publish_sidecar() {
+                    let _ = std::fs::remove_file(&side_tmp);
+                    let surviving = if source_marked { scratch } else { path };
+                    return Err(retained(surviving, error));
+                }
+                // Deliberately last: fallback never removes its marked source
+                // until destination publication is complete.
+                if let Err(error) = std::fs::remove_file(scratch) {
+                    return Err(retained(path, error.into()));
+                }
+                self.clear_scratch_durable(scratch);
+                Ok(path.to_path_buf())
+            }
+        }
     }
 
     /// Drop a staged blob and its sidecar, once its bytes are safely on the
@@ -1904,6 +2086,92 @@ mod tests {
             b"unsent work",
             "staged bytes outlive the daemon that failed to upload them"
         );
+    }
+
+    fn preservation_meta() -> StagedWrite {
+        StagedWrite {
+            uid: uid("preserved").to_string(),
+            len: 14,
+            base_size: 0,
+            base_mtime: 100,
+            authored: vec![(0, 14)],
+            complete: true,
+            based_on: None,
+        }
+    }
+
+    #[test]
+    fn orphan_preservation_publishes_exact_bytes_then_removes_source() {
+        use std::io::Write as _;
+
+        let (c, _dir) = cache();
+        let (mut file, scratch) = c.create_scratch().unwrap();
+        file.write_all(b"accepted bytes").unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+
+        let preserved = c.preserve_write(&preservation_meta(), &scratch).unwrap();
+
+        assert!(!scratch.exists());
+        assert_eq!(std::fs::read(&preserved).unwrap(), b"accepted bytes");
+        let sidecar: StagedWrite =
+            serde_json::from_slice(&std::fs::read(preserved.with_extension("json")).unwrap())
+                .unwrap();
+        let expected = preservation_meta();
+        assert_eq!(sidecar.uid, expected.uid);
+        assert_eq!(sidecar.len, expected.len);
+        assert_eq!(sidecar.authored, expected.authored);
+        assert_eq!(sidecar.complete, expected.complete);
+    }
+
+    #[test]
+    fn orphan_preservation_sidecar_failure_reports_surviving_blob_across_reopen() {
+        use std::io::Write as _;
+
+        let (c, dir) = cache();
+        let (mut file, scratch) = c.create_scratch().unwrap();
+        file.write_all(b"only surviving copy").unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+
+        let destination = c.staging_dir.join("forced-preservation-failure");
+        let side = destination.with_extension("json");
+        std::fs::create_dir(&side).unwrap();
+
+        let error = c
+            .preserve_write_at(&preservation_meta(), &scratch, &destination)
+            .unwrap_err();
+        assert_eq!(error.surviving_path, scratch);
+        assert!(
+            scratch.exists(),
+            "failed sidecar publication must roll the blob back beside its marker"
+        );
+        assert_eq!(
+            std::fs::read(&error.surviving_path).unwrap(),
+            b"only surviving copy"
+        );
+        assert_eq!(
+            error.marker_path,
+            Some(ContentCache::scratch_sidecar(&scratch))
+        );
+        assert!(
+            side.is_dir(),
+            "the induced sidecar failure remains observable"
+        );
+
+        let content = dir.path().join("content");
+        let pins = dir.path().join("pins-reopen.json");
+        drop(c);
+        let reopened =
+            ContentCache::open(content, pins, 0, Arc::new(Db::open_in_memory().unwrap())).unwrap();
+        let recovered = reopened.recovered_writes();
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(
+            std::fs::read(&recovered[0].0).unwrap(),
+            b"only surviving copy"
+        );
+        assert_eq!(recovered[0].1.uid, preservation_meta().uid);
+        drop(reopened);
     }
 
     /// A2: `fsync(2)` promises the bytes survive a crash, but queueing happens

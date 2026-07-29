@@ -170,6 +170,8 @@ impl Core {
                             {
                                 kids.push(ino);
                             }
+                            drop(st);
+                            self.flush_access_changes();
                         }
                         // Uploaded fine but the metadata refresh failed; it will
                         // appear on the next directory enumeration regardless.
@@ -235,6 +237,8 @@ impl Core {
         {
             kids.push(ino);
         }
+        drop(st);
+        self.flush_access_changes();
         Ok((ino, new_uid))
     }
 

@@ -3,6 +3,7 @@
 //! order, so a child never drains before the parent that gives it a real uid.
 
 use rusqlite::{OptionalExtension, params};
+use serde::{Deserialize, Serialize};
 
 use super::Db;
 use crate::Result;
@@ -34,6 +35,16 @@ pub const OP_MKDIR: &str = "mkdir";
 /// folder that was itself created offline — in which case it is rewritten by
 /// that folder's own drain, exactly as for [`OP_CREATE`].
 pub const OP_RENAME: &str = "rename";
+
+/// Drain-time authority retained by a queued rename.
+///
+/// The optimistic local move rewrites the node's persisted ancestry to the
+/// destination immediately. Keeping the original parent here prevents that
+/// rewrite from erasing the shared tree that admitted the move.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RenameMeta {
+    pub original_parent_uid: String,
+}
 
 /// The `kind` of a [`PendingOp`] that trashes a node the server knows about
 /// (offline.md Phase 3b).
@@ -127,6 +138,32 @@ pub struct AttachedBlob {
 }
 
 impl Db {
+    /// Whether a specific desired-state operation is still queued for a node.
+    pub fn has_pending_op(&self, uid: &str, kind: &str) -> Result<bool> {
+        let conn = self.conn.lock();
+        conn.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM pending_op WHERE uid = ?1 AND kind = ?2
+             )",
+            params![uid, kind],
+            |row| row.get(0),
+        )
+        .map_err(Into::into)
+    }
+
+    /// Read an existing operation's metadata before a superseding enqueue.
+    pub fn pending_op_meta(&self, uid: &str, kind: &str) -> Result<Option<String>> {
+        let conn = self.conn.lock();
+        conn.query_row(
+            "SELECT meta_json FROM pending_op WHERE uid = ?1 AND kind = ?2",
+            params![uid, kind],
+            |row| row.get(0),
+        )
+        .optional()
+        .map(|value| value.flatten())
+        .map_err(Into::into)
+    }
+
     pub fn enqueue_op(&self, op: &PendingOp) -> Result<(i64, Option<String>)> {
         let mut conn = self.conn.lock();
         let tx = conn.transaction()?;
@@ -165,6 +202,50 @@ impl Db {
         let id = tx.last_insert_rowid();
         tx.commit()?;
         Ok((id, superseded))
+    }
+
+    /// Atomically replace every queued operation for `uid` and its queued
+    /// descendants with one remote trash intent.
+    ///
+    /// Staged blob paths are returned only after the transaction commits. A
+    /// failed trash insert therefore rolls the deletions back and leaves every
+    /// prior operation owning its bytes.
+    pub fn replace_ops_with_trash(
+        &self,
+        uid: &str,
+        name: &str,
+        created_at: i64,
+    ) -> Result<(i64, Vec<String>)> {
+        const SUBTREE: &str = "
+            WITH RECURSIVE doomed(uid) AS (
+              SELECT ?1
+              UNION
+              SELECT p.uid FROM pending_op p JOIN doomed d ON p.parent_uid = d.uid
+            )";
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
+        let blobs: Vec<String> = {
+            let mut stmt = tx.prepare(&format!(
+                "{SUBTREE}
+                 SELECT blob_path FROM pending_op
+                 WHERE uid IN (SELECT uid FROM doomed) AND blob_path IS NOT NULL"
+            ))?;
+            let rows = stmt.query_map(params![uid], |row| row.get::<_, String>(0))?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        tx.execute(
+            &format!("{SUBTREE} DELETE FROM pending_op WHERE uid IN (SELECT uid FROM doomed)"),
+            params![uid],
+        )?;
+        tx.execute(
+            "INSERT INTO pending_op
+               (kind, uid, parent_uid, name, blob_path, meta_json, created_at, next_attempt_at)
+             VALUES (?1, ?2, NULL, ?3, NULL, NULL, ?4, 0)",
+            params![OP_TRASH, uid, name, created_at],
+        )?;
+        let id = tx.last_insert_rowid();
+        tx.commit()?;
+        Ok((id, blobs))
     }
 
     /// Point a queued create at the bytes that were just written to it, returning
@@ -506,6 +587,25 @@ impl Db {
              SET attempts = attempts + 1, last_error = ?2, next_attempt_at = ?3
              WHERE id = ?1",
             params![id, error, next_attempt_at],
+        )?;
+        Ok(())
+    }
+
+    /// Defer a due operation without recording a failed remote attempt.
+    ///
+    /// Access checks happen before the drain calls Proton, so a locally denied
+    /// operation has not failed remotely and must not consume a retry. Preserve
+    /// the long-lived transient-create sentinel if this is ever called for one.
+    pub fn defer_op_without_attempt(&self, id: i64, next_attempt_at: i64) -> Result<()> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "UPDATE pending_op
+             SET next_attempt_at = CASE
+                 WHEN next_attempt_at >= ?3 THEN next_attempt_at
+                 ELSE ?2
+             END
+             WHERE id = ?1",
+            params![id, next_attempt_at, PARK_UNTIL],
         )?;
         Ok(())
     }

@@ -160,7 +160,10 @@ impl Core {
         self.for_each_state(|st| {
             st.forget_or_unlink(uid);
         });
-        self.discard_queued_ops(uid);
+        if let Err(error) = self.discard_queued_ops(uid) {
+            warn!(%uid, ?error, "conflict sweep: queued-op cleanup failed");
+            return;
+        }
         self.cache.evict(uid);
         self.evict_reader(uid);
         if let Err(e) = self.db.delete_node(uid) {
@@ -346,6 +349,7 @@ mod tests {
             is_shared: false,
             is_shared_publicly: false,
             signature_email: None,
+            membership: None,
             verification: Default::default(),
         }
     }

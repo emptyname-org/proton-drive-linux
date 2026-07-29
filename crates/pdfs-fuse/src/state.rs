@@ -2,15 +2,16 @@
 //! the open write handles, and the interval set that tracks which bytes of a
 //! staged write are authored locally.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::File;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use pdfs_core::cache::StagedWrite;
 use pdfs_core::db::Db;
+use pdfs_core::{Access, access_for};
 use proton_drive_rs::proton_sdk::ids::NodeUid;
-use proton_drive_rs::{Node, NodeKind};
+use proton_drive_rs::{MemberRole, Node, NodeKind};
 use tracing::warn;
 
 /// A node known to the filesystem, addressed by its kernel inode.
@@ -18,9 +19,16 @@ pub(crate) struct Entry {
     pub(crate) uid: NodeUid,
     pub(crate) parent: u64,
     pub(crate) node: Node,
+    pub(crate) access: Access,
     pub(crate) lookup_count: u64,
     pub(crate) open_count: u32,
     pub(crate) unlinked: bool,
+}
+
+impl Entry {
+    pub(crate) fn writable(&self) -> bool {
+        self.access.writable()
+    }
 }
 
 /// A set of non-overlapping `[start, end)` byte ranges, kept sorted and merged.
@@ -148,6 +156,14 @@ pub(crate) struct State {
     /// have no entry here.
     pub(crate) handles: HashMap<u64, u64>,
     pub(crate) next_fh: u64,
+    /// Resident inode attributes whose effective access changed during an
+    /// intern/root refresh. Core drains this set and notifies the matching
+    /// kernel only after releasing the State lock.
+    pub(crate) access_changes: HashSet<u64>,
+    /// Persisted shared-root authority, loaded once per inode space and updated
+    /// on every explicit role/tombstone change. Descendant inheritance reads
+    /// this map instead of issuing one SQLite query per interned inode.
+    pub(crate) share_access: HashMap<NodeUid, Access>,
     /// Unified SQLite metadata cache. Every map mutation below writes through to
     /// it inside the `State` lock so the DB stays the authoritative copy across
     /// restarts (see plan.md P1).
@@ -155,6 +171,306 @@ pub(crate) struct State {
 }
 
 impl State {
+    pub(crate) fn require_writable(&self, ino: u64) -> Result<(), fuser::Errno> {
+        match self.entries.get(&ino) {
+            Some(entry) if entry.writable() => Ok(()),
+            Some(_) => Err(fuser::Errno::EACCES),
+            None => Err(fuser::Errno::ENOENT),
+        }
+    }
+
+    pub(crate) fn access_by_uid(&self, uid: &NodeUid) -> Option<Access> {
+        self.by_uid
+            .get(uid)
+            .and_then(|ino| self.entries.get(ino))
+            .map(|entry| entry.access)
+    }
+
+    pub(crate) fn take_access_changes(&mut self) -> Vec<u64> {
+        self.access_changes.drain().collect()
+    }
+
+    fn stored_share_access(&self, uid: &NodeUid) -> Option<Access> {
+        self.share_access.get(uid).copied()
+    }
+
+    pub(crate) fn access_for_node(&mut self, parent: u64, node: &Node) -> Access {
+        let parent_access = self
+            .entries
+            .get(&parent)
+            .map_or(Access::Owner, |entry| entry.access);
+        let stored = self.stored_share_access(&node.uid);
+
+        // A persisted row is the offline authority. A live membership on a
+        // node directly below an owned root identifies a newly discovered
+        // share root and refreshes that row. Descendants inherit directly.
+        let is_new_share_root = node.membership.is_some() && parent_access == Access::Owner;
+        if stored.is_some() || is_new_share_root {
+            let access = node.membership.as_ref().map_or_else(
+                || stored.unwrap_or(Access::Viewer),
+                |membership| access_for(membership.role_exact(), parent_access, true),
+            );
+            if let Err(error) = self.db.set_share_access(&node.uid, access) {
+                warn!(uid = %node.uid, ?access, %error, "db set_share_access failed");
+            } else {
+                self.share_access.insert(node.uid.clone(), access);
+            }
+            return access;
+        }
+        parent_access
+    }
+
+    /// Record a role observed by an authority-bearing shared-root surface.
+    ///
+    /// Ordinary node enumeration, especially `enumerate_nodes_light` and old
+    /// cached JSON, may omit membership and must continue to trust persisted
+    /// `share_access`. P3 can call this method only when its share-root endpoint
+    /// explicitly observed a role; explicit absence or an unknown wire role is
+    /// represented by `None` and fails closed to Viewer.
+    #[allow(dead_code)] // P3 consumes this explicit-provenance hook.
+    pub(crate) fn record_observed_share_root_role(
+        &mut self,
+        uid: &NodeUid,
+        role: Option<MemberRole>,
+    ) -> Vec<u64> {
+        let (root, parent_access) = match self.by_uid.get(uid).copied() {
+            Some(root) => {
+                let parent_access = self
+                    .entries
+                    .get(&root)
+                    .and_then(|entry| self.entries.get(&entry.parent))
+                    .map_or(Access::Owner, |entry| entry.access);
+                (Some(root), parent_access)
+            }
+            None => (None, Access::Unknown),
+        };
+        let access = access_for(role, parent_access, true);
+        if let Err(error) = self.db.set_share_access(uid, access) {
+            warn!(%uid, ?access, %error, "db set observed share access failed");
+        } else {
+            self.share_access.insert(uid.clone(), access);
+        }
+        let Some(root) = root else {
+            return Vec::new();
+        };
+
+        let mut changed = Vec::new();
+        if let Some(entry) = self.entries.get_mut(&root)
+            && entry.access != access
+        {
+            entry.access = access;
+            changed.push(root);
+        }
+        changed.extend(self.recompute_descendant_access(root));
+        self.access_changes.extend(changed.iter().copied());
+        changed
+    }
+
+    fn resident_children(&self) -> HashMap<u64, Vec<u64>> {
+        let mut children: HashMap<u64, Vec<u64>> = HashMap::new();
+        for (&ino, entry) in &self.entries {
+            if entry.parent != ino {
+                children.entry(entry.parent).or_default().push(ino);
+            }
+        }
+        children
+    }
+
+    /// Recompute all resident descendants after a root's effective access
+    /// changes. A nested persisted share root remains its own authority.
+    fn recompute_descendant_access(&mut self, root: u64) -> Vec<u64> {
+        let mut changed = Vec::new();
+        let mut queue = VecDeque::from([root]);
+        let mut seen = HashSet::new();
+        let children = self.resident_children();
+        while let Some(parent) = queue.pop_front() {
+            if !seen.insert(parent) {
+                continue;
+            }
+            let parent_access = match self.entries.get(&parent) {
+                Some(entry) => entry.access,
+                None => continue,
+            };
+            for &child in children.get(&parent).into_iter().flatten() {
+                let access = self
+                    .entries
+                    .get(&child)
+                    .and_then(|entry| self.share_access.get(&entry.uid).copied())
+                    .unwrap_or(parent_access);
+                if let Some(entry) = self.entries.get_mut(&child)
+                    && entry.access != access
+                {
+                    entry.access = access;
+                    changed.push(child);
+                }
+                queue.push_back(child);
+            }
+        }
+        changed
+    }
+
+    /// Force a known shared root and every resident descendant read-only.
+    ///
+    /// This intentionally ignores nested authorities: losing access to an
+    /// outer tree must not leave a cached inner entry writable.
+    pub(crate) fn downgrade_shared_subtree(&mut self, uid: &NodeUid) -> Vec<u64> {
+        self.share_access.insert(uid.clone(), Access::Viewer);
+        let Some(&root) = self.by_uid.get(uid) else {
+            return Vec::new();
+        };
+        let mut changed = Vec::new();
+        let mut queue = VecDeque::from([root]);
+        let mut seen = HashSet::new();
+        let children = self.resident_children();
+        while let Some(ino) = queue.pop_front() {
+            if !seen.insert(ino) {
+                continue;
+            }
+            if let Some(entry) = self.entries.get_mut(&ino)
+                && entry.access != Access::Viewer
+            {
+                entry.access = Access::Viewer;
+                changed.push(ino);
+            }
+            queue.extend(children.get(&ino).into_iter().flatten().copied());
+        }
+        changed
+    }
+
+    /// Downgrade resident shared subtrees identified by persisted authority,
+    /// live membership, or already-inherited non-owner access. Owned and device
+    /// entries remain `Owner`.
+    pub(crate) fn downgrade_known_shared_access(&mut self) -> Vec<u64> {
+        for access in self.share_access.values_mut() {
+            *access = Access::Viewer;
+        }
+        let roots: Vec<u64> = self
+            .entries
+            .iter()
+            .filter(|entry| {
+                let (_, entry) = entry;
+                entry.access != Access::Owner
+                    || entry.node.membership.is_some()
+                    || self.share_access.contains_key(&entry.uid)
+            })
+            .map(|(&ino, _)| ino)
+            .collect();
+        let children = self.resident_children();
+        let mut queue = VecDeque::from(roots);
+        let mut seen = HashSet::new();
+        let mut changed = Vec::new();
+        while let Some(ino) = queue.pop_front() {
+            if !seen.insert(ino) {
+                continue;
+            }
+            if let Some(entry) = self.entries.get_mut(&ino)
+                && entry.access != Access::Viewer
+            {
+                entry.access = Access::Viewer;
+                changed.push(ino);
+            }
+            queue.extend(children.get(&ino).into_iter().flatten().copied());
+        }
+        changed
+    }
+
+    /// Rebuild effective access after cold hydration. The memo makes each
+    /// parent edge resolve once, then every child is a direct inheritance.
+    pub(crate) fn hydrate_access(&mut self) {
+        fn resolve(
+            state: &State,
+            ino: u64,
+            memo: &mut HashMap<u64, Access>,
+            visiting: &mut HashSet<u64>,
+        ) -> Access {
+            if let Some(access) = memo.get(&ino) {
+                return *access;
+            }
+            let Some(entry) = state.entries.get(&ino) else {
+                return Access::Unknown;
+            };
+            if !visiting.insert(ino) {
+                return Access::Unknown;
+            }
+            let stored = state.share_access.get(&entry.uid).copied();
+            let access = if let Some(stored) = stored {
+                stored
+            } else if entry.parent == ino {
+                Access::Owner
+            } else if !state.entries.contains_key(&entry.parent) {
+                entry
+                    .node
+                    .parent_uid
+                    .as_ref()
+                    .and_then(|parent_uid| state.share_access.get(parent_uid).copied())
+                    .unwrap_or(Access::Unknown)
+            } else {
+                let parent_access = resolve(state, entry.parent, memo, visiting);
+                if entry.node.membership.is_none() || parent_access != Access::Owner {
+                    parent_access
+                } else {
+                    access_for(
+                        entry
+                            .node
+                            .membership
+                            .as_ref()
+                            .and_then(|membership| membership.role_exact()),
+                        parent_access,
+                        true,
+                    )
+                }
+            };
+            visiting.remove(&ino);
+            memo.insert(ino, access);
+            access
+        }
+
+        let mut memo = HashMap::new();
+        let mut visiting = HashSet::new();
+        for ino in self.entries.keys().copied().collect::<Vec<_>>() {
+            resolve(self, ino, &mut memo, &mut visiting);
+        }
+        for (ino, access) in memo {
+            if let Some(entry) = self.entries.get_mut(&ino) {
+                entry.access = access;
+            }
+        }
+        let discovered: Vec<(NodeUid, Access)> = self
+            .entries
+            .values()
+            .filter_map(|entry| {
+                let parent_access = self
+                    .entries
+                    .get(&entry.parent)
+                    .map_or(Access::Unknown, |parent| parent.access);
+                (entry.node.membership.is_some()
+                    && parent_access == Access::Owner
+                    && !self.share_access.contains_key(&entry.uid))
+                .then(|| {
+                    (
+                        entry.uid.clone(),
+                        access_for(
+                            entry
+                                .node
+                                .membership
+                                .as_ref()
+                                .and_then(|membership| membership.role_exact()),
+                            parent_access,
+                            true,
+                        ),
+                    )
+                })
+            })
+            .collect();
+        for (uid, access) in discovered {
+            if let Err(error) = self.db.set_share_access(&uid, access) {
+                warn!(%uid, ?access, %error, "db set hydrated share access failed");
+            } else {
+                self.share_access.insert(uid, access);
+            }
+        }
+    }
+
     pub(crate) fn intern(&mut self, parent: u64, node: Node) -> u64 {
         if let Err(e) = self.db.upsert_node(&node) {
             warn!(uid = %node.uid, error = %e, "db upsert_node failed");
@@ -167,12 +483,24 @@ impl State {
     /// the split exists so a batch can pay for one transaction instead of `n`.
     pub(crate) fn intern_mem(&mut self, parent: u64, node: Node) -> u64 {
         if let Some(&ino) = self.by_uid.get(&node.uid) {
+            let access = self.access_for_node(parent, &node);
+            let changed = self
+                .entries
+                .get(&ino)
+                .is_some_and(|entry| entry.access != access);
             if let Some(e) = self.entries.get_mut(&ino) {
                 e.node = node;
                 e.parent = parent;
+                e.access = access;
+            }
+            if changed {
+                self.access_changes.insert(ino);
+                let descendants = self.recompute_descendant_access(ino);
+                self.access_changes.extend(descendants);
             }
             return ino;
         }
+        let access = self.access_for_node(parent, &node);
         let ino = self.next_ino;
         self.next_ino += 1;
         self.by_uid.insert(node.uid.clone(), ino);
@@ -182,6 +510,7 @@ impl State {
                 uid: node.uid.clone(),
                 parent,
                 node,
+                access,
                 lookup_count: 1,
                 open_count: 0,
                 unlinked: false,
@@ -276,15 +605,40 @@ impl State {
         self.forget(uid)
     }
 
+    /// Remove a dentry while retaining both open inode state and the persisted
+    /// node row. Queued trash needs the row as drain-time authority; if the node
+    /// is open, POSIX also requires its inode to survive until the final close.
+    pub(crate) fn unlink_mem(&mut self, uid: &NodeUid) -> Option<(u64, String)> {
+        if let Some(&ino) = self.by_uid.get(uid)
+            && let Some(entry) = self.entries.get_mut(&ino)
+            && entry.open_count > 0
+        {
+            entry.unlinked = true;
+            if let Some(kids) = self.children.get_mut(&entry.parent) {
+                kids.retain(|&kid| kid != ino);
+            }
+            return Some((entry.parent, entry.node.name.clone()));
+        }
+        self.forget_mem(uid)
+    }
+
     /// Forget a node entirely: drop its inode, its uid mapping, its own cached
     /// listing, its slot in its parent's listing, and its DB row. Returns
     /// `(parent_ino, name)` when the node was known, so the caller can notify
     /// the kernel.
     pub(crate) fn forget(&mut self, uid: &NodeUid) -> Option<(u64, String)> {
-        let ino = self.by_uid.remove(uid)?;
         if let Err(e) = self.db.delete_node(uid) {
             warn!(%uid, error = %e, "db delete_node failed");
         }
+        self.forget_mem(uid)
+    }
+
+    /// Forget a resident node while retaining its persisted row.
+    ///
+    /// A queued trash uses the row as its drain-time access authority and only
+    /// deletes it after the remote mutation lands.
+    pub(crate) fn forget_mem(&mut self, uid: &NodeUid) -> Option<(u64, String)> {
+        let ino = self.by_uid.remove(uid)?;
         let entry = self.entries.remove(&ino)?;
         self.children.remove(&ino);
         if let Some(kids) = self.children.get_mut(&entry.parent) {
@@ -308,11 +662,21 @@ impl State {
         new_parent_uid: &NodeUid,
         name: &str,
     ) {
+        let parent_access = self
+            .entries
+            .get(&new_parent)
+            .map_or(Access::Owner, |entry| entry.access);
+        let access = self
+            .entries
+            .get(&ino)
+            .and_then(|entry| self.share_access.get(&entry.uid).copied())
+            .unwrap_or(parent_access);
         let Some(entry) = self.entries.get_mut(&ino) else {
             return;
         };
         let old_parent = entry.parent;
         entry.parent = new_parent;
+        entry.access = access;
         entry.node.name = name.to_string();
         entry.node.parent_uid = Some(new_parent_uid.clone());
         let node = entry.node.clone();
@@ -331,6 +695,7 @@ impl State {
         if let Err(e) = self.db.upsert_node(&node) {
             warn!(uid = %node.uid, error = %e, "db upsert_node failed for a queued rename");
         }
+        self.recompute_descendant_access(ino);
     }
 
     /// Drop a directory's cached child listing and mark it unlisted in the DB,
@@ -427,7 +792,8 @@ impl State {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use proton_drive_rs::proton_sdk::ids::{LinkId, VolumeId};
+    use proton_drive_rs::ShareMembership;
+    use proton_drive_rs::proton_sdk::ids::{LinkId, ShareId, ShareMembershipId, VolumeId};
 
     fn uid(link: &str) -> NodeUid {
         NodeUid::new(VolumeId::from("vol"), LinkId::from(link))
@@ -457,7 +823,16 @@ mod tests {
             is_shared: false,
             is_shared_publicly: false,
             signature_email: None,
+            membership: None,
             verification: Default::default(),
+        }
+    }
+
+    fn membership(permissions: i32) -> ShareMembership {
+        ShareMembership {
+            share_id: ShareId::from("share"),
+            membership_id: ShareMembershipId::from("membership"),
+            permissions,
         }
     }
 
@@ -488,6 +863,7 @@ mod tests {
     fn state() -> (State, TempDir) {
         let dir = TempDir::new();
         let db = Db::open(&dir.0.join("cache.db")).unwrap();
+        let share_access = db.all_share_access().unwrap();
         let st = State {
             entries: HashMap::new(),
             by_uid: HashMap::new(),
@@ -496,6 +872,8 @@ mod tests {
             active_writes: HashMap::new(),
             handles: HashMap::new(),
             next_fh: 1,
+            access_changes: HashSet::new(),
+            share_access,
             db: Arc::new(db),
         };
         (st, dir)
@@ -623,5 +1001,311 @@ mod tests {
         );
         st.children.remove(&folder);
         assert!(st.has_children(folder), "has child in db");
+    }
+
+    #[test]
+    fn share_root_access_is_persisted_and_children_inherit_in_constant_time() {
+        let (mut st, _dir) = state();
+        let owned_root = st.intern(0, node("root", "none", "My Files", true));
+        let mut shared = node("shared", "root", "Shared", true);
+        shared.membership = Some(membership(6));
+        let shared_ino = st.intern(owned_root, shared);
+        let child = st.intern(
+            shared_ino,
+            node("shared-child", "shared", "child.txt", false),
+        );
+
+        assert_eq!(st.entries[&shared_ino].access, Access::Editor);
+        assert_eq!(st.entries[&child].access, Access::Editor);
+        assert_eq!(
+            st.db.share_access(&uid("shared")).unwrap(),
+            Some(Access::Editor)
+        );
+    }
+
+    #[test]
+    fn persisted_share_access_controls_offline_hydration() {
+        let (mut st, _dir) = state();
+        let root_node = node("root", "none", "My Files", true);
+        let shared_node = node("offline-share", "root", "Offline share", true);
+        let child_node = node("offline-child", "offline-share", "nested folder", true);
+        let leaf_node = node("offline-leaf", "offline-child", "child.txt", false);
+        for node in [&root_node, &shared_node, &child_node, &leaf_node] {
+            st.db.upsert_node(node).unwrap();
+        }
+        st.db
+            .set_share_access(&uid("offline-share"), Access::Viewer)
+            .unwrap();
+        st.share_access = st.db.all_share_access().unwrap();
+
+        // Reconstruct in deliberately non-topological order, matching the
+        // database hydration path that first allocates every inode and only
+        // then materializes entries.
+        let owned_root = 1;
+        let shared = 2;
+        let child = 3;
+        let leaf = 4;
+        for (node, ino) in [
+            (&root_node, owned_root),
+            (&shared_node, shared),
+            (&child_node, child),
+            (&leaf_node, leaf),
+        ] {
+            st.by_uid.insert(node.uid.clone(), ino);
+        }
+        for (ino, parent, node) in [
+            (leaf, child, leaf_node),
+            (child, shared, child_node),
+            (shared, owned_root, shared_node),
+            (owned_root, owned_root, root_node),
+        ] {
+            st.entries.insert(
+                ino,
+                Entry {
+                    uid: node.uid.clone(),
+                    parent,
+                    node,
+                    access: Access::Unknown,
+                    lookup_count: 1,
+                    open_count: 0,
+                    unlinked: false,
+                },
+            );
+        }
+        st.next_ino = 5;
+        st.hydrate_access();
+
+        assert_eq!(st.entries[&owned_root].access, Access::Owner);
+        assert_eq!(st.entries[&shared].access, Access::Viewer);
+        assert_eq!(st.entries[&child].access, Access::Viewer);
+        assert_eq!(st.entries[&leaf].access, Access::Viewer);
+        assert_eq!(
+            st.require_writable(shared).unwrap_err().code(),
+            libc::EACCES
+        );
+        assert_eq!(st.require_writable(child).unwrap_err().code(), libc::EACCES);
+        assert_eq!(st.require_writable(leaf).unwrap_err().code(), libc::EACCES);
+        assert!(st.require_writable(owned_root).is_ok());
+    }
+
+    #[test]
+    fn reinterned_share_root_propagates_a_viewer_downgrade() {
+        let (mut st, _dir) = state();
+        let owned_root = st.intern(0, node("root", "none", "My Files", true));
+        let mut shared_node = node("shared", "root", "Shared", true);
+        shared_node.membership = Some(membership(6));
+        let shared = st.intern(owned_root, shared_node.clone());
+        let child = st.intern(shared, node("child", "shared", "folder", true));
+        let leaf = st.intern(child, node("leaf", "child", "leaf.txt", false));
+        assert_eq!(st.entries[&leaf].access, Access::Editor);
+
+        shared_node.membership = Some(membership(4));
+        assert_eq!(st.intern(owned_root, shared_node), shared);
+
+        for ino in [shared, child, leaf] {
+            assert_eq!(st.entries[&ino].access, Access::Viewer);
+            assert_eq!(st.require_writable(ino).unwrap_err().code(), libc::EACCES);
+        }
+        assert_eq!(
+            st.db.share_access(&uid("shared")).unwrap(),
+            Some(Access::Viewer)
+        );
+    }
+
+    #[test]
+    fn missing_light_membership_keeps_persisted_share_authority() {
+        for persisted in [Access::Viewer, Access::Editor] {
+            let (mut st, _dir) = state();
+            let owned_root = st.intern(0, node("root", "none", "My Files", true));
+            st.db.set_share_access(&uid("shared"), persisted).unwrap();
+            st.share_access = st.db.all_share_access().unwrap();
+            let shared = st.intern(
+                owned_root,
+                node("shared", "root", "Shared without membership", true),
+            );
+            let child = st.intern(
+                shared,
+                node("child", "shared", "Light child without membership", false),
+            );
+
+            assert_eq!(st.entries[&shared].access, persisted);
+            assert_eq!(st.entries[&child].access, persisted);
+            assert_eq!(st.db.share_access(&uid("shared")).unwrap(), Some(persisted));
+        }
+    }
+
+    #[test]
+    fn explicit_missing_share_role_fails_closed_and_marks_kernel_attrs() {
+        let (mut st, _dir) = state();
+        let owned_root = st.intern(0, node("root", "none", "My Files", true));
+        st.db
+            .set_share_access(&uid("shared"), Access::Editor)
+            .unwrap();
+        let shared = st.intern(owned_root, node("shared", "root", "Shared", true));
+        let child = st.intern(shared, node("child", "shared", "child.txt", false));
+        st.take_access_changes();
+
+        let changed = st.record_observed_share_root_role(&uid("shared"), None);
+
+        assert_eq!(st.entries[&shared].access, Access::Viewer);
+        assert_eq!(st.entries[&child].access, Access::Viewer);
+        assert_eq!(
+            st.db.share_access(&uid("shared")).unwrap(),
+            Some(Access::Viewer)
+        );
+        assert!(changed.contains(&shared));
+        assert!(changed.contains(&child));
+        let pending = st.take_access_changes();
+        assert!(pending.contains(&shared));
+        assert!(pending.contains(&child));
+    }
+
+    #[test]
+    fn restored_editor_access_marks_root_and_descendants_for_invalidation() {
+        let (mut st, _dir) = state();
+        let owned_root = st.intern(0, node("root", "none", "My Files", true));
+        let mut shared_node = node("shared", "root", "Shared", true);
+        shared_node.membership = Some(membership(4));
+        let shared = st.intern(owned_root, shared_node.clone());
+        let child = st.intern(shared, node("child", "shared", "child.txt", false));
+        st.take_access_changes();
+
+        shared_node.membership = Some(membership(6));
+        assert_eq!(st.intern(owned_root, shared_node), shared);
+
+        assert_eq!(st.entries[&shared].access, Access::Editor);
+        assert_eq!(st.entries[&child].access, Access::Editor);
+        let changed = st.take_access_changes();
+        assert!(changed.contains(&shared));
+        assert!(changed.contains(&child));
+    }
+
+    #[test]
+    fn revoked_root_tombstone_keeps_resident_and_persisted_descendants_read_only() {
+        let (mut st, _dir) = state();
+        let owned_root = st.intern(0, node("root", "none", "My Files", true));
+        let mut shared_node = node("shared", "root", "Shared", true);
+        shared_node.membership = Some(membership(6));
+        let shared = st.intern(owned_root, shared_node);
+        let child = st.intern(shared, node("child", "shared", "folder", true));
+        let leaf = st.intern(child, node("leaf", "child", "leaf.txt", false));
+
+        st.db
+            .set_share_access(&uid("shared"), Access::Viewer)
+            .unwrap();
+        let changed = st.downgrade_shared_subtree(&uid("shared"));
+        assert!(changed.contains(&shared));
+        assert!(changed.contains(&child));
+        assert!(changed.contains(&leaf));
+        st.forget(&uid("shared"));
+
+        assert!(!st.entries.contains_key(&shared));
+        assert_eq!(st.entries[&child].access, Access::Viewer);
+        assert_eq!(st.entries[&leaf].access, Access::Viewer);
+        assert_eq!(st.require_writable(leaf).unwrap_err().code(), libc::EACCES);
+        assert_eq!(
+            st.db.effective_node_access(&uid("leaf")).unwrap(),
+            Some(Access::Viewer)
+        );
+
+        // Restart-shaped reconstruction: the deleted root is absent from the
+        // inode map, so its direct child is attached to the orphan inode. Cold
+        // hydration must still follow the persisted parent UID to the retained
+        // share_access tombstone.
+        let child_node = st.entries[&child].node.clone();
+        let leaf_node = st.entries[&leaf].node.clone();
+        st.entries.clear();
+        st.by_uid.clear();
+        st.children.clear();
+        st.by_uid.insert(child_node.uid.clone(), child);
+        st.by_uid.insert(leaf_node.uid.clone(), leaf);
+        st.entries.insert(
+            leaf,
+            Entry {
+                uid: leaf_node.uid.clone(),
+                parent: child,
+                node: leaf_node,
+                access: Access::Unknown,
+                lookup_count: 1,
+                open_count: 0,
+                unlinked: false,
+            },
+        );
+        st.entries.insert(
+            child,
+            Entry {
+                uid: child_node.uid.clone(),
+                parent: 0,
+                node: child_node,
+                access: Access::Unknown,
+                lookup_count: 1,
+                open_count: 0,
+                unlinked: false,
+            },
+        );
+        st.hydrate_access();
+
+        assert_eq!(st.entries[&child].access, Access::Viewer);
+        assert_eq!(st.entries[&leaf].access, Access::Viewer);
+        assert_eq!(st.require_writable(leaf).unwrap_err().code(), libc::EACCES);
+    }
+
+    #[test]
+    fn global_access_loss_downgrades_only_recorded_shared_subtrees() {
+        let (mut st, _dir) = state();
+        let owned_root = st.intern(0, node("root", "none", "My Files", true));
+        let owned_child = st.intern(owned_root, node("owned", "root", "Owned", true));
+        let mut shared_node = node("shared", "root", "Shared", true);
+        shared_node.membership = Some(membership(6));
+        let shared = st.intern(owned_root, shared_node);
+        let shared_child = st.intern(shared, node("child", "shared", "child.txt", false));
+
+        st.db.downgrade_all_share_access().unwrap();
+        let changed = st.downgrade_known_shared_access();
+
+        assert!(changed.contains(&shared));
+        assert!(changed.contains(&shared_child));
+        assert_eq!(st.entries[&shared].access, Access::Viewer);
+        assert_eq!(st.entries[&shared_child].access, Access::Viewer);
+        assert_eq!(st.entries[&owned_root].access, Access::Owner);
+        assert_eq!(st.entries[&owned_child].access, Access::Owner);
+    }
+
+    #[test]
+    fn global_access_loss_visits_a_deep_shared_tree_once_per_changed_inode() {
+        let (mut st, _dir) = state();
+        let owned_root = st.intern(0, node("root", "none", "My Files", true));
+        let mut shared_node = node("shared", "root", "Shared", true);
+        shared_node.membership = Some(membership(6));
+        let shared = st.intern(owned_root, shared_node);
+        let mut parent = shared;
+        for index in 0..1_024 {
+            let link = format!("deep-{index}");
+            let parent_link = st.entries[&parent].uid.link_id.to_string();
+            parent = st.intern(parent, node(&link, &parent_link, &link, true));
+        }
+        st.db.downgrade_all_share_access().unwrap();
+
+        let changed = st.downgrade_known_shared_access();
+
+        let unique: HashSet<u64> = changed.iter().copied().collect();
+        assert_eq!(changed.len(), 1_025);
+        assert_eq!(unique.len(), changed.len());
+        assert_eq!(st.entries[&owned_root].access, Access::Owner);
+        assert!(
+            st.entries
+                .values()
+                .all(|entry| { entry.uid == uid("root") || entry.access == Access::Viewer })
+        );
+    }
+
+    #[test]
+    fn unknown_membership_permissions_fail_closed() {
+        let (mut st, _dir) = state();
+        let owned_root = st.intern(0, node("root", "none", "My Files", true));
+        let mut shared = node("shared", "root", "Shared", true);
+        shared.membership = Some(membership(38));
+        let shared = st.intern(owned_root, shared);
+        assert_eq!(st.entries[&shared].access, Access::Viewer);
     }
 }

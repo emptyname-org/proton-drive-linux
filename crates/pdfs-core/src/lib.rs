@@ -2,6 +2,7 @@
 //! identity, XDG paths, and the login/session/keyring layer that every
 //! front-end (CLI today, daemon + GUI later) shares.
 
+pub mod access;
 pub mod auth;
 pub mod cache;
 pub mod config;
@@ -15,6 +16,7 @@ pub mod service;
 pub mod shell;
 pub mod syncignore;
 
+pub use access::{Access, access_for, perm_bits};
 pub use error::{CoreError, CoreResult, Error, Result};
 
 // Re-export the SDK surface downstream crates need, so they depend on

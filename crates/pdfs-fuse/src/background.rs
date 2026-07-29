@@ -27,6 +27,40 @@ fn forget_and_notify(st: &mut State, notifier: Option<&Notifier>, uid: &NodeUid)
     true
 }
 
+fn invalidate_access_changes(notifier: Option<&Notifier>, changed: &[u64]) {
+    let Some(notifier) = notifier else {
+        return;
+    };
+    for &ino in changed {
+        let _ = notifier.inval_inode(INodeNo(ino), 0, 0);
+    }
+}
+
+/// Persist the fail-closed part of an access event and install the same denial
+/// in resident state even when SQLite rejects the write. The caller must not
+/// acknowledge the event when this returns an error.
+fn apply_access_downgrade(
+    db: &Db,
+    event: &DriveEvent,
+    mut deny: impl FnMut(Option<&NodeUid>),
+) -> pdfs_core::Result<()> {
+    match event {
+        DriveEvent::NodeDeleted { node_uid, .. } => {
+            let result = db.set_share_access(node_uid, Access::Viewer);
+            deny(Some(node_uid));
+            result
+        }
+        DriveEvent::ContinuityLost { .. }
+        | DriveEvent::ScopeAccessLost { .. }
+        | DriveEvent::SharedWithMeUpdated { .. } => {
+            let result = db.downgrade_all_share_access().map(|_| ());
+            deny(None);
+            result
+        }
+        _ => Ok(()),
+    }
+}
+
 /// Apply one remote event to the local cache and notify the kernel so it drops
 /// any stale cached metadata/data for the affected inodes.
 ///
@@ -43,7 +77,16 @@ fn forget_and_notify(st: &mut State, notifier: Option<&Notifier>, uid: &NodeUid)
 /// read-side twin of `docs/BUGS.md` B74. Inode numbers are per-mount, so each
 /// mount must be notified through its **own** channel; that pairing is what
 /// [`Core::for_each_mount`] exists to preserve.
-fn apply_event(core: &Core, event: &DriveEvent, dirty: &mut DirtyParents) {
+fn apply_event(core: &Core, event: &DriveEvent, dirty: &mut DirtyParents) -> pdfs_core::Result<()> {
+    let access_result = apply_access_downgrade(&core.db, event, |root| {
+        core.for_each_mount(|st, notifier| {
+            let changed = match root {
+                Some(uid) => st.downgrade_shared_subtree(uid),
+                None => st.downgrade_known_shared_access(),
+            };
+            invalidate_access_changes(notifier, &changed);
+        });
+    });
     match event {
         DriveEvent::NodeUpdated {
             node_uid,
@@ -109,11 +152,14 @@ fn apply_event(core: &Core, event: &DriveEvent, dirty: &mut DirtyParents) {
                 forget_and_notify(st, notifier, node_uid);
             });
         }
-        // Continuity or scope was lost: our cached listings may be arbitrarily
-        // stale, so drop every listing and tell the kernel to forget all
-        // metadata. Inodes stay stable; dirs simply re-enumerate on next access.
-        DriveEvent::ContinuityLost { .. } | DriveEvent::ScopeAccessLost { .. } => {
-            warn!("event continuity lost; dropping all cached listings, resyncing lazily");
+        // Losing event continuity or any shared-access signal makes persisted
+        // shared roots untrustworthy. Keep owned/device trees unchanged, but
+        // fail every known shared subtree closed until a root refresh carries a
+        // current membership role.
+        DriveEvent::ContinuityLost { .. }
+        | DriveEvent::ScopeAccessLost { .. }
+        | DriveEvent::SharedWithMeUpdated { .. } => {
+            warn!("event access continuity lost; downgrading shared trees and resyncing lazily");
             core.for_each_mount(|st, notifier| {
                 let dirs: Vec<u64> = st.children.keys().copied().collect();
                 for &ino in &dirs {
@@ -126,8 +172,20 @@ fn apply_event(core: &Core, event: &DriveEvent, dirty: &mut DirtyParents) {
         }
         // No substantive local change; the cursor advance is handled by the
         // caller persisting the event id.
-        DriveEvent::CursorAdvanced { .. } | DriveEvent::SharedWithMeUpdated { .. } => {}
+        DriveEvent::CursorAdvanced { .. } => {}
     }
+    access_result
+}
+
+fn acknowledge_applied_event(
+    db: &Db,
+    event: &DriveEvent,
+    applied: pdfs_core::Result<()>,
+) -> pdfs_core::Result<DriveEventId> {
+    applied?;
+    let id = event.id().clone();
+    db.set_event_cursor(id.as_str())?;
+    Ok(id)
 }
 
 /// The folders one batch of events changed, collected so the listings are
@@ -296,12 +354,17 @@ pub(super) async fn run_event_sync(
                 warn!(error = %e, "sdk cache invalidation for event failed; retaining cursor for retry");
                 break;
             }
-            apply_event(&core, event, &mut dirty);
-            let applied = event.id().clone();
-            if let Err(e) = db.set_event_cursor(applied.as_str()) {
-                warn!(error = %e, "persist event cursor failed; retaining prior cursor for retry");
-                break;
-            }
+            let applied = match acknowledge_applied_event(
+                &db,
+                event,
+                apply_event(&core, event, &mut dirty),
+            ) {
+                Ok(applied) => applied,
+                Err(e) => {
+                    warn!(error = %e, "event application or acknowledgment failed; retaining prior cursor for retry");
+                    break;
+                }
+            };
             // Advance only after this exact event is durably acknowledged. If a
             // later event fails, polling resumes from here and replays nothing
             // that was not already made visible locally.
@@ -395,4 +458,109 @@ fn scan_local_once(
         Err(e) => warn!(error = %e, "local index: finish failed"),
     }
     indexing.store(false, Ordering::Relaxed);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::Cell;
+
+    fn uid(link: &str) -> NodeUid {
+        NodeUid::new(VolumeId::from("vol"), LinkId::from(link))
+    }
+
+    #[test]
+    fn deleted_share_downgrade_failure_denies_memory_and_retains_cursor() {
+        let db = Db::open(std::path::Path::new(":memory:")).unwrap();
+        let root = uid("shared");
+        db.set_share_access(&root, Access::Editor).unwrap();
+        db.with_conn(|conn| {
+            conn.execute_batch(
+                "CREATE TRIGGER reject_share_update
+                 BEFORE UPDATE ON share_access
+                 BEGIN SELECT RAISE(FAIL, 'forced downgrade failure'); END;",
+            )?;
+            Ok(())
+        })
+        .unwrap();
+        let event = DriveEvent::NodeDeleted {
+            id: DriveEventId::from("event-1"),
+            node_uid: root,
+            parent_node_uid: None,
+        };
+        let denied = Cell::new(false);
+
+        let applied = apply_access_downgrade(&db, &event, |root| {
+            denied.set(root.is_some());
+        });
+        assert!(applied.is_err());
+        assert!(denied.get(), "resident state must fail closed immediately");
+        assert!(acknowledge_applied_event(&db, &event, applied).is_err());
+        assert!(
+            db.get_event_cursor().unwrap().is_none(),
+            "failed downgrade must leave the event unacknowledged"
+        );
+    }
+
+    #[test]
+    fn deleted_resident_root_without_share_row_is_denied_and_tombstoned() {
+        let db = Db::open(std::path::Path::new(":memory:")).unwrap();
+        let root = uid("resident-without-row");
+        assert!(db.share_access(&root).unwrap().is_none());
+        let resident = std::cell::RefCell::new(std::collections::HashMap::from([(
+            root.clone(),
+            Access::Editor,
+        )]));
+        let event = DriveEvent::NodeDeleted {
+            id: DriveEventId::from("event-missing-row"),
+            node_uid: root.clone(),
+            parent_node_uid: None,
+        };
+
+        let applied = apply_access_downgrade(&db, &event, |target| {
+            assert_eq!(target, Some(&root));
+            resident.borrow_mut().insert(root.clone(), Access::Viewer);
+        });
+        assert!(applied.is_ok());
+        assert_eq!(resident.borrow().get(&root), Some(&Access::Viewer));
+        assert_eq!(db.share_access(&root).unwrap(), Some(Access::Viewer));
+
+        let acknowledged = acknowledge_applied_event(&db, &event, applied).unwrap();
+        assert_eq!(acknowledged.as_str(), "event-missing-row");
+        assert_eq!(
+            db.get_event_cursor().unwrap().as_deref(),
+            Some("event-missing-row")
+        );
+    }
+
+    #[test]
+    fn continuity_downgrade_failure_denies_memory_and_retains_cursor() {
+        let db = Db::open(std::path::Path::new(":memory:")).unwrap();
+        let root = uid("shared");
+        db.set_share_access(&root, Access::Editor).unwrap();
+        db.with_conn(|conn| {
+            conn.execute_batch(
+                "CREATE TRIGGER reject_all_share_updates
+                 BEFORE UPDATE ON share_access
+                 BEGIN SELECT RAISE(FAIL, 'forced global downgrade failure'); END;",
+            )?;
+            Ok(())
+        })
+        .unwrap();
+        let event = DriveEvent::ContinuityLost {
+            id: DriveEventId::from("event-2"),
+        };
+        let denied_all = Cell::new(false);
+
+        let applied = apply_access_downgrade(&db, &event, |root| {
+            denied_all.set(root.is_none());
+        });
+        assert!(applied.is_err());
+        assert!(
+            denied_all.get(),
+            "all resident shared roots must fail closed immediately"
+        );
+        assert!(acknowledge_applied_event(&db, &event, applied).is_err());
+        assert!(db.get_event_cursor().unwrap().is_none());
+    }
 }

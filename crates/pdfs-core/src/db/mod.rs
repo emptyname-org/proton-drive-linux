@@ -31,6 +31,7 @@ mod nodes;
 mod ops;
 mod photos;
 mod pins;
+mod share_access;
 mod state;
 mod sync;
 mod trash;
@@ -43,7 +44,7 @@ pub use maintenance::{DbStats, VacuumOutcome};
 pub use nodes::{SearchHit, StoredNode};
 pub use ops::{
     AttachedBlob, LOCAL_VOLUME, OP_CREATE, OP_MKDIR, OP_RENAME, OP_REVISION, OP_TRASH, PARK_UNTIL,
-    PendingCounts, PendingOp, op_supersedes,
+    PendingCounts, PendingOp, RenameMeta, op_supersedes,
 };
 pub use photos::{StoredPhoto, THUMB_HAVE, THUMB_NONE, THUMB_UNKNOWN};
 pub use sync::{StoredSyncEntry, StoredSyncFolder};

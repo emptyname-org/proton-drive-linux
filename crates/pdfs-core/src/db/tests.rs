@@ -351,6 +351,34 @@ fn delete_node_removes_row() {
 }
 
 #[test]
+fn completing_trash_atomically_removes_the_op_and_retained_node() {
+    let db = Db::open_in_memory().unwrap();
+    let node = file("trash-me", "parent", "trash-me.txt", 4);
+    let uid = node.uid.clone();
+    db.upsert_node(&node).unwrap();
+    db.enqueue_op(&PendingOp {
+        id: 0,
+        kind: OP_TRASH.to_string(),
+        uid: uid.to_string(),
+        parent_uid: None,
+        name: Some(node.name.clone()),
+        blob_path: None,
+        meta_json: None,
+        created_at: 1,
+        attempts: 0,
+        last_error: None,
+        next_attempt_at: 0,
+    })
+    .unwrap();
+    let op = db.pending_ops().unwrap().remove(0);
+
+    db.complete_trash_op(op.id, &uid).unwrap();
+
+    assert!(db.node_by_uid(&uid.to_string()).unwrap().is_none());
+    assert!(db.pending_ops().unwrap().is_empty());
+}
+
+#[test]
 fn children_if_listed_gated_on_flag() {
     let db = Db::open_in_memory().unwrap();
     db.upsert_node(&folder("root", None, "My Files")).unwrap();
@@ -785,6 +813,154 @@ fn opens_and_migrates() {
 }
 
 #[test]
+fn share_access_round_trips_updates_and_deletes() {
+    let db = Db::open_in_memory().unwrap();
+    let root = uid("shared-root");
+
+    assert_eq!(db.share_access(&root).unwrap(), None);
+    for access in [
+        crate::Access::Owner,
+        crate::Access::Editor,
+        crate::Access::Viewer,
+        crate::Access::Unknown,
+    ] {
+        db.set_share_access(&root, access).unwrap();
+        assert_eq!(db.share_access(&root).unwrap(), Some(access));
+        assert_eq!(db.all_share_access().unwrap().get(&root), Some(&access));
+    }
+    db.delete_share_access(&root).unwrap();
+    assert_eq!(db.share_access(&root).unwrap(), None);
+    assert!(db.all_share_access().unwrap().is_empty());
+}
+
+#[test]
+fn effective_node_access_inherits_from_the_persisted_share_root() {
+    let db = Db::open_in_memory().unwrap();
+    db.upsert_node(&folder("root", None, "My Files")).unwrap();
+    db.upsert_node(&folder("shared", Some("root"), "Shared"))
+        .unwrap();
+    db.upsert_node(&folder("nested", Some("shared"), "Nested"))
+        .unwrap();
+    db.upsert_node(&file("child", "nested", "child.txt", 1))
+        .unwrap();
+    db.set_share_access(&uid("shared"), crate::Access::Viewer)
+        .unwrap();
+
+    assert_eq!(
+        db.effective_node_access(&uid("child")).unwrap(),
+        Some(crate::Access::Viewer)
+    );
+    assert_eq!(
+        db.effective_node_access(&uid("root")).unwrap(),
+        Some(crate::Access::Owner)
+    );
+    assert_eq!(db.effective_node_access(&uid("missing")).unwrap(), None);
+}
+
+#[test]
+fn effective_node_access_uses_the_nearest_nested_share_root() {
+    let db = Db::open_in_memory().unwrap();
+    db.upsert_node(&folder("root", None, "My Files")).unwrap();
+    db.upsert_node(&folder("outer", Some("root"), "Outer"))
+        .unwrap();
+    db.upsert_node(&folder("inner", Some("outer"), "Inner"))
+        .unwrap();
+    db.upsert_node(&file("child", "inner", "child.txt", 1))
+        .unwrap();
+    db.set_share_access(&uid("outer"), crate::Access::Editor)
+        .unwrap();
+    db.set_share_access(&uid("inner"), crate::Access::Viewer)
+        .unwrap();
+
+    assert_eq!(
+        db.effective_node_access(&uid("child")).unwrap(),
+        Some(crate::Access::Viewer)
+    );
+}
+
+#[test]
+fn effective_node_access_keeps_a_missing_share_root_tombstone_authoritative() {
+    let db = Db::open_in_memory().unwrap();
+    db.upsert_node(&folder("root", None, "My Files")).unwrap();
+    db.upsert_node(&folder("shared", Some("root"), "Shared"))
+        .unwrap();
+    db.upsert_node(&folder("nested", Some("shared"), "Nested"))
+        .unwrap();
+    db.upsert_node(&file("child", "nested", "child.txt", 1))
+        .unwrap();
+    db.set_share_access(&uid("shared"), crate::Access::Viewer)
+        .unwrap();
+    db.delete_node(&uid("shared")).unwrap();
+
+    assert_eq!(
+        db.effective_node_access(&uid("child")).unwrap(),
+        Some(crate::Access::Viewer)
+    );
+}
+
+#[test]
+fn downgrade_all_share_access_leaves_unrecorded_owned_nodes_owned() {
+    let db = Db::open_in_memory().unwrap();
+    db.upsert_node(&folder("root", None, "My Files")).unwrap();
+    db.upsert_node(&folder("shared", Some("root"), "Shared"))
+        .unwrap();
+    db.set_share_access(&uid("shared"), crate::Access::Editor)
+        .unwrap();
+
+    assert_eq!(db.downgrade_all_share_access().unwrap(), 1);
+    assert_eq!(
+        db.effective_node_access(&uid("shared")).unwrap(),
+        Some(crate::Access::Viewer)
+    );
+    assert_eq!(
+        db.effective_node_access(&uid("root")).unwrap(),
+        Some(crate::Access::Owner)
+    );
+}
+
+#[test]
+fn migration_v17_adds_share_access_to_a_v16_fixture() {
+    let path = std::env::temp_dir().join(format!(
+        "pdfs-db-v16-fixture-{}-{}.db",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    {
+        // V17 only adds `share_access`, so removing it and restoring the version
+        // stamp produces the exact schema a released V16 database had.
+        let db = Db::open(&path).unwrap();
+        db.set_state_str("fixture_value", "survives").unwrap();
+    }
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "DROP TABLE share_access;
+             UPDATE sync_state SET value = '16' WHERE key = 'schema_version';",
+        )
+        .unwrap();
+    }
+
+    let db = Db::open(&path).unwrap();
+    assert_eq!(
+        db.state_str("fixture_value").unwrap().as_deref(),
+        Some("survives")
+    );
+    let root = uid("offline-share");
+    db.set_share_access(&root, crate::Access::Viewer).unwrap();
+    assert_eq!(db.share_access(&root).unwrap(), Some(crate::Access::Viewer));
+    assert_eq!(
+        db.state_str("schema_version").unwrap().as_deref(),
+        Some("17")
+    );
+
+    drop(db);
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
 fn refuses_a_schema_newer_than_the_running_build() {
     let path = std::env::temp_dir().join(format!(
         "pdfs-db-future-{}-{}.db",
@@ -933,6 +1109,82 @@ fn failed_superseding_insert_keeps_the_old_pending_op() {
     let ops = db.pending_ops().unwrap();
     assert_eq!(ops.len(), 1);
     assert_eq!(ops[0].blob_path.as_deref(), Some("/staging/original"));
+}
+
+#[test]
+fn atomic_trash_replacement_returns_owned_blobs_after_commit() {
+    let db = Db::open_in_memory().unwrap();
+    let root = uid("trash-root").to_string();
+    let child = uid("trash-child").to_string();
+    let revision = |uid: &str, parent_uid: Option<&str>, blob: &str| PendingOp {
+        id: 0,
+        kind: OP_REVISION.to_string(),
+        uid: uid.to_string(),
+        parent_uid: parent_uid.map(str::to_string),
+        name: None,
+        blob_path: Some(blob.to_string()),
+        meta_json: Some("{}".to_string()),
+        created_at: 1,
+        attempts: 0,
+        last_error: None,
+        next_attempt_at: 0,
+    };
+    db.enqueue_op(&revision(&root, None, "/staging/root"))
+        .unwrap();
+    db.enqueue_op(&revision(&child, Some(&root), "/staging/child"))
+        .unwrap();
+
+    let (trash_id, mut blobs) = db.replace_ops_with_trash(&root, "removed.txt", 2).unwrap();
+    blobs.sort();
+    assert_eq!(blobs, vec!["/staging/child", "/staging/root"]);
+
+    let ops = db.pending_ops().unwrap();
+    assert_eq!(ops.len(), 1);
+    assert_eq!(ops[0].id, trash_id);
+    assert_eq!(ops[0].kind, OP_TRASH);
+    assert_eq!(ops[0].uid, root);
+    assert_eq!(ops[0].name.as_deref(), Some("removed.txt"));
+    assert!(ops[0].blob_path.is_none());
+}
+
+#[test]
+fn failed_atomic_trash_insert_keeps_prior_revision_and_blob_ownership() {
+    let db = Db::open_in_memory().unwrap();
+    let node = uid("atomic-trash").to_string();
+    db.enqueue_op(&PendingOp {
+        id: 0,
+        kind: OP_REVISION.to_string(),
+        uid: node.clone(),
+        parent_uid: None,
+        name: None,
+        blob_path: Some("/staging/still-owned".to_string()),
+        meta_json: Some("{}".to_string()),
+        created_at: 1,
+        attempts: 0,
+        last_error: None,
+        next_attempt_at: 0,
+    })
+    .unwrap();
+    db.with_conn(|conn| {
+        conn.execute_batch(
+            "CREATE TRIGGER reject_trash_insert BEFORE INSERT ON pending_op
+             WHEN NEW.kind = 'trash'
+             BEGIN SELECT RAISE(ABORT, 'injected trash insert failure'); END;",
+        )?;
+        Ok(())
+    })
+    .unwrap();
+
+    assert!(db.replace_ops_with_trash(&node, "removed.txt", 2).is_err());
+    let ops = db.pending_ops().unwrap();
+    assert_eq!(ops.len(), 1);
+    assert_eq!(ops[0].kind, OP_REVISION);
+    assert_eq!(ops[0].uid, node);
+    assert_eq!(
+        ops[0].blob_path.as_deref(),
+        Some("/staging/still-owned"),
+        "the rolled-back revision still owns its staged bytes"
+    );
 }
 
 /// Deleting a folder that was created offline must take the ops queued
@@ -1200,6 +1452,63 @@ fn a_failed_op_stays_queued_with_backoff() {
 
     db.delete_op(id).unwrap();
     assert_eq!(db.pending_op_counts().unwrap().uploads, 0);
+}
+
+#[test]
+fn an_access_blocked_op_is_deferred_without_counting_an_attempt() {
+    let db = Db::open_in_memory().unwrap();
+    db.enqueue_op(&PendingOp {
+        id: 0,
+        kind: OP_REVISION.to_string(),
+        uid: uid("blocked").to_string(),
+        parent_uid: None,
+        name: None,
+        blob_path: Some("/staging/blocked".to_string()),
+        meta_json: Some("{}".to_string()),
+        created_at: 1,
+        attempts: 3,
+        last_error: Some("earlier network failure".to_string()),
+        next_attempt_at: 0,
+    })
+    .unwrap();
+    let before = db.pending_ops().unwrap();
+    let id = before[0].id;
+    let count = db.pending_op_counts().unwrap();
+
+    db.defer_op_without_attempt(id, 5_000).unwrap();
+
+    let after = db.pending_ops().unwrap();
+    assert_eq!(after.len(), 1);
+    let after_count = db.pending_op_counts().unwrap();
+    assert_eq!(after_count.uploads, count.uploads);
+    assert_eq!(after_count.changes, count.changes);
+    assert_eq!(after[0].attempts, before[0].attempts);
+    assert_eq!(after[0].last_error, before[0].last_error);
+    assert_eq!(after[0].next_attempt_at, 5_000);
+}
+
+#[test]
+fn access_deferral_does_not_unpark_a_transient_create() {
+    let db = Db::open_in_memory().unwrap();
+    db.enqueue_op(&PendingOp {
+        id: 0,
+        kind: OP_CREATE.to_string(),
+        uid: uid("transient").to_string(),
+        parent_uid: Some(uid("parent").to_string()),
+        name: Some(".part".to_string()),
+        blob_path: Some("/staging/transient".to_string()),
+        meta_json: Some("{}".to_string()),
+        created_at: 1,
+        attempts: 0,
+        last_error: None,
+        next_attempt_at: PARK_UNTIL,
+    })
+    .unwrap();
+    let op = db.pending_ops().unwrap().remove(0);
+
+    db.defer_op_without_attempt(op.id, 5_000).unwrap();
+
+    assert_eq!(db.pending_ops().unwrap()[0].next_attempt_at, PARK_UNTIL);
 }
 
 #[test]
@@ -1846,6 +2155,7 @@ fn test_db_has_children_and_trashed_filtering() {
         is_shared: false,
         is_shared_publicly: false,
         signature_email: None,
+        membership: None,
         verification: Default::default(),
     };
     db.upsert_node(&parent_node).unwrap();
@@ -1869,6 +2179,7 @@ fn test_db_has_children_and_trashed_filtering() {
         is_shared: false,
         is_shared_publicly: false,
         signature_email: None,
+        membership: None,
         verification: Default::default(),
     };
     db.upsert_node(&child_node).unwrap();

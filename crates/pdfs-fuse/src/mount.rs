@@ -179,6 +179,9 @@ pub fn mount(
     } = options;
     let (root, online) = fetch_or_recall_root(&client, &rt, &db)?;
     let scope = root.tree_event_scope_id();
+    let share_access = db
+        .all_share_access()
+        .map_err(|error| std::io::Error::other(format!("load shared access: {error}")))?;
 
     // The folder-sync engine (devices.md Phase 2) runs on its own thread and is
     // nudged over this channel; the sender lives in Core so control-socket
@@ -196,6 +199,8 @@ pub fn mount(
             active_writes: HashMap::new(),
             handles: HashMap::new(),
             next_fh: 1,
+            access_changes: HashSet::new(),
+            share_access,
             db: db.clone(),
         })),
         cache: Arc::new(cache),

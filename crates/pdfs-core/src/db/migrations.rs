@@ -9,7 +9,7 @@ use super::Db;
 use crate::Result;
 
 /// Current schema version. Bump on every forward migration added below.
-pub(super) const SCHEMA_VERSION: i64 = 16;
+pub(super) const SCHEMA_VERSION: i64 = 17;
 
 impl Db {
     pub(super) fn migrate(&self) -> Result<()> {
@@ -88,6 +88,9 @@ impl Db {
         }
         if current < 16 {
             tx.execute_batch(MIGRATION_V16)?;
+        }
+        if current < 17 {
+            tx.execute_batch(MIGRATION_V17)?;
         }
         tx.execute(
             "INSERT INTO sync_state (key, value) VALUES ('schema_version', ?1)
@@ -410,4 +413,15 @@ CREATE VIRTUAL TABLE local_fts USING fts5(
 CREATE INDEX IF NOT EXISTS idx_local_files_name_nocase
   ON local_files(name COLLATE NOCASE);
 INSERT INTO local_fts(local_fts) VALUES('rebuild');
+";
+
+/// Schema v17: effective access for roots shared with this account. The role is
+/// persisted separately from `nodes.node_json` so a cold/offline mount can
+/// enforce the last known permission even when the SDK cannot refresh metadata.
+const MIGRATION_V17: &str = "
+CREATE TABLE share_access (
+  root_uid TEXT PRIMARY KEY,
+  access   TEXT NOT NULL
+           CHECK (access IN ('owner', 'editor', 'viewer', 'unknown'))
+);
 ";

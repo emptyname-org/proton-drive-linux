@@ -27,7 +27,7 @@ use std::time::Duration;
 
 use pdfs_core::cache::{Baseline, StagedWrite};
 use pdfs_core::control::{ActivityKind, TransferDirection};
-use pdfs_core::db::{OP_CREATE, OP_MKDIR, OP_RENAME, OP_REVISION, OP_TRASH, PendingOp};
+use pdfs_core::db::{OP_CREATE, OP_MKDIR, OP_RENAME, OP_REVISION, OP_TRASH, PendingOp, RenameMeta};
 use proton_drive_rs::Node;
 use proton_drive_rs::proton_sdk::ids::NodeUid;
 use tracing::{debug, error, info, warn};
@@ -39,6 +39,78 @@ use super::{
     is_already_exists, is_gone, is_local_uid_str, media_type_for, node_revision_id, node_size,
     now_millis, now_secs, parse_node_uid,
 };
+
+const DRAIN_ACCESS_RECHECK: Duration = Duration::from_secs(5);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DrainDisposition {
+    Applied,
+    AccessDeferred,
+}
+
+fn pending_op_authorities(op: &PendingOp) -> Result<Vec<NodeUid>, Box<dyn std::error::Error>> {
+    let uid = || -> Result<NodeUid, Box<dyn std::error::Error>> {
+        parse_node_uid(&op.uid)
+            .ok_or_else(|| Box::<dyn std::error::Error>::from("pending op has an unparseable uid"))
+    };
+    let parent = || -> Result<NodeUid, Box<dyn std::error::Error>> {
+        let parent = op
+            .parent_uid
+            .as_deref()
+            .ok_or("pending op has no parent authority")?;
+        parse_node_uid(parent).ok_or_else(|| {
+            Box::<dyn std::error::Error>::from("pending op has an unparseable parent")
+        })
+    };
+    match op.kind.as_str() {
+        OP_REVISION | OP_TRASH => Ok(vec![uid()?]),
+        OP_CREATE | OP_MKDIR => Ok(vec![parent()?]),
+        OP_RENAME => {
+            let mut authorities = vec![uid()?];
+            if let Some(json) = op.meta_json.as_deref() {
+                let meta: RenameMeta = serde_json::from_str(json)?;
+                authorities.push(
+                    parse_node_uid(&meta.original_parent_uid)
+                        .ok_or("rename op has an unparseable original parent")?,
+                );
+            } else {
+                // Rows written by 1.1.1 predate foreign shared mounts. Their
+                // source tree was necessarily owned, so the node plus desired
+                // destination are the complete available authority set.
+            }
+            authorities.push(parent()?);
+            authorities.dedup();
+            Ok(authorities)
+        }
+        other => Err(format!("unknown pending op kind {other:?}").into()),
+    }
+}
+
+fn run_authorized_drain(
+    op: &PendingOp,
+    mut require: impl FnMut(&NodeUid) -> Result<(), fuser::Errno>,
+    apply: impl FnOnce() -> Result<(), Box<dyn std::error::Error>>,
+) -> Result<DrainDisposition, Box<dyn std::error::Error>> {
+    // This check is the admission/linearization point. A downgrade that lands
+    // first defers the op; one observed afterwards does not revoke this admitted
+    // attempt. Every later queued operation rechecks. No permission lock is
+    // held across remote latency.
+    for authority in pending_op_authorities(op)? {
+        match require(&authority) {
+            Ok(()) => {}
+            Err(error) if error.code() == libc::EACCES => {
+                return Ok(DrainDisposition::AccessDeferred);
+            }
+            Err(error) => {
+                return Err(
+                    format!("drain access check failed with errno {}", error.code()).into(),
+                );
+            }
+        }
+    }
+    apply()?;
+    Ok(DrainDisposition::Applied)
+}
 
 impl Core {
     /// Drain the pending-op queue: the background half of every write
@@ -69,7 +141,30 @@ impl Core {
                 self.wait_for_drain_work_or_due();
                 continue;
             };
-            if let Err(e) = self.drain_op(&op) {
+            let outcome = run_authorized_drain(
+                &op,
+                |uid| self.require_uid_writable(uid),
+                || self.drain_op(&op),
+            );
+            if matches!(outcome, Ok(DrainDisposition::AccessDeferred)) {
+                let next_attempt_at = now_millis() + DRAIN_ACCESS_RECHECK.as_millis() as i64;
+                if let Err(error) = self.db.defer_op_without_attempt(op.id, next_attempt_at) {
+                    error!(
+                        uid = %op.uid,
+                        %error,
+                        "deferring access-blocked pending operation failed"
+                    );
+                    self.wait_for_drain_work();
+                } else {
+                    debug!(
+                        uid = %op.uid,
+                        next_attempt_at,
+                        "pending operation deferred until access is writable"
+                    );
+                }
+                continue;
+            }
+            if let Err(e) = outcome {
                 let attempts = op.attempts + 1;
                 let err_str = e.to_string();
                 // Never infer that user data is disposable from an error string
@@ -252,7 +347,7 @@ impl Core {
             }
             Err(e) => return Err(e.into()),
         }
-        self.db.delete_op(op.id)?;
+        self.db.complete_trash_op(op.id, &uid)?;
         self.own_sealed_revs.lock().remove(&uid);
         self.invalidate_trash();
         self.log_activity(ActivityKind::Trash, &name, "trashed", true);
@@ -996,8 +1091,184 @@ fn is_own_self_supersede(complete: bool, remote_rev: Option<&str>, own_rev: Opti
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pdfs_core::Access;
+    use pdfs_core::db::Db;
     use proton_drive_rs::NodeKind;
     use proton_drive_rs::proton_sdk::ids::{LinkId, VolumeId};
+    use std::cell::Cell;
+
+    fn pending(kind: &str) -> PendingOp {
+        PendingOp {
+            id: 0,
+            kind: kind.to_string(),
+            uid: NodeUid::new(VolumeId::from("v"), LinkId::from("node")).to_string(),
+            parent_uid: Some(NodeUid::new(VolumeId::from("v"), LinkId::from("parent")).to_string()),
+            name: Some("name".to_string()),
+            blob_path: (kind == OP_REVISION).then(|| "/staging/blob".to_string()),
+            meta_json: None,
+            created_at: 1,
+            attempts: 0,
+            last_error: None,
+            next_attempt_at: 0,
+        }
+    }
+
+    #[test]
+    fn drain_authorities_match_each_operation_kind() {
+        for kind in [OP_REVISION, OP_TRASH] {
+            assert_eq!(pending_op_authorities(&pending(kind)).unwrap().len(), 1);
+        }
+        for kind in [OP_CREATE, OP_MKDIR] {
+            let authorities = pending_op_authorities(&pending(kind)).unwrap();
+            assert_eq!(authorities.len(), 1);
+            assert_eq!(authorities[0].to_string(), "v~parent");
+        }
+        let authorities = pending_op_authorities(&pending(OP_RENAME)).unwrap();
+        assert_eq!(authorities.len(), 2);
+        assert_eq!(authorities[0].to_string(), "v~node");
+        assert_eq!(authorities[1].to_string(), "v~parent");
+    }
+
+    fn folder_node(link: &str, parent: Option<&str>) -> Node {
+        Node {
+            uid: NodeUid::new(VolumeId::from("v"), LinkId::from(link)),
+            parent_uid: parent
+                .map(|parent| NodeUid::new(VolumeId::from("v"), LinkId::from(parent))),
+            kind: NodeKind::Folder,
+            name: link.to_string(),
+            creation_time: 0,
+            modification_time: 0,
+            trashed: false,
+            is_shared: false,
+            is_shared_publicly: false,
+            signature_email: None,
+            membership: None,
+            verification: Default::default(),
+        }
+    }
+
+    #[test]
+    fn queued_cross_parent_rename_retains_viewer_source_authority_after_local_move() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static N: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "pdfs-drain-rename-access-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = Db::open(&dir.join("cache.db")).unwrap();
+        let source = folder_node("source", None);
+        let destination = folder_node("destination", None);
+        let mut moved = file_node(1, 0, None);
+        moved.parent_uid = Some(destination.uid.clone());
+        for node in [&source, &destination, &moved] {
+            db.upsert_node(node).unwrap();
+        }
+        db.set_share_access(&source.uid, Access::Viewer).unwrap();
+        db.set_share_access(&destination.uid, Access::Editor)
+            .unwrap();
+
+        let mut op = pending(OP_RENAME);
+        op.uid = moved.uid.to_string();
+        op.parent_uid = Some(destination.uid.to_string());
+        op.meta_json = Some(
+            serde_json::to_string(&RenameMeta {
+                original_parent_uid: source.uid.to_string(),
+            })
+            .unwrap(),
+        );
+        let authorities = pending_op_authorities(&op).unwrap();
+        assert_eq!(authorities.len(), 3);
+        assert_eq!(authorities[1], source.uid);
+
+        let applied = Cell::new(false);
+        let disposition = run_authorized_drain(
+            &op,
+            |uid| {
+                db.effective_node_access(uid)
+                    .unwrap()
+                    .filter(|access| access.writable())
+                    .map(|_| ())
+                    .ok_or(fuser::Errno::EACCES)
+            },
+            || {
+                applied.set(true);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(disposition, DrainDisposition::AccessDeferred);
+        assert!(!applied.get());
+        assert_eq!(
+            db.effective_node_access(&moved.uid).unwrap(),
+            Some(Access::Editor),
+            "the node's optimistic destination ancestry is writable"
+        );
+        drop(db);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn viewer_deferred_drain_never_applies_or_consumes_an_attempt() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static N: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "pdfs-drain-access-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = Db::open(&dir.join("cache.db")).unwrap();
+        let mut queued = pending(OP_REVISION);
+        queued.attempts = 2;
+        db.enqueue_op(&queued).unwrap();
+        let op = db.pending_ops().unwrap().remove(0);
+        let before_count = db.pending_op_counts().unwrap();
+        let applied = Cell::new(false);
+
+        let disposition = run_authorized_drain(
+            &op,
+            |_| Err(fuser::Errno::EACCES),
+            || {
+                applied.set(true);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(disposition, DrainDisposition::AccessDeferred);
+        assert!(!applied.get(), "no API surrogate may run while read-only");
+        db.defer_op_without_attempt(op.id, 5_000).unwrap();
+
+        let retained = db.pending_ops().unwrap();
+        let after_count = db.pending_op_counts().unwrap();
+        assert_eq!(retained.len(), 1);
+        assert_eq!(retained[0].attempts, op.attempts);
+        assert_eq!(after_count.uploads, before_count.uploads);
+        assert_eq!(after_count.changes, before_count.changes);
+        drop(db);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn owner_and_editor_drain_authorities_apply_normally() {
+        for access in [Access::Owner, Access::Editor] {
+            let applied = Cell::new(false);
+            let disposition = run_authorized_drain(
+                &pending(OP_REVISION),
+                |_| access.writable().then_some(()).ok_or(fuser::Errno::EACCES),
+                || {
+                    applied.set(true);
+                    Ok(())
+                },
+            )
+            .unwrap();
+            assert_eq!(disposition, DrainDisposition::Applied);
+            assert!(applied.get());
+        }
+    }
 
     fn file_node(mtime: i64, size: i64, rev: Option<&str>) -> Node {
         Node {
@@ -1019,6 +1290,7 @@ mod tests {
             is_shared: false,
             is_shared_publicly: false,
             signature_email: None,
+            membership: None,
             verification: Default::default(),
         }
     }
