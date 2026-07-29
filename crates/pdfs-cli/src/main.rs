@@ -13,7 +13,7 @@ use pdfs_core::auth;
 use pdfs_core::cache::ContentCache;
 use pdfs_core::config::AppDirs;
 use pdfs_core::control::{
-    ErrorKind, RefreshScope, Request as CtlRequest, Response as CtlResponse,
+    ErrorKind, MountKind, RefreshScope, Request as CtlRequest, Response as CtlResponse,
     RestoreItem as CtlRestoreItem, ShareEntryKind, SyncPhase, pending_summary,
 };
 use pdfs_core::db::Db;
@@ -28,7 +28,7 @@ struct Cli {
     /// Emit machine-readable JSON instead of formatted text.
     ///
     /// Applies to the query commands (`status`, `ls`, `pins`, `sync list`,
-    /// `devices list`, `transfers`, `activity`, `cache inspect`). Commands that
+    /// `devices list`, `locations`, `transfers`, `activity`, `cache inspect`). Commands that
     /// perform an action keep their human output — a script that needs to know
     /// whether one succeeded has the exit code.
     #[arg(long, global = true)]
@@ -105,6 +105,8 @@ enum Command {
     Logout,
     /// Show account login state, and mount status if a daemon is running.
     Status,
+    /// List every local Proton Drive location.
+    Locations,
     /// Mount Proton Drive at the given (or default) path. Blocks until unmounted.
     Mount {
         /// Mountpoint; defaults to ~/ProtonDrive.
@@ -507,6 +509,7 @@ fn main() -> Result<()> {
         Command::Login { username } => cmd_login(username),
         Command::Logout => cmd_logout(),
         Command::Status => cmd_status(),
+        Command::Locations => cmd_locations(),
         Command::Mount { mountpoint } => cmd_mount(mountpoint),
         Command::Daemon { mountpoint } => cmd_daemon(mountpoint),
         Command::Pin { path } => cmd_pin(path),
@@ -1197,6 +1200,45 @@ fn cmd_status() -> Result<()> {
         }
         Ok(other) => println!("Mount: unexpected response {other:?}"),
         Err(_) => println!("Mount: not running."),
+    }
+    Ok(())
+}
+
+fn cmd_locations() -> Result<()> {
+    let response = control_request(CtlRequest::ListLocations)?;
+    if emit_json(&response)? {
+        return Ok(());
+    }
+    match response {
+        CtlResponse::Locations { items } if items.is_empty() => {
+            println!("No Proton Drive locations.");
+        }
+        CtlResponse::Locations { items } => {
+            for location in items {
+                let kind = match &location.kind {
+                    MountKind::MyFiles => "My Files".to_string(),
+                    MountKind::Device { sync_folder_id } => {
+                        format!("Device folder {sync_folder_id}")
+                    }
+                    MountKind::Shared { .. } => "Shared folder".to_string(),
+                };
+                let mode = match location.pending_mode {
+                    Some(pending) => format!("{} -> {pending}", location.mode),
+                    None => location.mode.to_string(),
+                };
+                let mounted = if location.mounted {
+                    "mounted"
+                } else {
+                    "not mounted"
+                };
+                println!(
+                    "{kind}: {} ({mode}, {}, {}, {mounted})",
+                    location.local_path, location.access, location.state
+                );
+            }
+        }
+        CtlResponse::Error { message, kind } => bail!("{}", cli_error(kind, &message)),
+        other => bail!("unexpected response: {other:?}"),
     }
     Ok(())
 }

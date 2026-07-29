@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::cache::Pin;
 use crate::error::Result;
+pub use crate::mounts::{MountAccess, MountKind, MountMode, MountSpec};
 
 /// Cap on the *write* half of a round-trip. A crashed daemon can leave its
 /// listening socket in the kernel (e.g. as a `<defunct>` zombie): `connect`
@@ -193,6 +194,11 @@ pub enum Request {
     /// knows the cache is stale needs a way to say so. Cheap and idempotent —
     /// it invalidates, it does not fetch.
     Refresh { scope: RefreshScope },
+
+    // ---- locations --------------------------------------------------------
+    /// List every local Proton Drive location. Replies with
+    /// [`Response::Locations`].
+    ListLocations,
 
     // ---- devices ----------------------------------------------------------
     /// List the account's registered devices. Replies with [`Response::Devices`].
@@ -1127,6 +1133,8 @@ pub enum Response {
     },
     /// The account's devices (reply to [`Request::ListDevices`]).
     Devices { items: Vec<DeviceInfo> },
+    /// Every local Proton Drive location (reply to [`Request::ListLocations`]).
+    Locations { items: Vec<MountSpec> },
     /// This device's synced folders (reply to [`Request::ListSyncFolders`]).
     SyncFolders { items: Vec<SyncFolderInfo> },
     /// Folders offered for restore (reply to [`Request::ListRestorableFolders`]).
@@ -1574,6 +1582,7 @@ mod tests {
     #[test]
     fn sharing_requests_roundtrip() {
         let reqs = [
+            Request::ListLocations,
             Request::ListDevices,
             Request::RenameDevice {
                 uid: "dev-1".into(),
@@ -1696,6 +1705,107 @@ mod tests {
             let back: Request = serde_json::from_str(&line).unwrap();
             assert_eq!(line, serde_json::to_string(&back).unwrap());
         }
+    }
+
+    #[test]
+    fn locations_response_roundtrips_typed_mounts() {
+        let response = Response::Locations {
+            items: vec![
+                MountSpec {
+                    id: 1,
+                    kind: MountKind::MyFiles,
+                    local_path: "/home/me/ProtonDrive".into(),
+                    root_uid: "vol~root".into(),
+                    root_share_id: "share-main".into(),
+                    mode: MountMode::OnDemand,
+                    access: MountAccess::Rw,
+                    state: "idle".into(),
+                    last_sync: 0,
+                    pending_mode: None,
+                    mounted: true,
+                    progress: None,
+                },
+                MountSpec {
+                    id: 2,
+                    kind: MountKind::Device { sync_folder_id: 7 },
+                    local_path: "/home/me/Work".into(),
+                    root_uid: "device-vol~work".into(),
+                    root_share_id: "device-share".into(),
+                    mode: MountMode::Mirror,
+                    access: MountAccess::Rw,
+                    state: "syncing".into(),
+                    last_sync: 42,
+                    pending_mode: Some(MountMode::OnDemand),
+                    mounted: false,
+                    progress: None,
+                },
+                MountSpec {
+                    id: 3,
+                    kind: MountKind::Shared {
+                        share_root_uid: "shared-vol~root".into(),
+                    },
+                    local_path: "/home/me/Shared".into(),
+                    root_uid: "shared-vol~root".into(),
+                    root_share_id: "shared-share".into(),
+                    mode: MountMode::Unknown,
+                    access: MountAccess::Ro,
+                    state: "error".into(),
+                    last_sync: 0,
+                    pending_mode: Some(MountMode::Unknown),
+                    mounted: false,
+                    progress: Some(SyncProgress {
+                        phase: SyncPhase::Applying,
+                        done: 2,
+                        total: 5,
+                        current: "report.pdf".into(),
+                    }),
+                },
+            ],
+        };
+        let wire = serde_json::to_string(&response).unwrap();
+        assert!(!wire.contains('\n'), "wire form must be a single line");
+        assert!(wire.contains(r#""mode":"ondemand""#));
+        assert!(wire.contains(r#""kind":"shared""#));
+        assert!(wire.contains(r#""access":"ro""#));
+        assert!(wire.contains(r#""mode":"unknown""#));
+        let back: Response = serde_json::from_str(&wire).unwrap();
+        match back {
+            Response::Locations { items } => {
+                assert_eq!(items.len(), 3);
+                assert!(matches!(
+                    items[1].kind,
+                    MountKind::Device { sync_folder_id: 7 }
+                ));
+                assert_eq!(items[1].pending_mode, Some(MountMode::OnDemand));
+                assert!(matches!(
+                    &items[2].kind,
+                    MountKind::Shared { share_root_uid }
+                        if share_root_uid == "shared-vol~root"
+                ));
+                assert_eq!(items[2].access, MountAccess::Ro);
+                assert_eq!(items[2].mode, MountMode::Unknown);
+                assert_eq!(items[2].pending_mode, Some(MountMode::Unknown));
+                let progress = items[2].progress.as_ref().unwrap();
+                assert_eq!(progress.phase, SyncPhase::Applying);
+                assert_eq!((progress.done, progress.total), (2, 5));
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn legacy_daemons_reject_list_locations_cleanly() {
+        #[allow(dead_code)]
+        #[derive(serde::Deserialize)]
+        enum LegacyLocationRequest {
+            ListSyncFolders,
+        }
+
+        let wire = serde_json::to_string(&Request::ListLocations).unwrap();
+        assert!(
+            serde_json::from_str::<LegacyLocationRequest>(&wire).is_err(),
+            "an old daemon must reject ListLocations instead of interpreting another request"
+        );
     }
 
     #[test]

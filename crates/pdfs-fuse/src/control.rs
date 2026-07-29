@@ -561,6 +561,10 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
             Ok(items) => CtlResponse::Devices { items },
             Err(e) => CtlResponse::error(e),
         },
+        Ok(CtlRequest::ListLocations) => match core.list_locations() {
+            Ok(items) => CtlResponse::Locations { items },
+            Err(e) => CtlResponse::error(e),
+        },
         Ok(CtlRequest::RenameDevice { uid, name }) => match core.rename_device(&uid, &name) {
             Ok(()) => CtlResponse::Ok {
                 message: format!("renamed device to {name}"),

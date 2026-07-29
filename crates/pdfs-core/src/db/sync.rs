@@ -115,14 +115,17 @@ impl Db {
         Ok(n > 0)
     }
 
-    /// Update a synced folder's mode (`mirror`/`ondemand`). The folder has
-    /// reached the mode it was asked for, so any queued request is satisfied and
-    /// cleared in the same write — a `pending_mode` outliving the switch it asked
-    /// for would have the engine try to apply it again on the next pass.
+    /// Update a synced folder's mode (`mirror`/`ondemand`). A queued request for
+    /// that mode is satisfied and cleared in the same write. An opposite pending
+    /// mode arrived after this transition started, so preserve it as the newer
+    /// last-request intent.
     pub fn sync_folder_set_mode(&self, id: i64, mode: &str) -> Result<()> {
         let conn = self.conn.lock();
         conn.execute(
-            "UPDATE sync_folder SET mode = ?2, pending_mode = NULL WHERE id = ?1",
+            "UPDATE sync_folder
+                SET mode = ?2,
+                    pending_mode = CASE WHEN pending_mode = ?2 THEN NULL ELSE pending_mode END
+              WHERE id = ?1",
             params![id, mode],
         )?;
         Ok(())
@@ -137,6 +140,18 @@ impl Db {
             params![id, mode],
         )?;
         Ok(())
+    }
+
+    /// Withdraw a queued mode only if it is still the intent the caller
+    /// inspected. A newer request must survive an older settlement attempt.
+    pub fn sync_folder_clear_pending_mode_if(&self, id: i64, expected: &str) -> Result<bool> {
+        let conn = self.conn.lock();
+        let changed = conn.execute(
+            "UPDATE sync_folder SET pending_mode = NULL
+             WHERE id = ?1 AND pending_mode = ?2",
+            params![id, expected],
+        )?;
+        Ok(changed > 0)
     }
 
     /// Update a synced folder's state and stamp `last_sync` to now.

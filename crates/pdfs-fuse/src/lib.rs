@@ -98,7 +98,9 @@ mod workers;
 use background::{run_event_sync, run_local_index};
 pub(crate) use mount::is_stale_mount;
 pub use mount::{MountOptions, MountOutcome, mount};
-use mount::{SecondaryMount, clear_stale_mount, fuse_connection_id, umount_session_unblocked};
+use mount::{
+    SecondaryInsertRejection, SecondaryMount, clear_stale_mount, fuse_connection_id, spawn_session,
+};
 use reads::{ReaderSlot, STREAM_BYPASS_MIN, StreamRing};
 use state::{Entry, Intervals, PendingRevision, State, WriteHandle};
 use tracing::{debug, error, info, warn};
@@ -400,6 +402,10 @@ struct Core {
     /// would name inodes that session has never heard of. [`Core::fork_state`]
     /// gives each fork an empty cell of its own.
     notifier: Arc<OnceLock<Notifier>>,
+    /// True only after this inode space's FUSE session spawned successfully.
+    /// Registration happens earlier for the primary drain, so state residency
+    /// alone cannot answer whether the location is mounted.
+    session_live: Arc<AtomicBool>,
     /// In-flight upload/download progress, served to `GetQueueStatus`. Shared
     /// across the FUSE session and the control-socket task.
     transfers: Arc<TransferRegistry>,
@@ -417,10 +423,10 @@ struct Core {
     /// id (devices.md Phase 3). Each is a `ProtonFs` rooted at the folder's remote
     /// node, mounted over its local path, sharing this Core's client/cache/db but
     /// with its own inode space (`fork_state`). Held so we can unmount on toggle
-    /// back to `mirror` and on daemon shutdown. The `u32` is the FUSE connection
-    /// id (see [`fuse_connection_id`]), captured at mount time so teardown can
-    /// abort a mid-transfer connection instead of blocking on it.
-    mounts: Arc<Mutex<HashMap<i64, SecondaryMount>>>,
+    /// back to `mirror` and on daemon shutdown. Each entry retains the FUSE
+    /// connection id and the fork's exact liveness flag so teardown first makes
+    /// that inode space unroutable.
+    mounts: Arc<Mutex<mount::SecondaryMountRegistry<SecondaryMount>>>,
     /// Per-sync-folder locks, held for a whole reconcile pass and for a whole
     /// mode switch. A `mirror→ondemand` flip evicts the local tree and mounts
     /// FUSE over it, so it must never overlap a pass that is walking and
@@ -523,15 +529,23 @@ fn take_self_change(
 /// the kernel to drop inode 42 is only correct on the session that minted it.
 /// Background work that invalidates as well as mutates needs the matching pair,
 /// which is what [`Core::for_each_mount`] hands it.
-type LiveMount = (Arc<Mutex<State>>, Arc<OnceLock<Notifier>>);
+type LiveMount = (
+    PathBuf,
+    Arc<Mutex<State>>,
+    Arc<OnceLock<Notifier>>,
+    Arc<AtomicBool>,
+);
 
 struct MountedState {
+    /// Absolute local root of this inode space.
+    mountpoint: PathBuf,
     /// `Weak`, so an unmounted fork's state is dropped rather than pinned here;
     /// a dead entry is reaped on the next registry walk.
     state: std::sync::Weak<Mutex<State>>,
     /// This mount's kernel notification channel — the same cell as
     /// [`Core::notifier`], still empty until its session is spawned.
     notifier: Arc<OnceLock<Notifier>>,
+    session_live: Arc<AtomicBool>,
 }
 
 /// Every mounted inode space in the daemon, shared by the primary `Core` and
@@ -546,14 +560,28 @@ struct StateRegistry(Mutex<Vec<MountedState>>);
 impl StateRegistry {
     /// Publish an inode space and the channel to the session that owns it.
     ///
-    /// Registering the same `state` twice would make every walk visit it twice;
-    /// callers register exactly once, at mount time.
-    fn register(&self, state: &Arc<Mutex<State>>, notifier: Arc<OnceLock<Notifier>>) {
+    /// A state/path pair is registered exactly once by its owner. Session
+    /// construction only flips `session_live`; it never republishes the state.
+    fn register(
+        &self,
+        mountpoint: &Path,
+        state: &Arc<Mutex<State>>,
+        notifier: Arc<OnceLock<Notifier>>,
+        session_live: Arc<AtomicBool>,
+    ) {
         let mut states = self.0.lock();
         states.retain(|m| m.state.strong_count() > 0);
+        debug_assert!(
+            !states
+                .iter()
+                .any(|mounted| mounted.state.ptr_eq(&Arc::downgrade(state))),
+            "an inode state must be registered exactly once"
+        );
         states.push(MountedState {
+            mountpoint: mountpoint.to_path_buf(),
             state: Arc::downgrade(state),
             notifier,
+            session_live,
         });
     }
 
@@ -565,8 +593,37 @@ impl StateRegistry {
         states.retain(|m| m.state.strong_count() > 0);
         states
             .iter()
-            .filter_map(|m| Some((m.state.upgrade()?, m.notifier.clone())))
+            .filter_map(|m| {
+                Some((
+                    m.mountpoint.clone(),
+                    m.state.upgrade()?,
+                    m.notifier.clone(),
+                    m.session_live.clone(),
+                ))
+            })
             .collect()
+    }
+
+    /// The live session whose local root most specifically covers `path`.
+    ///
+    /// On-demand roots can be nested below another location. Selecting by the
+    /// longest component prefix ensures the nested session wins rather than the
+    /// broader primary mount. Callers currently need the selected mount only;
+    /// a future path router can derive a relative suffix with
+    /// `path.strip_prefix(mountpoint)` without storing a second path value here.
+    fn covering(&self, path: &Path) -> Option<LiveMount> {
+        self.live()
+            .into_iter()
+            .filter(|(mountpoint, _, _, live)| {
+                live.load(Ordering::Acquire) && path.starts_with(mountpoint)
+            })
+            .max_by_key(|(mountpoint, _, _, _)| mountpoint.components().count())
+    }
+
+    fn is_mounted_at(&self, path: &Path) -> bool {
+        self.covering(path).is_some_and(|(mountpoint, _, _, live)| {
+            mountpoint == path && live.load(Ordering::Acquire)
+        })
     }
 
     /// Whether any live inode space owns and currently exposes `uid`.
@@ -578,7 +635,8 @@ impl StateRegistry {
     fn owns_visible_uid(&self, uid: &NodeUid) -> bool {
         self.live()
             .into_iter()
-            .any(|(state, _)| state.lock().owns_visible_uid(uid))
+            .filter(|(_, _, _, live)| live.load(Ordering::Acquire))
+            .any(|(_, state, _, _)| state.lock().owns_visible_uid(uid))
     }
 }
 
@@ -589,6 +647,9 @@ impl StateRegistry {
 enum SwitchBlocked {
     /// The folder is mid-pass, or not yet safe to switch. Try again after a pass.
     NotNow,
+    /// A queued target was canceled or replaced before the folder lock became
+    /// available. The newer intent owns the next transition.
+    Superseded,
     /// The switch was attempted and broke.
     Failed(String),
 }
@@ -596,8 +657,13 @@ enum SwitchBlocked {
 impl Core {
     /// Register an inode space so background work can reach it. Called once for
     /// the primary mount and once per on-demand fork.
-    fn register_state(&self) {
-        self.states.register(&self.state, self.notifier.clone());
+    fn register_state(&self, mountpoint: &Path) {
+        self.states.register(
+            mountpoint,
+            &self.state,
+            self.notifier.clone(),
+            self.session_live.clone(),
+        );
     }
 
     /// Run `apply` against every live inode space — this daemon's primary mount
@@ -610,7 +676,7 @@ impl Core {
     /// to all of them is correct because a uid is unique across mounts — at most
     /// one state has an entry for it, and the rest are no-ops.
     fn for_each_state(&self, mut apply: impl FnMut(&mut State)) {
-        for (state, notifier) in self.states.live() {
+        for (_, state, notifier, _) in self.states.live() {
             let changed = {
                 let mut state = state.lock();
                 apply(&mut state);
@@ -627,7 +693,7 @@ impl Core {
     /// `None` for a mount whose session has not been spawned yet — there is
     /// nothing to invalidate in a kernel that has never been told about it.
     fn for_each_mount(&self, mut apply: impl FnMut(&mut State, Option<&Notifier>)) {
-        for (state, notifier) in self.states.live() {
+        for (_, state, notifier, _) in self.states.live() {
             apply(&mut state.lock(), notifier.get());
         }
     }
@@ -660,7 +726,7 @@ impl Core {
                 live_access.push(access);
             }
         }
-        for (state, _) in self.states.live() {
+        for (_, state, _, _) in self.states.live() {
             if Arc::ptr_eq(&state, &self.state) {
                 continue;
             }
@@ -1152,6 +1218,7 @@ impl Core {
                     // exactly this.
                     self.wake_drain();
                     info!("back online");
+                    self.repair_primary_share_id(&root.uid);
                     return;
                 }
                 Err(e) => {
@@ -4627,6 +4694,10 @@ mod tests {
     use pdfs_core::cache::{Baseline, StagedWrite};
     use pdfs_core::db::{OP_REVISION, OP_TRASH, PendingOp};
 
+    fn session_flag(live: bool) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(live))
+    }
+
     /// The registry every mount publishes itself into is what lets the daemon's
     /// single drain thread reach a node living in an on-demand fork's inode
     /// space. A fork missing from it reads as an empty file for the life of the
@@ -4644,8 +4715,17 @@ mod tests {
         let primary = std::sync::Arc::new(parking_lot::Mutex::new(primary));
         let fork_a = std::sync::Arc::new(parking_lot::Mutex::new(fork_a));
         let fork_b = std::sync::Arc::new(parking_lot::Mutex::new(fork_b));
-        for state in [&primary, &fork_a, &fork_b] {
-            registry.register(state, std::sync::Arc::new(std::sync::OnceLock::new()));
+        for (mountpoint, state) in [
+            ("/mnt/primary", &primary),
+            ("/mnt/fork-a", &fork_a),
+            ("/mnt/fork-b", &fork_b),
+        ] {
+            registry.register(
+                std::path::Path::new(mountpoint),
+                state,
+                std::sync::Arc::new(std::sync::OnceLock::new()),
+                session_flag(false),
+            );
         }
         assert_eq!(registry.live().len(), 3, "every registered mount is walked");
 
@@ -4675,6 +4755,113 @@ mod tests {
     }
 
     #[test]
+    fn state_registry_covering_uses_longest_prefix_and_ignores_dead_forks() {
+        let registry = StateRegistry::default();
+        let (primary, _primary_dir) = rooted_state("primary-volume", "primary");
+        let (nested, _nested_dir) = rooted_state("nested-volume", "nested");
+        let (sibling, _sibling_dir) = rooted_state("sibling-volume", "sibling");
+        let primary_uid = primary.entries[&super::ROOT_INO].uid.clone();
+        let primary = std::sync::Arc::new(parking_lot::Mutex::new(primary));
+        let nested = std::sync::Arc::new(parking_lot::Mutex::new(nested));
+        let sibling = std::sync::Arc::new(parking_lot::Mutex::new(sibling));
+        let primary_path = std::path::Path::new("/home/me/ProtonDrive");
+        let nested_path = std::path::Path::new("/home/me/ProtonDrive/Device");
+        let sibling_path = std::path::Path::new("/home/me/Archive");
+        let primary_live = session_flag(false);
+        let nested_live = session_flag(false);
+        let sibling_live = session_flag(true);
+
+        registry.register(
+            primary_path,
+            &primary,
+            std::sync::Arc::new(std::sync::OnceLock::new()),
+            primary_live.clone(),
+        );
+        registry.register(
+            nested_path,
+            &nested,
+            std::sync::Arc::new(std::sync::OnceLock::new()),
+            nested_live.clone(),
+        );
+        registry.register(
+            sibling_path,
+            &sibling,
+            std::sync::Arc::new(std::sync::OnceLock::new()),
+            sibling_live,
+        );
+        assert_eq!(registry.live().len(), 3);
+        assert!(!registry.is_mounted_at(primary_path));
+        assert!(!registry.is_mounted_at(nested_path));
+        assert!(
+            !registry.owns_visible_uid(&primary_uid),
+            "an unspawned session must not authorize resident uids"
+        );
+        assert!(
+            registry
+                .covering(&nested_path.join("folder/file.txt"))
+                .is_none(),
+            "a registered but unspawned session must not win path covering"
+        );
+        primary_live.store(true, std::sync::atomic::Ordering::Release);
+        nested_live.store(true, std::sync::atomic::Ordering::Release);
+        assert!(registry.owns_visible_uid(&primary_uid));
+
+        let (covering, covering_state, _, _) = registry
+            .covering(&nested_path.join("folder/file.txt"))
+            .unwrap();
+        assert_eq!(covering, nested_path);
+        assert!(std::sync::Arc::ptr_eq(&covering_state, &nested));
+        drop(covering_state);
+        let (covering, _, _, _) = registry.covering(nested_path).unwrap();
+        assert_eq!(covering, nested_path, "an exact mountpoint covers itself");
+        let (covering, _, _, _) = registry
+            .covering(std::path::Path::new("/home/me/ProtonDrive/Device/folder/"))
+            .unwrap();
+        assert_eq!(
+            covering, nested_path,
+            "a trailing separator does not change component-prefix selection"
+        );
+        let (covering, _, _, _) = registry
+            .covering(std::path::Path::new(
+                "/home/me/ProtonDrive/DeviceBackup/file",
+            ))
+            .unwrap();
+        assert_eq!(
+            covering, primary_path,
+            "/Device must not string-prefix-match /DeviceBackup"
+        );
+        let (covering, covering_state, _, _) =
+            registry.covering(&sibling_path.join("file")).unwrap();
+        assert_eq!(covering, sibling_path);
+        assert!(std::sync::Arc::ptr_eq(&covering_state, &sibling));
+        assert!(
+            registry
+                .covering(std::path::Path::new("/home/me/ProtonDriveBackup/file"))
+                .is_none(),
+            "/ProtonDrive must not string-prefix-match /ProtonDriveBackup"
+        );
+        assert!(
+            registry
+                .covering(std::path::Path::new("/tmp/outside"))
+                .is_none(),
+            "an outside path has no covering mount"
+        );
+        assert!(registry.is_mounted_at(primary_path));
+        assert!(registry.is_mounted_at(nested_path));
+        assert!(
+            !registry.is_mounted_at(&nested_path.join("folder")),
+            "a path covered by a session is not itself a mountpoint"
+        );
+
+        // This is also the failed-fork case: the caller registered the fork,
+        // session construction failed, and its last strong `Core`/state handle
+        // was dropped. It must not make ListLocations report mounted.
+        drop(nested);
+        assert!(!registry.is_mounted_at(nested_path));
+        assert_eq!(registry.live().len(), 2);
+    }
+
+    #[test]
     fn state_registry_resolves_uids_from_any_resident_mount() {
         let registry = StateRegistry::default();
         let (primary, _primary_dir) = rooted_state("primary-volume", "primary");
@@ -4687,8 +4874,18 @@ mod tests {
         fork.children.insert(super::ROOT_INO, vec![fork_ino]);
         let primary = std::sync::Arc::new(parking_lot::Mutex::new(primary));
         let fork = std::sync::Arc::new(parking_lot::Mutex::new(fork));
-        registry.register(&primary, std::sync::Arc::new(std::sync::OnceLock::new()));
-        registry.register(&fork, std::sync::Arc::new(std::sync::OnceLock::new()));
+        registry.register(
+            std::path::Path::new("/mnt/primary"),
+            &primary,
+            std::sync::Arc::new(std::sync::OnceLock::new()),
+            session_flag(true),
+        );
+        registry.register(
+            std::path::Path::new("/mnt/device"),
+            &fork,
+            std::sync::Arc::new(std::sync::OnceLock::new()),
+            session_flag(true),
+        );
 
         assert!(registry.owns_visible_uid(&primary_uid));
         assert!(registry.owns_visible_uid(&fork_uid));
@@ -4711,7 +4908,12 @@ mod tests {
         let child_ino = state.intern(super::ROOT_INO, child_node);
         state.children.insert(super::ROOT_INO, vec![child_ino]);
         let state = std::sync::Arc::new(parking_lot::Mutex::new(state));
-        registry.register(&state, std::sync::Arc::new(std::sync::OnceLock::new()));
+        registry.register(
+            std::path::Path::new("/mnt/device"),
+            &state,
+            std::sync::Arc::new(std::sync::OnceLock::new()),
+            session_flag(true),
+        );
 
         assert!(registry.owns_visible_uid(&child_uid));
 
@@ -4769,7 +4971,12 @@ mod tests {
         );
 
         let state = std::sync::Arc::new(parking_lot::Mutex::new(state));
-        registry.register(&state, std::sync::Arc::new(std::sync::OnceLock::new()));
+        registry.register(
+            std::path::Path::new("/mnt/device"),
+            &state,
+            std::sync::Arc::new(std::sync::OnceLock::new()),
+            session_flag(true),
+        );
         assert!(
             registry.owns_visible_uid(&child_uid),
             "the absent listing remains unknown until refresh, so a valid resident uid is allowed"
@@ -5015,7 +5222,12 @@ mod tests {
         state.children.insert(revoked_ino, vec![child_ino]);
 
         let state = std::sync::Arc::new(parking_lot::Mutex::new(state));
-        registry.register(&state, std::sync::Arc::new(std::sync::OnceLock::new()));
+        registry.register(
+            std::path::Path::new("/mnt/device"),
+            &state,
+            std::sync::Arc::new(std::sync::OnceLock::new()),
+            session_flag(true),
+        );
         assert!(registry.owns_visible_uid(&open_uid));
         assert!(registry.owns_visible_uid(&child_uid));
 
@@ -5064,7 +5276,12 @@ mod tests {
         state.children.insert(cycle_b, vec![cycle_a]);
 
         let state = std::sync::Arc::new(parking_lot::Mutex::new(state));
-        registry.register(&state, std::sync::Arc::new(std::sync::OnceLock::new()));
+        registry.register(
+            std::path::Path::new("/mnt/device"),
+            &state,
+            std::sync::Arc::new(std::sync::OnceLock::new()),
+            session_flag(true),
+        );
 
         assert!(
             !registry.owns_visible_uid(&foreign_uid),

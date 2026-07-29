@@ -1323,15 +1323,17 @@ fn migration_v17_adds_share_access_to_a_v16_fixture() {
             .as_nanos()
     ));
     {
-        // V17 only adds `share_access`, so removing it and restoring the version
-        // stamp produces the exact schema a released V16 database had.
+        // Remove the later tables too, so restoring the version stamp produces
+        // the exact schema a released V16 database had.
         let db = Db::open(&path).unwrap();
         db.set_state_str("fixture_value", "survives").unwrap();
     }
     {
         let conn = rusqlite::Connection::open(&path).unwrap();
         conn.execute_batch(
-            "DROP TABLE share_access;
+            "DROP TRIGGER mount_sync_folder_insert;
+             DROP TABLE mount;
+             DROP TABLE share_access;
              UPDATE sync_state SET value = '16' WHERE key = 'schema_version';",
         )
         .unwrap();
@@ -1347,11 +1349,209 @@ fn migration_v17_adds_share_access_to_a_v16_fixture() {
     assert_eq!(db.share_access(&root).unwrap(), Some(crate::Access::Viewer));
     assert_eq!(
         db.state_str("schema_version").unwrap().as_deref(),
-        Some("17")
+        Some("18")
     );
 
     drop(db);
     let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn migration_v18_projects_v17_sync_folders_and_cascades_deletes() {
+    let path = std::env::temp_dir().join(format!(
+        "pdfs-db-v17-fixture-{}-{}.db",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    {
+        // Pin the released V17 shape that V18 reads instead of deriving a
+        // fixture from today's head schema and dropping newer objects.
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE sync_state (key TEXT PRIMARY KEY, value TEXT);
+             INSERT INTO sync_state VALUES ('schema_version', '17');
+             INSERT INTO sync_state VALUES ('fixture_value', 'survives');
+             CREATE TABLE sync_folder (
+               id              INTEGER PRIMARY KEY,
+               local_path      TEXT NOT NULL UNIQUE,
+               remote_uid      TEXT NOT NULL,
+               remote_share_id TEXT NOT NULL,
+               mode            TEXT NOT NULL DEFAULT 'mirror',
+               state           TEXT NOT NULL DEFAULT 'idle',
+               last_sync       INTEGER NOT NULL DEFAULT 0,
+               pending_mode    TEXT
+             );
+             CREATE TABLE sync_entry (
+               folder_id   INTEGER NOT NULL,
+               rel_path    TEXT NOT NULL,
+               remote_uid  TEXT,
+               local_mtime INTEGER NOT NULL DEFAULT 0,
+               local_size  INTEGER NOT NULL DEFAULT 0,
+               remote_hash TEXT,
+               remote_rev  TEXT,
+               PRIMARY KEY (folder_id, rel_path)
+             );
+             INSERT INTO sync_folder
+               (id, local_path, remote_uid, remote_share_id, mode, state, last_sync)
+             VALUES
+               (41, '/home/me/Existing', 'vol~existing', 'share-existing',
+                'ondemand', 'syncing', 123);
+             CREATE TABLE share_access (
+               root_uid TEXT PRIMARY KEY,
+               access   TEXT NOT NULL
+                        CHECK (access IN ('owner', 'editor', 'viewer', 'unknown'))
+             );",
+        )
+        .unwrap();
+    }
+
+    let db = Db::open(&path).unwrap();
+    let existing = 41;
+    let locations = db.mount_list().unwrap();
+    assert_eq!(locations.len(), 1);
+    let projected = &locations[0];
+    assert!(matches!(
+        projected.kind,
+        crate::mounts::MountKind::Device {
+            sync_folder_id
+        } if sync_folder_id == existing
+    ));
+    assert_eq!(projected.local_path, "/home/me/Existing");
+    assert_eq!(projected.mode, crate::mounts::MountMode::OnDemand);
+    assert_eq!(projected.state, "syncing");
+    assert_eq!(projected.last_sync, 123);
+    assert_eq!(
+        db.state_str("fixture_value").unwrap().as_deref(),
+        Some("survives")
+    );
+
+    let added = db
+        .sync_folder_add("/home/me/New", "vol~new", "share-new")
+        .unwrap();
+    assert_eq!(db.mount_list().unwrap().len(), 2);
+    assert!(db.sync_folder_remove(added).unwrap());
+    assert_eq!(
+        db.mount_list().unwrap().len(),
+        1,
+        "the V18 foreign key must remove the device projection"
+    );
+    assert_eq!(
+        db.state_str("schema_version").unwrap().as_deref(),
+        Some("18")
+    );
+
+    drop(db);
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn my_files_projection_retains_share_id_only_for_the_same_root() {
+    let db = Db::open_in_memory().unwrap();
+    let id = db
+        .mount_upsert_my_files("/home/me/ProtonDrive", "vol~root", Some("share-main"))
+        .unwrap();
+    let same_id = db
+        .mount_upsert_my_files("/mnt/proton", "vol~root", None)
+        .unwrap();
+    assert_eq!(same_id, id);
+    assert_eq!(db.mount_list().unwrap()[0].root_share_id, "share-main");
+
+    db.mount_upsert_my_files("/mnt/proton", "vol~root-new", None)
+        .unwrap();
+
+    let locations = db.mount_list().unwrap();
+    assert_eq!(locations.len(), 1);
+    assert!(matches!(
+        locations[0].kind,
+        crate::mounts::MountKind::MyFiles
+    ));
+    assert_eq!(locations[0].local_path, "/mnt/proton");
+    assert_eq!(locations[0].root_uid, "vol~root-new");
+    assert_eq!(
+        locations[0].root_share_id, "",
+        "a share id must never be paired with a different root uid"
+    );
+}
+
+#[test]
+fn my_files_share_id_repair_is_conditional_on_root_uid() {
+    let db = Db::open_in_memory().unwrap();
+    db.mount_upsert_my_files("/mnt/proton", "vol~root", None)
+        .unwrap();
+
+    assert!(
+        !db.mount_repair_my_files_share_id("vol~stale", "share-stale")
+            .unwrap()
+    );
+    assert_eq!(db.mount_list().unwrap()[0].root_share_id, "");
+
+    assert!(
+        db.mount_repair_my_files_share_id("vol~root", "share-current")
+            .unwrap()
+    );
+    assert_eq!(db.mount_list().unwrap()[0].root_share_id, "share-current");
+}
+
+#[test]
+fn mount_constraints_reject_malformed_kinds_and_missing_sync_folders() {
+    let db = Db::open_in_memory().unwrap();
+    let conn = db.conn.lock();
+
+    assert!(
+        conn.execute(
+            "INSERT INTO mount (kind, local_path, root_uid)
+             VALUES ('device', '/tmp/device', 'vol~device')",
+            [],
+        )
+        .is_err(),
+        "a device projection without sync_folder_id must fail its CHECK"
+    );
+    assert!(
+        conn.execute(
+            "INSERT INTO mount (kind, sync_folder_id)
+             VALUES ('device', 999999)",
+            [],
+        )
+        .is_err(),
+        "a device projection cannot reference a missing sync folder"
+    );
+    assert!(
+        conn.execute(
+            "INSERT INTO mount (kind, share_root_uid, local_path, root_uid)
+             VALUES ('myfiles', 'vol~shared', '/tmp/root', 'vol~root')",
+            [],
+        )
+        .is_err(),
+        "kind-specific columns must not be mixed"
+    );
+}
+
+#[test]
+fn deleting_a_device_projection_does_not_delete_its_sync_folder() {
+    let db = Db::open_in_memory().unwrap();
+    let folder_id = db
+        .sync_folder_add("/home/me/Keep", "vol~keep", "share-keep")
+        .unwrap();
+    {
+        let conn = db.conn.lock();
+        assert_eq!(
+            conn.execute(
+                "DELETE FROM mount WHERE kind = 'device' AND sync_folder_id = ?1",
+                [folder_id],
+            )
+            .unwrap(),
+            1
+        );
+    }
+
+    assert!(db.sync_folder_get(folder_id).unwrap().is_some());
+    assert!(
+        db.mount_list().unwrap().is_empty(),
+        "the foreign key direction must not recreate or delete sync authority"
+    );
 }
 
 #[test]
@@ -1951,6 +2151,56 @@ fn pending_mode_is_queued_until_the_mode_is_reached() {
     let folder = db.sync_folder_get(id).unwrap().unwrap();
     assert_eq!(folder.mode, "ondemand");
     assert_eq!(folder.pending_mode, None);
+}
+
+#[test]
+fn mode_commit_clears_only_the_intent_it_satisfies() {
+    let db = Db::open_in_memory().unwrap();
+    let id = db
+        .sync_folder_add("/tmp/pdfs-mode-intent", "vol~folder", "share")
+        .unwrap();
+
+    db.sync_folder_set_pending_mode(id, Some("ondemand"))
+        .unwrap();
+    db.sync_folder_set_mode(id, "ondemand").unwrap();
+    assert_eq!(db.sync_folder_get(id).unwrap().unwrap().pending_mode, None);
+
+    db.sync_folder_set_pending_mode(id, Some("mirror")).unwrap();
+    db.sync_folder_set_mode(id, "ondemand").unwrap();
+    assert_eq!(
+        db.sync_folder_get(id)
+            .unwrap()
+            .unwrap()
+            .pending_mode
+            .as_deref(),
+        Some("mirror")
+    );
+}
+
+#[test]
+fn clearing_a_stale_pending_mode_preserves_the_newer_intent() {
+    let db = Db::open_in_memory().unwrap();
+    let id = db
+        .sync_folder_add("/tmp/pdfs-pending", "vol~folder", "share")
+        .unwrap();
+    db.sync_folder_set_pending_mode(id, Some("ondemand"))
+        .unwrap();
+    db.sync_folder_set_pending_mode(id, Some("mirror")).unwrap();
+
+    assert!(
+        !db.sync_folder_clear_pending_mode_if(id, "ondemand")
+            .unwrap()
+    );
+    assert_eq!(
+        db.sync_folder_get(id)
+            .unwrap()
+            .unwrap()
+            .pending_mode
+            .as_deref(),
+        Some("mirror")
+    );
+    assert!(db.sync_folder_clear_pending_mode_if(id, "mirror").unwrap());
+    assert_eq!(db.sync_folder_get(id).unwrap().unwrap().pending_mode, None);
 }
 
 #[test]

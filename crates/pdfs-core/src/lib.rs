@@ -10,6 +10,7 @@ pub mod control;
 pub mod db;
 pub mod error;
 pub mod localindex;
+pub mod mounts;
 pub mod profile;
 pub mod search;
 pub mod service;

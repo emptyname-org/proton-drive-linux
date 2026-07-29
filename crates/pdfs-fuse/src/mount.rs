@@ -28,10 +28,101 @@ pub(crate) fn is_stale_mount(path: &Path) -> bool {
     )
 }
 
-/// A secondary (on-demand sync folder) FUSE session, paired with its FUSE
-/// connection id so teardown can abort a mid-transfer connection rather than
-/// block on it. See [`Core::mounts`] and [`umount_session_unblocked`].
-pub(super) type SecondaryMount = (BackgroundSession, Option<u32>);
+/// A secondary (on-demand sync folder) FUSE session and the exact liveness flag
+/// published with its forked inode state.
+///
+/// Keeping these together makes every teardown mark the fork unroutable before
+/// unmounting, including paths that can block on an in-flight FUSE request.
+pub(super) struct SecondaryMount {
+    session: BackgroundSession,
+    conn: Option<u32>,
+    session_live: Arc<AtomicBool>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum SecondaryInsertRejection {
+    Closed,
+    Duplicate,
+}
+
+/// Secondary sessions and the daemon-wide gate controlling whether newly
+/// spawned sessions may become visible. The gate and map share one lock so
+/// shutdown cannot race an insertion between checking and publishing.
+pub(super) struct SecondaryMountRegistry<T> {
+    accepting: bool,
+    entries: HashMap<i64, T>,
+}
+
+impl<T> Default for SecondaryMountRegistry<T> {
+    fn default() -> Self {
+        Self {
+            accepting: false,
+            entries: HashMap::new(),
+        }
+    }
+}
+
+impl<T> SecondaryMountRegistry<T> {
+    pub(super) fn open(&mut self) {
+        self.accepting = true;
+    }
+
+    pub(super) fn is_accepting(&self) -> bool {
+        self.accepting
+    }
+
+    pub(super) fn close(&mut self) {
+        self.accepting = false;
+    }
+
+    pub(super) fn insert(
+        &mut self,
+        id: i64,
+        mount: T,
+    ) -> Result<(), (SecondaryInsertRejection, T)> {
+        if !self.accepting {
+            return Err((SecondaryInsertRejection::Closed, mount));
+        }
+        if self.entries.contains_key(&id) {
+            return Err((SecondaryInsertRejection::Duplicate, mount));
+        }
+        self.entries.insert(id, mount);
+        Ok(())
+    }
+
+    pub(super) fn remove(&mut self, id: &i64) -> Option<T> {
+        self.entries.remove(id)
+    }
+
+    pub(super) fn contains_key(&self, id: &i64) -> bool {
+        self.entries.contains_key(id)
+    }
+
+    pub(super) fn close_and_drain(&mut self) -> Vec<(i64, T)> {
+        self.close();
+        self.entries.drain().collect()
+    }
+}
+
+impl SecondaryMount {
+    pub(super) fn new(
+        session: BackgroundSession,
+        conn: Option<u32>,
+        session_live: Arc<AtomicBool>,
+    ) -> Self {
+        Self {
+            session,
+            conn,
+            session_live,
+        }
+    }
+
+    pub(super) fn teardown(self) -> std::io::Result<()> {
+        teardown_session(&self.session_live, || {
+            umount_session_unblocked(self.session, self.conn)
+        })
+    }
+}
 
 /// The kernel's id for the FUSE connection backing the mount at `mountpoint` —
 /// the directory name under `/sys/fs/fuse/connections`, which is the minor
@@ -152,6 +243,71 @@ pub struct MountOptions {
     pub sweep_mode: SweepMode,
 }
 
+/// Spawn one FUSE session rooted at an arbitrary remote node.
+///
+/// Primary My Files and secondary on-demand device locations use this same
+/// construction path so mount options, stale-mount recovery, registry
+/// liveness, and notifier ownership cannot drift apart. Each caller owns its
+/// state/path registration and performs it exactly once before calling here.
+pub(super) fn spawn_session(
+    core: &Core,
+    mountpoint: &Path,
+    root: Node,
+) -> std::io::Result<BackgroundSession> {
+    let mut config = Config::default();
+    config.mount_options = vec![
+        MountOption::FSName("protondrive".to_string()),
+        MountOption::Subtype("protondrive".to_string()),
+        MountOption::DefaultPermissions,
+    ];
+
+    clear_stale_mount(mountpoint);
+    info!(mountpoint = %mountpoint.display(), "mounting Proton Drive location");
+    let fs = ProtonFs::new(core.clone(), root);
+    if core.primary {
+        // Only My Files rehydrates the daemon-wide node cache. A secondary
+        // inode space is rooted at one device subtree and must not import every
+        // unrelated persisted node.
+        core.hydrate();
+    }
+    let session = Session::new(fs, mountpoint, &config)?.spawn()?;
+    let _ = core.notifier.set(session.notifier());
+    core.session_live.store(true, Ordering::Release);
+    Ok(session)
+}
+
+/// Make a session unroutable before beginning any teardown that may block.
+fn teardown_session<T>(session_live: &AtomicBool, teardown: impl FnOnce() -> T) -> T {
+    session_live.store(false, Ordering::Release);
+    teardown()
+}
+
+impl Core {
+    /// Resolve the primary share id away from startup and publish it only if the
+    /// projected root has not changed while the request was in flight.
+    pub(crate) fn repair_primary_share_id(&self, root_uid: &NodeUid) {
+        match self.rt.block_on(self.client.context_share_id(root_uid)) {
+            Ok(share_id) => {
+                match self
+                    .db
+                    .mount_repair_my_files_share_id(&root_uid.to_string(), &share_id.to_string())
+                {
+                    Ok(true) => debug!(%root_uid, "repaired My Files share id"),
+                    Ok(false) => {
+                        debug!(%root_uid, "discarded stale My Files share-id result");
+                    }
+                    Err(error) => {
+                        warn!(%root_uid, error = %error, "persist My Files share id failed");
+                    }
+                }
+            }
+            Err(error) => {
+                debug!(%root_uid, error = %error, "resolve My Files share id failed");
+            }
+        }
+    }
+}
+
 /// Mount the filesystem at `mountpoint` and block until it is unmounted or the
 /// daemon is asked to stop.
 ///
@@ -179,6 +335,8 @@ pub fn mount(
     } = options;
     let (root, online) = fetch_or_recall_root(&client, &rt, &db)?;
     let scope = root.tree_event_scope_id();
+    db.mount_upsert_my_files(&mountpoint.to_string_lossy(), &root.uid.to_string(), None)
+        .map_err(|error| std::io::Error::other(format!("project My Files mount: {error}")))?;
     let share_access = db
         .all_share_access()
         .map_err(|error| std::io::Error::other(format!("load shared access: {error}")))?;
@@ -228,17 +386,18 @@ pub fn mount(
         no_thumbnail: Arc::new(Mutex::new(HashMap::new())),
         size_upgrades: Arc::new(Mutex::new(HashMap::new())),
         notifier: Arc::new(OnceLock::new()),
+        session_live: Arc::new(AtomicBool::new(false)),
         transfers: TransferRegistry::new(),
         indexing: Arc::new(AtomicBool::new(false)),
         sync_progress: Arc::new(Mutex::new(HashMap::new())),
         sync_tx,
-        mounts: Arc::new(Mutex::new(HashMap::new())),
+        mounts: Arc::new(Mutex::new(SecondaryMountRegistry::default())),
         sync_locks: Arc::new(Mutex::new(HashMap::new())),
         states: Arc::new(StateRegistry::default()),
     };
     // Before anything can queue work against it: the drain thread below reaches
     // every mount's inode space through this registry, not through `core.state`.
-    core.register_state();
+    core.register_state(mountpoint);
 
     // Writes queued by a previous run (or left behind by a crash) are still owed
     // an upload, and reads must be served from their staged blobs until they land.
@@ -282,16 +441,6 @@ pub fn mount(
             .spawn(move || core.run_online_probe())?;
     }
 
-    // Re-establish on-demand mounts left over from a previous run (devices.md
-    // Phase 4). On its own thread: each remount fetches a remote node, and we
-    // must not block the main mount below on the network.
-    {
-        let core = core.clone();
-        std::thread::Builder::new()
-            .name("pdfs-restore-ondemand".into())
-            .spawn(move || core.restore_ondemand_mounts())?;
-    }
-
     // Keep the launcher prompt's "This computer" index fresh. Its own thread:
     // the walk is I/O-heavy and must never sit in front of a FUSE callback.
     {
@@ -303,18 +452,6 @@ pub fn mount(
             .name("pdfs-localindex".into())
             .spawn(move || run_local_index(db, indexing, transfers, mountpoint))?;
     }
-
-    let mut config = Config::default();
-    config.mount_options = vec![
-        MountOption::FSName("protondrive".to_string()),
-        MountOption::Subtype("protondrive".to_string()),
-        MountOption::DefaultPermissions,
-    ];
-
-    // A crashed previous run can leave the kernel mount in place, which makes
-    // the fresh mount below fail with EBUSY. Lazily detach any leftover first.
-    clear_stale_mount(mountpoint);
-    info!(mountpoint = %mountpoint.display(), "mounting Proton Drive");
 
     // Bind the control socket before the FUSE session takes over the thread. A
     // stale socket file from a previous run would block the bind, so clear it.
@@ -332,32 +469,70 @@ pub fn mount(
             "control socket permissions: {e}"
         )));
     }
-    {
-        let core = core.clone();
-        let username = username.clone();
-        let mountpoint = mountpoint.to_path_buf();
-        std::thread::Builder::new()
-            .name("pdfs-control".into())
-            .spawn(move || run_control_socket(core, username, mountpoint, listener))?;
-    }
-
-    let fs = ProtonFs::new(core.clone(), root);
-    // Warm the in-memory maps from the DB so a cold start serves previously
-    // seen metadata without re-hitting the API (plan.md P1).
-    core.hydrate();
-
-    // Build the session explicitly (not `mount2`) so we can grab a `Notifier`
-    // for the event task. `spawn` runs the session loop on its own background
-    // thread; we then wait here for either a stop signal or the mount ending.
-    let bg = Session::new(fs, mountpoint, &config)?.spawn()?;
+    // Do not accept control requests until `spawn_session` has transitioned the
+    // primary registration to live. The listener may queue a connection during
+    // this short window, but its handler cannot observe `mounted = false`.
+    let bg = match spawn_session(&core, mountpoint, root) {
+        Ok(session) => session,
+        Err(error) => {
+            let _ = std::fs::remove_file(control_socket);
+            return Err(error);
+        }
+    };
+    core.mounts.lock().open();
     // The connection id, captured now while the mount is live, so a stop signal
     // mid-transfer can abort it rather than block `join` (see `abort_fuse_connection`).
     let main_conn = fuse_connection_id(mountpoint);
-    let notifier = bg.notifier();
-    // Same channel, kept on the `Core` so background work (a size upgrade, say)
-    // can invalidate kernel-cached metadata without threading a handle through.
-    let _ = core.notifier.set(notifier.clone());
+    {
+        let control_core = core.clone();
+        let username = username.clone();
+        let mountpoint = mountpoint.to_path_buf();
+        if let Err(error) = std::thread::Builder::new()
+            .name("pdfs-control".into())
+            .spawn(move || run_control_socket(control_core, username, mountpoint, listener))
+        {
+            let secondaries = core.mounts.lock().close_and_drain();
+            for (id, mount) in secondaries {
+                if let Err(unmount_error) = mount.teardown() {
+                    warn!(id, error = %unmount_error, "secondary teardown after control startup failure failed");
+                }
+            }
+            if let Err(unmount_error) = teardown_session(&core.session_live, || {
+                umount_session_unblocked(bg, main_conn)
+            }) {
+                warn!(error = %unmount_error, "unmount after control startup failure failed");
+            }
+            let _ = std::fs::remove_file(control_socket);
+            return Err(error);
+        }
+    }
+    // Re-establish on-demand mounts only after the primary session is live.
+    // Keep the worker so shutdown can close publication, wait for any in-flight
+    // fetch to observe that closure, and then drain a stable registry.
+    let restore_worker = {
+        let restore_core = core.clone();
+        match std::thread::Builder::new()
+            .name("pdfs-restore-ondemand".into())
+            .spawn(move || restore_core.restore_ondemand_mounts())
+        {
+            Ok(worker) => Some(worker),
+            Err(error) => {
+                warn!(%error, "start on-demand restore worker failed");
+                None
+            }
+        }
+    };
     rt.spawn(run_event_sync(client, scope, core.clone()));
+    if online {
+        let repair_core = core.clone();
+        let root_uid = core.primary_root_uid.clone();
+        if let Err(error) = std::thread::Builder::new()
+            .name("pdfs-share-id".into())
+            .spawn(move || repair_core.repair_primary_share_id(&root_uid))
+        {
+            warn!(%error, "start My Files share-id repair failed");
+        }
+    }
 
     // Stop signals (SIGTERM from `systemctl --user stop`, SIGINT from Ctrl-C)
     // are delivered onto the async runtime; bridge them onto a sync channel so
@@ -396,7 +571,10 @@ pub fn mount(
         match sig_rx.recv_timeout(Duration::from_millis(500)) {
             Ok(()) => {
                 info!("stop requested; unmounting");
-                if let Err(e) = umount_session_unblocked(bg, main_conn) {
+                core.mounts.lock().close();
+                if let Err(e) = teardown_session(&core.session_live, || {
+                    umount_session_unblocked(bg, main_conn)
+                }) {
                     warn!(error = %e, "umount_and_join failed");
                 }
                 break MountOutcome::Shutdown;
@@ -404,7 +582,8 @@ pub fn mount(
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                 if bg.guard.is_finished() {
                     info!("mount ended externally");
-                    if let Err(e) = bg.join() {
+                    core.mounts.lock().close();
+                    if let Err(e) = teardown_session(&core.session_live, || bg.join()) {
                         warn!(error = %e, "session join failed");
                     }
                     break MountOutcome::Unmounted;
@@ -412,7 +591,8 @@ pub fn mount(
             }
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                 // Signal task gone (failed to install); fall back to join.
-                let _ = bg.join();
+                core.mounts.lock().close();
+                let _ = teardown_session(&core.session_live, || bg.join());
                 break MountOutcome::Unmounted;
             }
         }
@@ -420,13 +600,56 @@ pub fn mount(
 
     // Unmount every on-demand sync folder too, or the kernel mounts linger as
     // stale and the next start fails with EBUSY (devices.md Phase 3).
-    let secondaries: Vec<_> = core.mounts.lock().drain().collect();
-    for (id, (session, conn)) in secondaries {
-        if let Err(e) = umount_session_unblocked(session, conn) {
+    if let Some(worker) = restore_worker
+        && worker.join().is_err()
+    {
+        warn!("on-demand restore worker panicked");
+    }
+    let secondaries = core.mounts.lock().close_and_drain();
+    for (id, mount) in secondaries {
+        if let Err(e) = mount.teardown() {
             warn!(id, error = %e, "unmount on-demand folder failed");
         }
     }
 
     let _ = std::fs::remove_file(control_socket);
     Ok(outcome)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use super::{SecondaryInsertRejection, SecondaryMountRegistry, teardown_session};
+
+    #[test]
+    fn session_is_unroutable_before_teardown_starts() {
+        let live = AtomicBool::new(true);
+        teardown_session(&live, || {
+            assert!(
+                !live.load(Ordering::Acquire),
+                "teardown must never run while the registry still reports mounted"
+            );
+        });
+    }
+
+    #[test]
+    fn secondary_registry_rejects_closed_and_duplicate_insertions() {
+        let mut mounts = SecondaryMountRegistry::default();
+        assert_eq!(
+            mounts.insert(7, "closed"),
+            Err((SecondaryInsertRejection::Closed, "closed"))
+        );
+
+        mounts.open();
+        assert_eq!(mounts.insert(7, "first"), Ok(()));
+        assert_eq!(
+            mounts.insert(7, "duplicate"),
+            Err((SecondaryInsertRejection::Duplicate, "duplicate"))
+        );
+        assert!(mounts.contains_key(&7));
+
+        assert_eq!(mounts.close_and_drain(), vec![(7, "first")]);
+        assert!(!mounts.is_accepting());
+    }
 }

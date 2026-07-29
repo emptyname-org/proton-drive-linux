@@ -9,7 +9,7 @@ use super::Db;
 use crate::Result;
 
 /// Current schema version. Bump on every forward migration added below.
-pub(super) const SCHEMA_VERSION: i64 = 17;
+pub(super) const SCHEMA_VERSION: i64 = 18;
 
 impl Db {
     pub(super) fn migrate(&self) -> Result<()> {
@@ -91,6 +91,9 @@ impl Db {
         }
         if current < 17 {
             tx.execute_batch(MIGRATION_V17)?;
+        }
+        if current < 18 {
+            tx.execute_batch(MIGRATION_V18)?;
         }
         tx.execute(
             "INSERT INTO sync_state (key, value) VALUES ('schema_version', ?1)
@@ -424,4 +427,48 @@ CREATE TABLE share_access (
   access   TEXT NOT NULL
            CHECK (access IN ('owner', 'editor', 'viewer', 'unknown'))
 );
+";
+
+/// Schema v18: unified location presentation. Device rows carry only their
+/// `sync_folder` identity; reads join all device state from that authoritative
+/// table. The trigger projects future folders, while the foreign key removes a
+/// presentation row with its sync folder.
+const MIGRATION_V18: &str = "
+CREATE TABLE mount (
+  id              INTEGER PRIMARY KEY,
+  kind            TEXT NOT NULL
+                  CHECK (kind IN ('myfiles', 'device', 'shared')),
+  sync_folder_id  INTEGER REFERENCES sync_folder(id) ON DELETE CASCADE,
+  share_root_uid  TEXT,
+  local_path      TEXT NOT NULL DEFAULT '',
+  root_uid        TEXT NOT NULL DEFAULT '',
+  root_share_id   TEXT NOT NULL DEFAULT '',
+  mode            TEXT NOT NULL DEFAULT 'unknown',
+  access          TEXT NOT NULL DEFAULT 'rw'
+                  CHECK (access IN ('rw', 'ro')),
+  CHECK (
+    (kind = 'myfiles' AND sync_folder_id IS NULL AND share_root_uid IS NULL)
+    OR
+    (kind = 'device' AND sync_folder_id IS NOT NULL AND share_root_uid IS NULL)
+    OR
+    (kind = 'shared' AND sync_folder_id IS NULL AND share_root_uid IS NOT NULL)
+  )
+);
+
+CREATE UNIQUE INDEX mount_myfiles
+  ON mount(kind) WHERE kind = 'myfiles';
+CREATE UNIQUE INDEX mount_device
+  ON mount(sync_folder_id) WHERE kind = 'device';
+CREATE UNIQUE INDEX mount_shared
+  ON mount(share_root_uid) WHERE kind = 'shared';
+
+INSERT INTO mount (kind, sync_folder_id)
+SELECT 'device', id FROM sync_folder;
+
+CREATE TRIGGER mount_sync_folder_insert
+AFTER INSERT ON sync_folder
+BEGIN
+  INSERT OR IGNORE INTO mount (kind, sync_folder_id)
+  VALUES ('device', NEW.id);
+END;
 ";

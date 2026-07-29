@@ -12,6 +12,7 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use pdfs_core::control::RestorableFolder;
+use pdfs_core::mounts::MountMode;
 use pdfs_core::profile::{PROFILE_FILE_NAME, PROFILE_VERSION, Profile, ProfileFolder, ProfilePin};
 use pdfs_core::{CoreError, CoreResult};
 use proton_drive_rs::proton_sdk::ids::NodeUid;
@@ -133,7 +134,7 @@ impl Core {
                 local_path: f.local_path,
                 // A queued switch is where the user asked the folder to be, so
                 // that is what the next machine should set up.
-                mode: f.pending_mode.unwrap_or(f.mode),
+                mode: MountMode::from(f.pending_mode.unwrap_or(f.mode).as_str()),
             })
             .collect();
         let pins = self
@@ -267,7 +268,7 @@ impl Core {
                     name: n.name,
                     local_path: proposed.to_string_lossy().to_string(),
                     mode: saved
-                        .map(|f| f.mode.clone())
+                        .map(|f| f.mode.to_string())
                         .unwrap_or_else(|| "mirror".into()),
                 }
             })
@@ -319,10 +320,10 @@ impl Core {
                 skipped.push(format!("{}: {e}", item.local_path));
                 continue;
             }
-            let mode = match item.mode.as_str() {
-                "mirror" | "ondemand" => item.mode.as_str(),
-                other => {
-                    skipped.push(format!("{}: unknown mode {other}", item.local_path));
+            let mode = match restore_mode(&item.mode) {
+                Some(mode) => mode,
+                None => {
+                    skipped.push(format!("{}: unknown mode {}", item.local_path, item.mode));
                     continue;
                 }
             };
@@ -333,7 +334,7 @@ impl Core {
             // `ondemand` is applied through the normal request path, which
             // mounts the FUSE session and handles the folder being busy — the
             // restore does not get its own copy of that logic.
-            if mode == "ondemand" {
+            if mode == MountMode::OnDemand {
                 let _ = self.request_sync_folder_mode(id, "ondemand");
             }
             let _ = self.sync_tx.send(sync::SyncMsg::Reconcile(id));
@@ -347,6 +348,17 @@ impl Core {
         }
         info!(restored, skipped = skipped.len(), "restore complete");
         Ok(message)
+    }
+}
+
+/// Accept only modes this build can safely restore. `MountMode` itself is
+/// tolerant so a future value does not reject the whole profile; the folder
+/// carrying that value is skipped here with the message assembled above.
+fn restore_mode(value: &str) -> Option<MountMode> {
+    match MountMode::from(value) {
+        MountMode::Mirror => Some(MountMode::Mirror),
+        MountMode::OnDemand => Some(MountMode::OnDemand),
+        MountMode::Unknown => None,
     }
 }
 
@@ -380,6 +392,14 @@ mod tests {
             "/home/definitely-not-a-user-here/Documents"
         )));
         assert!(!path_is_usable_here(Path::new("relative/path")));
+    }
+
+    #[test]
+    fn unknown_profile_mode_is_skipped_without_rejecting_known_modes() {
+        assert_eq!(restore_mode("mirror"), Some(MountMode::Mirror));
+        assert_eq!(restore_mode("ondemand"), Some(MountMode::OnDemand));
+        assert_eq!(restore_mode("streaming"), None);
+        assert_eq!(restore_mode("unknown"), None);
     }
 
     /// A path whose parent exists but which does not itself is exactly the

@@ -77,6 +77,7 @@ const REPORTED_TABLES: &[&str] = &[
     "trash",
     "device",
     "sync_folder",
+    "mount",
     "sync_entry",
     "pending_op",
     "activity",

@@ -17,6 +17,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::mounts::MountMode;
+
 /// File name of the profile inside the device root folder.
 pub const PROFILE_FILE_NAME: &str = "profile.json";
 
@@ -39,8 +41,9 @@ pub struct ProfileFolder {
     /// Absolute local path it was synced to. A *suggestion* on restore: another
     /// machine may have a different username, home, or mount layout.
     pub local_path: String,
-    /// `mirror` or `ondemand`.
-    pub mode: String,
+    /// `mirror` or `ondemand`. Unknown values written by a newer client do not
+    /// invalidate the rest of the profile.
+    pub mode: MountMode,
 }
 
 /// One pinned node (P5 pins), as `pins` stores it.
@@ -114,7 +117,7 @@ mod tests {
             folders: vec![ProfileFolder {
                 remote_uid: "vol~link".to_string(),
                 local_path: "/home/nils/Documents".to_string(),
-                mode: "mirror".to_string(),
+                mode: MountMode::Mirror,
             }],
             pins: vec![ProfilePin {
                 uid: "vol~pin".to_string(),
@@ -131,6 +134,52 @@ mod tests {
     fn round_trips() {
         let p = sample();
         assert_eq!(Profile::parse(&p.to_bytes().unwrap()).unwrap(), p);
+    }
+
+    #[test]
+    fn profile_keeps_legacy_mode_bytes_and_parses_old_documents() {
+        let bytes = sample().to_bytes().unwrap();
+        let json = String::from_utf8(bytes).unwrap();
+        assert!(json.contains(r#""mode": "mirror""#));
+
+        let old = br#"{
+            "version": 1,
+            "device_uid": "dev-1",
+            "hostname": "old-client",
+            "saved_at": 1,
+            "folders": [
+                {
+                    "remote_uid": "vol~mirror",
+                    "local_path": "/home/me/Mirror",
+                    "mode": "mirror"
+                },
+                {
+                    "remote_uid": "vol~ondemand",
+                    "local_path": "/home/me/Cloud",
+                    "mode": "ondemand"
+                }
+            ]
+        }"#;
+        let profile = Profile::parse(old).unwrap();
+        assert_eq!(profile.folders[0].mode, MountMode::Mirror);
+        assert_eq!(profile.folders[1].mode, MountMode::OnDemand);
+    }
+
+    #[test]
+    fn unknown_folder_mode_does_not_reject_profile() {
+        let json = br#"{
+            "version": 1,
+            "device_uid": "dev-1",
+            "hostname": "future-client",
+            "saved_at": 1,
+            "folders": [{
+                "remote_uid": "vol~future",
+                "local_path": "/home/me/Future",
+                "mode": "streaming"
+            }]
+        }"#;
+        let profile = Profile::parse(json).unwrap();
+        assert_eq!(profile.folders[0].mode, MountMode::Unknown);
     }
 
     /// A field added by a later client must not break this one's restore: the

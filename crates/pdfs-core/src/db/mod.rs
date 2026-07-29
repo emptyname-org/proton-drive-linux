@@ -27,6 +27,7 @@ mod devices;
 mod local;
 mod maintenance;
 mod migrations;
+mod mounts;
 mod nodes;
 mod ops;
 mod photos;
@@ -110,6 +111,10 @@ impl Db {
     #[cfg(test)]
     pub fn open_in_memory() -> Result<Self> {
         let conn = Connection::open_in_memory()?;
+        // Keep relational behavior identical to `open`: V18 relies on the
+        // `mount.sync_folder_id` cascade, and SQLite disables foreign keys per
+        // connection unless explicitly enabled.
+        conn.pragma_update(None, "foreign_keys", "ON")?;
         let db = Self {
             conn: Mutex::new(conn),
         };
