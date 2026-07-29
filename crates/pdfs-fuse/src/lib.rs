@@ -221,6 +221,66 @@ const MAX_THUMBNAIL_MISSES: usize = 8192;
 /// delay the waiters this chunking exists to release (bugs.md B14).
 const SIZE_UPGRADE_CHUNK: usize = 150;
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RootListingSnapshot {
+    children: Vec<RootListingChild>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RootListingChild {
+    ino: u64,
+    entry: Option<RootListingEntry>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RootListingEntry {
+    uid: NodeUid,
+    name: String,
+    parent: u64,
+    trashed: bool,
+    unlinked: bool,
+}
+
+impl RootListingSnapshot {
+    fn capture(state: &State, parent_ino: u64) -> Option<Self> {
+        let children = state.children.get(&parent_ino)?;
+        Some(Self {
+            children: children
+                .iter()
+                .map(|ino| RootListingChild {
+                    ino: *ino,
+                    entry: state.entries.get(ino).and_then(|entry| {
+                        (!is_virtual_uid(&entry.uid)).then(|| RootListingEntry {
+                            uid: entry.uid.clone(),
+                            name: entry.node.name.clone(),
+                            parent: entry.parent,
+                            trashed: entry.node.trashed,
+                            unlinked: entry.unlinked,
+                        })
+                    }),
+                })
+                .collect(),
+        })
+    }
+
+    fn real_names(&self) -> HashSet<String> {
+        self.children
+            .iter()
+            .filter_map(|child| child.entry.as_ref())
+            .map(|entry| entry.name.clone())
+            .collect()
+    }
+
+    fn is_current(&self, state: &State, parent_ino: u64) -> bool {
+        Self::capture(state, parent_ino).as_ref() == Some(self)
+    }
+}
+
+struct VirtualRootPlan {
+    node: Node,
+    visible: bool,
+}
+
 #[derive(Clone)]
 struct Core {
     client: ProtonDriveClient,
@@ -507,6 +567,18 @@ impl StateRegistry {
             .iter()
             .filter_map(|m| Some((m.state.upgrade()?, m.notifier.clone())))
             .collect()
+    }
+
+    /// Whether any live inode space owns and currently exposes `uid`.
+    ///
+    /// Retained open inodes and revoked incoming shares remain interned after
+    /// their dentries disappear, so residency alone is not authority. The
+    /// state's mounted root also scopes the lookup to its own volume, excluding
+    /// foreign shared-with-me residents from uid-addressed sharing.
+    fn owns_visible_uid(&self, uid: &NodeUid) -> bool {
+        self.live()
+            .into_iter()
+            .any(|(state, _)| state.lock().owns_visible_uid(uid))
     }
 }
 
@@ -1130,32 +1202,26 @@ impl Core {
         apply_pending_sizes(nodes, &sizes);
     }
 
-    fn prepare_virtual_root(&self, real_names: &HashSet<String>) -> Result<(Node, bool), Errno> {
+    /// Read the inputs for virtual-root publication without changing SQLite.
+    ///
+    /// The caller validates the listing snapshot after these reads. Keeping all
+    /// writes out of this phase prevents an invalidated/repopulated root listing
+    /// from changing the synthetic node's persisted visibility or FTS ancestry.
+    fn prepare_virtual_root(&self, real_names: &HashSet<String>) -> Result<VirtualRootPlan, Errno> {
         let pinned = self.db.state_str(SHARED_WITH_ME_NAME).map_err(|error| {
             error!(%error, "reading shared-root display name failed");
             Errno::EIO
         })?;
         let (name, visible) = virtual_root_name(real_names, pinned.as_deref());
-        if pinned.is_none() {
-            self.db
-                .set_state_str(SHARED_WITH_ME_NAME, &name)
-                .map_err(|error| {
-                    error!(%error, "persisting shared-root display name failed");
-                    Errno::EIO
-                })?;
-        }
 
         let uid = shared_with_me_uid();
-        let mut node = self
-            .db
-            .node_by_uid(&uid.to_string())
-            .map_err(|error| {
-                error!(%error, "reading synthetic shared root failed");
-                Errno::EIO
-            })?
-            .unwrap_or_else(|| {
-                virtual_node(self.primary_root_uid.clone(), name.clone(), now_secs())
-            });
+        let previous_node = self.db.node_by_uid(&uid.to_string()).map_err(|error| {
+            error!(%error, "reading synthetic shared root failed");
+            Errno::EIO
+        })?;
+        let mut node = previous_node.unwrap_or_else(|| {
+            virtual_node(self.primary_root_uid.clone(), name.clone(), now_secs())
+        });
         node.parent_uid = Some(self.primary_root_uid.clone());
         node.name = name;
         node.kind = NodeKind::Folder;
@@ -1164,11 +1230,7 @@ impl Core {
         // restores both by writing `trashed = false` again.
         node.trashed = !visible;
         node.membership = None;
-        self.db.ensure_virtual_root(&node).map_err(|error| {
-            error!(%error, "persisting synthetic shared root failed");
-            Errno::EIO
-        })?;
-        Ok((node, visible))
+        Ok(VirtualRootPlan { node, visible })
     }
 
     /// Reconcile the synthetic dentry against an already-known primary-root
@@ -1177,33 +1239,23 @@ impl Core {
     fn reconcile_virtual_root_dentry(
         &self,
         parent_ino: u64,
-        real_names: HashSet<String>,
+        snapshot: RootListingSnapshot,
     ) -> Result<(), Errno> {
-        let (node, visible) = self.prepare_virtual_root(&real_names)?;
-        let uid = node.uid.clone();
+        let _publication = self.shared_publication.lock();
+        let plan = self.prepare_virtual_root(&snapshot.real_names())?;
         let mut st = self.state.lock();
-        st.share_access.insert(uid, Access::Viewer);
-        let virtual_ino = st.intern_mem(parent_ino, node);
-        let children = st.children.entry(parent_ino).or_default();
-        children.retain(|ino| *ino != virtual_ino);
-        if visible {
-            children.push(virtual_ino);
-        }
+        // State methods already establish the state -> DB lock order. No path
+        // holds the DB connection while acquiring state, including shared event
+        // publication, so keeping state locked across this one transaction
+        // closes the crash window without introducing an inverse order.
+        publish_virtual_root_in_listing(&self.db, &mut st, parent_ino, &snapshot, plan)?;
         drop(st);
         self.flush_access_changes();
         Ok(())
     }
 
-    fn resident_real_root_names(&self, ino: u64) -> HashSet<String> {
-        let st = self.state.lock();
-        st.children
-            .get(&ino)
-            .into_iter()
-            .flatten()
-            .filter_map(|child| st.entries.get(child))
-            .filter(|entry| !is_virtual_uid(&entry.uid))
-            .map(|entry| entry.node.name.clone())
-            .collect()
+    fn resident_root_listing_snapshot(&self, ino: u64) -> Result<RootListingSnapshot, Errno> {
+        RootListingSnapshot::capture(&self.state.lock(), ino).ok_or(Errno::EAGAIN)
     }
 
     fn shared_folder_freshness_key(uid: &NodeUid) -> String {
@@ -1383,7 +1435,7 @@ impl Core {
         });
         if cached && !refresh_foreign {
             if primary_root {
-                self.reconcile_virtual_root_dentry(ino, self.resident_real_root_names(ino))?;
+                self.reconcile_virtual_root_dentry(ino, self.resident_root_listing_snapshot(ino)?)?;
             }
             return Ok(());
         }
@@ -1403,8 +1455,6 @@ impl Core {
                 // Before the lock: a DB row carries the size the server last
                 // sealed, which a queued write is ahead of (B11).
                 self.stamp_pending_sizes(&mut nodes);
-                let real_names: HashSet<String> =
-                    nodes.iter().map(|node| node.name.clone()).collect();
                 let hidden = self.hidden.lock().clone();
                 let mut st = self.state.lock();
                 if st.children.contains_key(&ino) {
@@ -1428,10 +1478,12 @@ impl Core {
                     child_inos.push(st.intern_from_db(ino, node));
                 }
                 st.children.insert(ino, child_inos);
+                let root_snapshot =
+                    primary_root.then(|| RootListingSnapshot::capture(&st, ino).unwrap());
                 drop(st);
                 self.flush_access_changes();
-                if primary_root {
-                    self.reconcile_virtual_root_dentry(ino, real_names)?;
+                if let Some(snapshot) = root_snapshot {
+                    self.reconcile_virtual_root_dentry(ino, snapshot)?;
                 }
                 // Rows persisted from a cheap enumeration whose upgrade never
                 // ran (a restart in between, say) still owe their real sizes.
@@ -1470,7 +1522,6 @@ impl Core {
         // Same as the DB path above: the remote's size for a file with a write
         // still queued is the pre-write one (B11).
         self.stamp_pending_sizes(&mut nodes);
-        let real_names: HashSet<String> = nodes.iter().map(|node| node.name.clone()).collect();
         let hidden = self.hidden.lock().clone();
         let mut filtered_nodes: Vec<Node> = nodes
             .into_iter()
@@ -1557,6 +1608,7 @@ impl Core {
         let inos = st.intern_batch(ino, filtered_nodes);
         child_inos.extend(inos);
         st.children.insert(ino, child_inos);
+        let root_snapshot = primary_root.then(|| RootListingSnapshot::capture(&st, ino).unwrap());
         // Record the listing as complete so a later restart (or a trimmed hot
         // cache) can rebuild it from the DB without the API.
         if let Err(e) = self.db.set_listed(&folder_uid, true) {
@@ -1564,8 +1616,8 @@ impl Core {
         }
         drop(st);
         self.flush_access_changes();
-        if primary_root {
-            self.reconcile_virtual_root_dentry(ino, real_names)?;
+        if let Some(snapshot) = root_snapshot {
+            self.reconcile_virtual_root_dentry(ino, snapshot)?;
         }
         self.spawn_size_upgrade(ino, needs_size);
         Ok(())
@@ -1836,6 +1888,21 @@ impl Core {
     fn resolve(&self, rel: &Path) -> CoreResult<(u64, NodeUid)> {
         self.resolve_path(rel)
             .map_err(|e| self.errno_error(e, &format!("could not resolve {}", rel.display())))
+    }
+
+    /// Resolve a wire-format uid only when one of this daemon's locations
+    /// proves that it owns the node.
+    ///
+    /// The primary and on-demand mounts prove residency through
+    /// [`StateRegistry`]. Mirror locations have no inode space, so their root
+    /// and last-synced descendants are resolved through `sync_folder` and
+    /// `sync_entry` instead.
+    pub(crate) fn resolve_anywhere(&self, uid: &str) -> CoreResult<NodeUid> {
+        resolve_anywhere_with(
+            uid,
+            |uid| self.states.owns_visible_uid(uid),
+            |uid| self.db.mirror_contains_uid(&uid.to_string()),
+        )
     }
 
     fn source_parent_uid(&self, ino: u64, rel: &Path) -> CoreResult<NodeUid> {
@@ -3653,6 +3720,80 @@ impl Core {
     }
 }
 
+fn publish_virtual_root_in_listing(
+    db: &Db,
+    state: &mut State,
+    parent_ino: u64,
+    snapshot: &RootListingSnapshot,
+    plan: VirtualRootPlan,
+) -> Result<(), Errno> {
+    if !snapshot.is_current(state, parent_ino) {
+        return Err(Errno::EAGAIN);
+    }
+
+    db.publish_virtual_root(SHARED_WITH_ME_NAME, &plan.node)
+        .map_err(|error| {
+            error!(%error, "atomically publishing synthetic shared root failed");
+            Errno::EIO
+        })?;
+
+    let uid = plan.node.uid.clone();
+    state.share_access.insert(uid, Access::Viewer);
+    let virtual_ino = state.intern_mem(parent_ino, plan.node);
+    let published =
+        reconcile_virtual_root_in_listing(state, parent_ino, snapshot, virtual_ino, plan.visible);
+    debug_assert!(
+        published,
+        "snapshot cannot change while the state lock is held"
+    );
+    Ok(())
+}
+
+/// Update the synthetic dentry only while the parent listing is still known.
+///
+/// Event invalidation can remove the listing after its real names were captured.
+/// Recreating it here would publish a synthetic-only partial snapshot as complete.
+fn reconcile_virtual_root_in_listing(
+    state: &mut State,
+    parent_ino: u64,
+    snapshot: &RootListingSnapshot,
+    virtual_ino: u64,
+    visible: bool,
+) -> bool {
+    if !snapshot.is_current(state, parent_ino) {
+        return false;
+    }
+    let Some(children) = state.children.get_mut(&parent_ino) else {
+        return false;
+    };
+    children.retain(|ino| *ino != virtual_ino);
+    if visible {
+        children.push(virtual_ino);
+    }
+    true
+}
+
+fn resolve_anywhere_with(
+    raw_uid: &str,
+    resident: impl FnOnce(&NodeUid) -> bool,
+    mirrored: impl FnOnce(&NodeUid) -> pdfs_core::Result<bool>,
+) -> CoreResult<NodeUid> {
+    let uid =
+        parse_uid(raw_uid).ok_or_else(|| CoreError::invalid(format!("invalid uid: {raw_uid}")))?;
+    if is_local_uid(&uid) || is_virtual_uid(&uid) {
+        return Err(CoreError::invalid(format!("reserved uid: {raw_uid}")));
+    }
+    if resident(&uid) {
+        return Ok(uid);
+    }
+    if mirrored(&uid)? {
+        return Ok(uid);
+    }
+    Err(CoreError::not_found(format!(
+        "node is not present in any location: {raw_uid}"
+    )))
+}
+
 /// Map a [`MemberRole`] to its wire string.
 fn role_to_str(role: MemberRole) -> &'static str {
     match role {
@@ -3698,6 +3839,9 @@ fn public_link_info(link: proton_drive_rs::PublicLink) -> PublicLinkInfo {
 /// receive uids as strings over the control socket and pass them back verbatim.
 fn parse_uid(s: &str) -> Option<NodeUid> {
     let (vol, link) = s.split_once('~')?;
+    if vol.is_empty() || link.is_empty() || link.contains('~') {
+        return None;
+    }
     Some(NodeUid::new(VolumeId::from(vol), LinkId::from(link)))
 }
 /// Current wall-clock time as epoch seconds (0 if the clock is before the epoch).
@@ -3721,8 +3865,7 @@ fn now_millis() -> i64 {
 /// how one is persisted in `pending_op.uid` and a [`StagedWrite`] sidecar. The
 /// SDK has no `FromStr`, and neither id contains a `~`.
 fn parse_node_uid(s: &str) -> Option<NodeUid> {
-    let (vol, link) = s.split_once('~')?;
-    Some(NodeUid::new(VolumeId::from(vol), LinkId::from(link)))
+    parse_uid(s)
 }
 
 /// Distinguishes placeholder uids minted by [`mint_local_uid`] within one run.
@@ -4470,13 +4613,15 @@ mod pending_size_tests {
 #[cfg(test)]
 mod tests {
     use super::{
-        Access, AccessFlags, Errno, HashMap, Intervals, PendingRevision, SELF_CHANGE_TTL_MS,
-        ShareId, SharedWithMeItem, StateRegistry, accepted_share_provenance, conflict_name,
-        copy_pending_for_truncate, fuse_name, is_stale_mount, node_visible, note_self_change,
-        parse_node_uid, prepare_shared_roots, preserve_on_access_denied,
-        release_can_discard_unlinked, release_must_retain_queued_trash, release_unlinked_entry,
-        rename_needs_queue, require_node_parent_access, require_rename_access, require_uid_access,
-        shared_with_me_uid, take_self_change,
+        Access, AccessFlags, Errno, HashMap, Intervals, PendingRevision, RootListingSnapshot,
+        SELF_CHANGE_TTL_MS, ShareId, SharedWithMeItem, StateRegistry, VirtualRootPlan,
+        accepted_share_provenance, conflict_name, copy_pending_for_truncate, fuse_name,
+        is_stale_mount, node_visible, note_self_change, parse_node_uid, prepare_shared_roots,
+        preserve_on_access_denied, publish_virtual_root_in_listing,
+        reconcile_virtual_root_in_listing, release_can_discard_unlinked,
+        release_must_retain_queued_trash, release_unlinked_entry, rename_needs_queue,
+        require_node_parent_access, require_rename_access, require_uid_access,
+        resolve_anywhere_with, shared_with_me_uid, take_self_change, virtual_node,
     };
     use crate::filesystem::access_allowed;
     use pdfs_core::cache::{Baseline, StagedWrite};
@@ -4527,6 +4672,469 @@ mod tests {
             registry.live().is_empty(),
             "the last mount going away empties the registry"
         );
+    }
+
+    #[test]
+    fn state_registry_resolves_uids_from_any_resident_mount() {
+        let registry = StateRegistry::default();
+        let (primary, _primary_dir) = rooted_state("primary-volume", "primary");
+        let (mut fork, _fork_dir) = rooted_state("device-volume", "device");
+        let primary_uid = primary.entries[&super::ROOT_INO].uid.clone();
+        let fork_node =
+            node_helper_in_volume("device-volume", "fork", Some("device"), "fork", true);
+        let fork_uid = fork_node.uid.clone();
+        let fork_ino = fork.intern(super::ROOT_INO, fork_node);
+        fork.children.insert(super::ROOT_INO, vec![fork_ino]);
+        let primary = std::sync::Arc::new(parking_lot::Mutex::new(primary));
+        let fork = std::sync::Arc::new(parking_lot::Mutex::new(fork));
+        registry.register(&primary, std::sync::Arc::new(std::sync::OnceLock::new()));
+        registry.register(&fork, std::sync::Arc::new(std::sync::OnceLock::new()));
+
+        assert!(registry.owns_visible_uid(&primary_uid));
+        assert!(registry.owns_visible_uid(&fork_uid));
+        assert!(!registry.owns_visible_uid(&super::parse_uid("device-volume~missing").unwrap()));
+
+        drop(fork);
+        assert!(
+            !registry.owns_visible_uid(&fork_uid),
+            "an unmounted on-demand state must stop authorizing its uids"
+        );
+    }
+
+    #[test]
+    fn state_registry_treats_missing_listing_as_unknown_not_absent() {
+        let registry = StateRegistry::default();
+        let (mut state, _dir) = rooted_state("device-volume", "device");
+        let child_node =
+            node_helper_in_volume("device-volume", "child", Some("device"), "child.txt", false);
+        let child_uid = child_node.uid.clone();
+        let child_ino = state.intern(super::ROOT_INO, child_node);
+        state.children.insert(super::ROOT_INO, vec![child_ino]);
+        let state = std::sync::Arc::new(parking_lot::Mutex::new(state));
+        registry.register(&state, std::sync::Arc::new(std::sync::OnceLock::new()));
+
+        assert!(registry.owns_visible_uid(&child_uid));
+
+        state.lock().invalidate_listing(super::ROOT_INO);
+        assert!(
+            registry.owns_visible_uid(&child_uid),
+            "an invalidated listing is unknown and must not hide a valid resident child"
+        );
+
+        state.lock().children.insert(super::ROOT_INO, Vec::new());
+        assert!(
+            !registry.owns_visible_uid(&child_uid),
+            "a present listing that omits the child proves it is no longer visible"
+        );
+    }
+
+    #[test]
+    fn virtual_root_reconcile_does_not_recreate_an_invalidated_listing() {
+        let registry = StateRegistry::default();
+        let (mut state, _dir) = rooted_state("primary-volume", "root");
+        let root_uid = state.entries[&super::ROOT_INO].uid.clone();
+        let child_node =
+            node_helper_in_volume("primary-volume", "child", Some("root"), "child.txt", false);
+        let child_uid = child_node.uid.clone();
+        let child_ino = state.intern(super::ROOT_INO, child_node);
+        state.children.insert(super::ROOT_INO, vec![child_ino]);
+
+        // Simulate ensure_children observing a complete primary-root listing.
+        let snapshot = RootListingSnapshot::capture(&state, super::ROOT_INO).unwrap();
+        let detected_names = snapshot.real_names();
+        assert_eq!(
+            detected_names,
+            std::collections::HashSet::from(["child.txt".into()])
+        );
+
+        // An event wins the race before virtual-root dentry publication.
+        state.invalidate_listing(super::ROOT_INO);
+        let virtual_ino = state.intern_mem(
+            super::ROOT_INO,
+            virtual_node(root_uid, "Shared with me".into(), 0),
+        );
+        assert!(
+            !reconcile_virtual_root_in_listing(
+                &mut state,
+                super::ROOT_INO,
+                &snapshot,
+                virtual_ino,
+                true,
+            ),
+            "the invalidated snapshot must not publish"
+        );
+        assert!(
+            !state.children.contains_key(&super::ROOT_INO),
+            "reconciliation must leave an invalidated listing absent"
+        );
+
+        let state = std::sync::Arc::new(parking_lot::Mutex::new(state));
+        registry.register(&state, std::sync::Arc::new(std::sync::OnceLock::new()));
+        assert!(
+            registry.owns_visible_uid(&child_uid),
+            "the absent listing remains unknown until refresh, so a valid resident uid is allowed"
+        );
+    }
+
+    #[test]
+    fn virtual_root_reconcile_rejects_repopulated_changed_snapshot() {
+        let (mut state, _dir) = rooted_state("primary-volume", "root");
+        let root_uid = state.entries[&super::ROOT_INO].uid.clone();
+        let child =
+            node_helper_in_volume("primary-volume", "child", Some("root"), "child.txt", false);
+        let child_ino = state.intern(super::ROOT_INO, child);
+        state.children.insert(super::ROOT_INO, vec![child_ino]);
+        let stale_snapshot = RootListingSnapshot::capture(&state, super::ROOT_INO).unwrap();
+
+        let mut persisted_virtual = virtual_node(root_uid.clone(), "Shared with me".into(), 0);
+        persisted_virtual.trashed = true;
+        state
+            .db
+            .publish_virtual_root(super::SHARED_WITH_ME_NAME, &persisted_virtual)
+            .unwrap();
+        let mut indexed_descendant = node_helper_in_volume(
+            "foreign-volume",
+            "inside",
+            None,
+            "SnapshotRaceFindable",
+            false,
+        );
+        indexed_descendant.parent_uid = Some(shared_with_me_uid());
+        state.db.upsert_node(&indexed_descendant).unwrap();
+        assert!(
+            state
+                .db
+                .search("SnapshotRaceFindable", 10)
+                .unwrap()
+                .is_empty(),
+            "the hidden synthetic ancestor must hide descendant search hits"
+        );
+
+        state.invalidate_listing(super::ROOT_INO);
+        state.entries.get_mut(&child_ino).unwrap().node.name = "Shared with me".into();
+        state.children.insert(super::ROOT_INO, vec![child_ino]);
+        let replacement_snapshot = RootListingSnapshot::capture(&state, super::ROOT_INO).unwrap();
+        assert_ne!(stale_snapshot, replacement_snapshot);
+        assert_eq!(
+            replacement_snapshot.real_names(),
+            std::collections::HashSet::from(["Shared with me".into()])
+        );
+
+        let mut stale_node = persisted_virtual.clone();
+        stale_node.trashed = false;
+        let stale_plan = VirtualRootPlan {
+            node: stale_node.clone(),
+            visible: true,
+        };
+        let db = state.db.clone();
+        let error = publish_virtual_root_in_listing(
+            &db,
+            &mut state,
+            super::ROOT_INO,
+            &stale_snapshot,
+            stale_plan,
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.code(),
+            Errno::EAGAIN.code(),
+            "stale work must fail before persistence or dentry publication"
+        );
+        assert_eq!(
+            state.children[&super::ROOT_INO],
+            vec![child_ino],
+            "the replacement listing must remain untouched"
+        );
+        assert!(
+            state
+                .db
+                .node_by_uid(&shared_with_me_uid().to_string())
+                .unwrap()
+                .unwrap()
+                .trashed,
+            "stale work must not change persisted visibility"
+        );
+        assert!(
+            state
+                .db
+                .search("SnapshotRaceFindable", 10)
+                .unwrap()
+                .is_empty(),
+            "stale work must not change FTS ancestry"
+        );
+
+        let virtual_ino = state.intern_mem(super::ROOT_INO, stale_node);
+        state
+            .children
+            .get_mut(&super::ROOT_INO)
+            .unwrap()
+            .push(virtual_ino);
+        let current_snapshot = RootListingSnapshot::capture(&state, super::ROOT_INO).unwrap();
+        state.entries.get_mut(&virtual_ino).unwrap().node.trashed = false;
+        assert!(
+            reconcile_virtual_root_in_listing(
+                &mut state,
+                super::ROOT_INO,
+                &current_snapshot,
+                virtual_ino,
+                false,
+            ),
+            "the synthetic node's own visibility update must not stale the real-child snapshot"
+        );
+        assert_eq!(state.children[&super::ROOT_INO], vec![child_ino]);
+    }
+
+    #[test]
+    fn virtual_root_publication_failure_is_atomic_and_leaves_state_unchanged() {
+        let (mut state, _dir) = rooted_state("primary-volume", "root");
+        let root_uid = state.entries[&super::ROOT_INO].uid.clone();
+        let child =
+            node_helper_in_volume("primary-volume", "child", Some("root"), "child.txt", false);
+        let child_ino = state.intern(super::ROOT_INO, child);
+        state.children.insert(super::ROOT_INO, vec![child_ino]);
+        let snapshot = RootListingSnapshot::capture(&state, super::ROOT_INO).unwrap();
+
+        let mut descendant = node_helper_in_volume(
+            "foreign-volume",
+            "inside",
+            None,
+            "AtomicRollbackFindable",
+            false,
+        );
+        descendant.parent_uid = Some(shared_with_me_uid());
+        state.db.upsert_node(&descendant).unwrap();
+        assert!(
+            state
+                .db
+                .search("AtomicRollbackFindable", 10)
+                .unwrap()
+                .is_empty(),
+            "a descendant with no synthetic ancestor starts outside FTS"
+        );
+
+        // The pin is the transaction's final statement. Failing it proves the
+        // earlier access, node, and descendant FTS work rolls back with it.
+        state
+            .db
+            .with_conn(|conn| {
+                conn.execute_batch(
+                    "CREATE TRIGGER reject_virtual_root_pin
+                     BEFORE INSERT ON sync_state
+                     WHEN NEW.key = 'shared_with_me_name'
+                     BEGIN
+                       SELECT RAISE(ABORT, 'injected virtual-root pin failure');
+                     END;",
+                )?;
+                Ok(())
+            })
+            .unwrap();
+
+        let entries_before = state.entries.len();
+        let by_uid_before = state.by_uid.len();
+        let next_ino_before = state.next_ino;
+        let access_before = state.share_access.clone();
+        let db = state.db.clone();
+        let result = publish_virtual_root_in_listing(
+            &db,
+            &mut state,
+            super::ROOT_INO,
+            &snapshot,
+            VirtualRootPlan {
+                node: virtual_node(root_uid, "Shared with me".into(), 0),
+                visible: true,
+            },
+        );
+
+        assert_eq!(result.unwrap_err().code(), Errno::EIO.code());
+        assert_eq!(
+            RootListingSnapshot::capture(&state, super::ROOT_INO),
+            Some(snapshot),
+            "the resident listing must not change on DB failure"
+        );
+        assert_eq!(state.entries.len(), entries_before);
+        assert_eq!(state.by_uid.len(), by_uid_before);
+        assert_eq!(state.next_ino, next_ino_before);
+        assert_eq!(state.share_access, access_before);
+        assert!(
+            !state.by_uid.contains_key(&shared_with_me_uid()),
+            "the synthetic inode must not be interned before commit"
+        );
+
+        assert_eq!(
+            state.db.state_str(super::SHARED_WITH_ME_NAME).unwrap(),
+            None
+        );
+        assert!(
+            state
+                .db
+                .node_by_uid(&shared_with_me_uid().to_string())
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(state.db.share_access(&shared_with_me_uid()).unwrap(), None);
+        assert!(
+            state
+                .db
+                .search("AtomicRollbackFindable", 10)
+                .unwrap()
+                .is_empty(),
+            "descendant FTS visibility must roll back with the failed pin"
+        );
+    }
+
+    #[test]
+    fn state_registry_rejects_open_unlinked_and_revoked_residents() {
+        let registry = StateRegistry::default();
+        let (mut state, _dir) = rooted_state("device-volume", "device");
+
+        let open_node =
+            node_helper_in_volume("device-volume", "open", Some("device"), "open.txt", false);
+        let open_uid = open_node.uid.clone();
+        let open_ino = state.intern(super::ROOT_INO, open_node);
+        state.children.insert(super::ROOT_INO, vec![open_ino]);
+        state.entries.get_mut(&open_ino).unwrap().open_count = 1;
+
+        let revoked_node =
+            node_helper_in_volume("device-volume", "revoked", Some("device"), "revoked", true);
+        let revoked_uid = revoked_node.uid.clone();
+        let revoked_ino = state.intern(super::ROOT_INO, revoked_node);
+        let child_node = node_helper_in_volume(
+            "device-volume",
+            "revoked-child",
+            Some("revoked"),
+            "child.txt",
+            false,
+        );
+        let child_uid = child_node.uid.clone();
+        let child_ino = state.intern(revoked_ino, child_node);
+        state
+            .children
+            .get_mut(&super::ROOT_INO)
+            .unwrap()
+            .push(revoked_ino);
+        state.children.insert(revoked_ino, vec![child_ino]);
+
+        let state = std::sync::Arc::new(parking_lot::Mutex::new(state));
+        registry.register(&state, std::sync::Arc::new(std::sync::OnceLock::new()));
+        assert!(registry.owns_visible_uid(&open_uid));
+        assert!(registry.owns_visible_uid(&child_uid));
+
+        state.lock().unlink_mem(&open_uid);
+        assert!(
+            !registry.owns_visible_uid(&open_uid),
+            "an open inode retained after unlink is not addressable"
+        );
+
+        state.lock().hide_shared_root(&revoked_uid);
+        assert!(!registry.owns_visible_uid(&revoked_uid));
+        assert!(
+            !registry.owns_visible_uid(&child_uid),
+            "a retained descendant beneath a revoked root is not reachable"
+        );
+    }
+
+    #[test]
+    fn state_registry_rejects_foreign_broken_and_cyclic_residents() {
+        let registry = StateRegistry::default();
+        let (mut state, _dir) = rooted_state("own-volume", "root");
+
+        let foreign_node =
+            node_helper_in_volume("foreign-volume", "shared", Some("root"), "shared", true);
+        let foreign_uid = foreign_node.uid.clone();
+        let foreign_ino = state.intern(super::ROOT_INO, foreign_node);
+
+        let broken_node =
+            node_helper_in_volume("own-volume", "broken", Some("root"), "broken", true);
+        let broken_uid = broken_node.uid.clone();
+        let _broken_ino = state.intern(super::ROOT_INO, broken_node);
+
+        let cycle_a_node = node_helper_in_volume("own-volume", "cycle-a", Some("root"), "a", true);
+        let cycle_a_uid = cycle_a_node.uid.clone();
+        let cycle_a = state.intern(super::ROOT_INO, cycle_a_node);
+        let cycle_b_node =
+            node_helper_in_volume("own-volume", "cycle-b", Some("cycle-a"), "b", true);
+        let cycle_b = state.intern(cycle_a, cycle_b_node);
+        let cycle_b_uid = state.entries[&cycle_b].uid.clone();
+        let cycle_a_entry = state.entries.get_mut(&cycle_a).unwrap();
+        cycle_a_entry.parent = cycle_b;
+        cycle_a_entry.node.parent_uid = Some(cycle_b_uid);
+
+        state.children.insert(super::ROOT_INO, vec![foreign_ino]);
+        state.children.insert(cycle_a, vec![cycle_b]);
+        state.children.insert(cycle_b, vec![cycle_a]);
+
+        let state = std::sync::Arc::new(parking_lot::Mutex::new(state));
+        registry.register(&state, std::sync::Arc::new(std::sync::OnceLock::new()));
+
+        assert!(
+            !registry.owns_visible_uid(&foreign_uid),
+            "incoming-share residents are outside the mounted root's volume"
+        );
+        assert!(
+            !registry.owns_visible_uid(&broken_uid),
+            "an interned node without a visible parent dentry is not reachable"
+        );
+        assert!(
+            !registry.owns_visible_uid(&cycle_a_uid),
+            "a cyclic resident parent chain is not reachable"
+        );
+    }
+
+    #[test]
+    fn resolve_anywhere_prefers_resident_state_then_falls_back_to_mirror() {
+        let resident = resolve_anywhere_with(
+            "vol~resident",
+            |_| true,
+            |_| panic!("resident uid must not query mirror bookkeeping"),
+        )
+        .unwrap();
+        assert_eq!(resident.to_string(), "vol~resident");
+
+        let mirror = resolve_anywhere_with("vol~mirror", |_| false, |_| Ok(true)).unwrap();
+        assert_eq!(mirror.to_string(), "vol~mirror");
+    }
+
+    #[test]
+    fn resolve_anywhere_classifies_invalid_missing_and_db_errors() {
+        for raw_uid in ["not-a-uid", "~link", "vol~", "vol~link~extra"] {
+            let invalid = resolve_anywhere_with(
+                raw_uid,
+                |_| panic!("invalid uid must not query live state"),
+                |_| panic!("invalid uid must not query mirror bookkeeping"),
+            )
+            .unwrap_err();
+            assert_eq!(
+                invalid.kind,
+                pdfs_core::control::ErrorKind::Invalid,
+                "{raw_uid}"
+            );
+        }
+
+        for raw_uid in ["local~pending", "virtual~sharedwithme"] {
+            let reserved = resolve_anywhere_with(
+                raw_uid,
+                |_| panic!("reserved uid must not query live state"),
+                |_| panic!("reserved uid must not query mirror bookkeeping"),
+            )
+            .unwrap_err();
+            assert_eq!(
+                reserved.kind,
+                pdfs_core::control::ErrorKind::Invalid,
+                "{raw_uid}"
+            );
+        }
+
+        let missing = resolve_anywhere_with("vol~missing", |_| false, |_| Ok(false)).unwrap_err();
+        assert_eq!(missing.kind, pdfs_core::control::ErrorKind::NotFound);
+
+        let db_error = resolve_anywhere_with(
+            "vol~db",
+            |_| false,
+            |_| Err(pdfs_core::Error::Other("lookup failed".into())),
+        )
+        .unwrap_err();
+        assert_eq!(db_error.kind, pdfs_core::control::ErrorKind::Internal);
+        assert!(db_error.message.contains("lookup failed"));
     }
 
     /// An event feed carries no revision id, so the only thing that tells a
@@ -5204,6 +5812,29 @@ mod tests {
             db: std::sync::Arc::new(db),
         };
         (st, TestDir(dir_path))
+    }
+
+    fn rooted_state(volume: &str, root_link: &str) -> (crate::state::State, TestDir) {
+        let (mut state, dir) = state_test_helper();
+        let root = node_helper_in_volume(volume, root_link, None, "root", true);
+        let root_ino = state.intern(0, root);
+        assert_eq!(root_ino, super::ROOT_INO);
+        state.entries.get_mut(&root_ino).unwrap().parent = root_ino;
+        (state, dir)
+    }
+
+    fn node_helper_in_volume(
+        volume: &str,
+        id: &str,
+        parent: Option<&str>,
+        name: &str,
+        is_dir: bool,
+    ) -> Node {
+        let mut node = node_helper(id, "none", name, is_dir);
+        node.uid = NodeUid::new(VolumeId::from(volume), LinkId::from(id));
+        node.parent_uid =
+            parent.map(|parent| NodeUid::new(VolumeId::from(volume), LinkId::from(parent)));
+        node
     }
 
     #[test]

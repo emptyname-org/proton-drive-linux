@@ -769,12 +769,18 @@ fn hidden_virtual_root_removes_descendants_from_fts_and_restores_them() {
         "Findable descendant",
     );
     db.upsert_node(&own_root).unwrap();
-    assert!(db.ensure_virtual_root(&virtual_root).unwrap());
+    assert!(
+        db.publish_virtual_root("shared_with_me_name", &virtual_root)
+            .unwrap()
+    );
     db.upsert_nodes(&[shared, child.clone()]).unwrap();
     assert_eq!(db.search("Findable", 10).unwrap().len(), 1);
 
     virtual_root.trashed = true;
-    assert!(db.ensure_virtual_root(&virtual_root).unwrap());
+    assert!(
+        db.publish_virtual_root("shared_with_me_name", &virtual_root)
+            .unwrap()
+    );
     assert!(db.search("Findable", 10).unwrap().is_empty());
     assert!(
         !db.node_by_uid(&child.uid.to_string())
@@ -785,10 +791,16 @@ fn hidden_virtual_root_removes_descendants_from_fts_and_restores_them() {
     );
 
     virtual_root.trashed = false;
-    assert!(db.ensure_virtual_root(&virtual_root).unwrap());
+    assert!(
+        db.publish_virtual_root("shared_with_me_name", &virtual_root)
+            .unwrap()
+    );
     assert_eq!(db.search("Findable", 10).unwrap().len(), 1);
     let before = db.with_conn(|conn| Ok(conn.total_changes())).unwrap();
-    assert!(!db.ensure_virtual_root(&virtual_root).unwrap());
+    assert!(
+        !db.publish_virtual_root("shared_with_me_name", &virtual_root)
+            .unwrap()
+    );
     let after = db.with_conn(|conn| Ok(conn.total_changes())).unwrap();
     assert_eq!(
         before, after,
@@ -1939,6 +1951,48 @@ fn pending_mode_is_queued_until_the_mode_is_reached() {
     let folder = db.sync_folder_get(id).unwrap().unwrap();
     assert_eq!(folder.mode, "ondemand");
     assert_eq!(folder.pending_mode, None);
+}
+
+#[test]
+fn mirror_uid_lookup_covers_the_root_and_synced_descendants_only() {
+    let db = Db::open_in_memory().unwrap();
+    let mirror = db
+        .sync_folder_add("/home/me/Mirror", "vol~mirror-root", "share")
+        .unwrap();
+    db.sync_entry_upsert(
+        mirror,
+        &StoredSyncEntry {
+            rel_path: "nested/file.txt".into(),
+            remote_uid: Some("vol~mirror-file".into()),
+            local_mtime: 1,
+            local_size: 2,
+            remote_rev: Some("3".into()),
+            remote_hash: Some("2".into()),
+        },
+    )
+    .unwrap();
+    let ondemand = db
+        .sync_folder_add("/home/me/OnDemand", "vol~ondemand-root", "share")
+        .unwrap();
+    db.sync_folder_set_mode(ondemand, "ondemand").unwrap();
+    db.sync_entry_upsert(
+        ondemand,
+        &StoredSyncEntry {
+            rel_path: "stale.txt".into(),
+            remote_uid: Some("vol~ondemand-stale".into()),
+            local_mtime: 1,
+            local_size: 2,
+            remote_rev: Some("3".into()),
+            remote_hash: Some("2".into()),
+        },
+    )
+    .unwrap();
+
+    assert!(db.mirror_contains_uid("vol~mirror-root").unwrap());
+    assert!(db.mirror_contains_uid("vol~mirror-file").unwrap());
+    assert!(!db.mirror_contains_uid("vol~ondemand-root").unwrap());
+    assert!(!db.mirror_contains_uid("vol~ondemand-stale").unwrap());
+    assert!(!db.mirror_contains_uid("vol~missing").unwrap());
 }
 
 #[test]

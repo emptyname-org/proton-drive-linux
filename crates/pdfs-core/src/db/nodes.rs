@@ -177,14 +177,24 @@ impl Db {
             .collect())
     }
 
-    /// Persist the synthetic root and its Viewer authority only when its
-    /// presentation state changed. Returning `false` guarantees no node/FTS
-    /// write occurred, which keeps every cached root lookup O(1).
-    pub fn ensure_virtual_root(&self, node: &Node) -> Result<bool> {
+    /// Atomically publish the synthetic root's pinned name, node/FTS state, and
+    /// Viewer authority.
+    ///
+    /// The pin is inserted last so any failure there rolls back the node and
+    /// its descendant FTS updates as well as the access row. Returning `false`
+    /// guarantees no write occurred, which keeps cached root lookups O(1).
+    pub fn publish_virtual_root(&self, pinned_name_key: &str, node: &Node) -> Result<bool> {
         let uid = node.uid.to_string();
         let desired_parent = node.parent_uid.as_ref().map(NodeUid::to_string);
         let mut conn = self.conn.lock();
         let tx = conn.transaction()?;
+        let pinned_name: Option<String> = tx
+            .query_row(
+                "SELECT value FROM sync_state WHERE key = ?1",
+                params![pinned_name_key],
+                |row| row.get(0),
+            )
+            .optional()?;
         let stored: Option<(Option<String>, String, i64, i64)> = tx
             .query_row(
                 "SELECT parent_uid, name, is_dir, trashed FROM nodes WHERE uid = ?1",
@@ -204,17 +214,19 @@ impl Db {
                 && name == node.name
                 && is_dir == 1
                 && trashed == node.trashed as i64
-        }) && access.as_deref() == Some(Access::Viewer.as_db_str());
+        }) && access.as_deref() == Some(Access::Viewer.as_db_str())
+            && pinned_name.is_some();
         if unchanged {
             tx.commit()?;
             return Ok(false);
         }
-        tx.execute(
-            "INSERT INTO share_access (root_uid, access) VALUES (?1, ?2)
-             ON CONFLICT(root_uid) DO UPDATE SET access = excluded.access",
-            params![uid, Access::Viewer.as_db_str()],
-        )?;
+        upsert_share_access_tx(&tx, &uid, Access::Viewer)?;
         upsert_node_tx(&tx, node)?;
+        tx.execute(
+            "INSERT INTO sync_state (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO NOTHING",
+            params![pinned_name_key, node.name],
+        )?;
         tx.commit()?;
         Ok(true)
     }

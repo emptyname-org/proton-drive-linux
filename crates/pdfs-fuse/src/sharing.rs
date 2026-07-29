@@ -57,11 +57,33 @@ impl Core {
         message: Option<&str>,
     ) -> CoreResult<(usize, usize)> {
         let (_ino, uid) = self.resolve(rel)?;
+        self.share_node_for_uid(&uid, emails, role, message)
+    }
+
+    /// [`Core::share_node`] for a node addressed through any daemon location.
+    pub(crate) fn share_node_by_uid(
+        &self,
+        uid: &str,
+        emails: &[String],
+        role: &str,
+        message: Option<&str>,
+    ) -> CoreResult<(usize, usize)> {
+        let uid = self.resolve_anywhere(uid)?;
+        self.share_node_for_uid(&uid, emails, role, message)
+    }
+
+    fn share_node_for_uid(
+        &self,
+        uid: &NodeUid,
+        emails: &[String],
+        role: &str,
+        message: Option<&str>,
+    ) -> CoreResult<(usize, usize)> {
         let role = role_from_str(role)?;
         let invitees: Vec<(String, MemberRole)> =
             emails.iter().map(|e| (e.clone(), role)).collect();
         self.rt
-            .block_on(self.client.invite_users(&uid, &invitees, message))
+            .block_on(self.client.invite_users(uid, &invitees, message))
             .map_err(|e| CoreError::from_api(&e, "share"))
     }
 
@@ -71,11 +93,26 @@ impl Core {
         rel: &Path,
     ) -> CoreResult<(Vec<ShareEntry>, Option<PublicLinkInfo>)> {
         let (_ino, uid) = self.resolve(rel)?;
+        self.list_share_for_uid(&uid)
+    }
 
+    /// [`Core::list_share`] for a node addressed through any daemon location.
+    pub(crate) fn list_share_by_uid(
+        &self,
+        uid: &str,
+    ) -> CoreResult<(Vec<ShareEntry>, Option<PublicLinkInfo>)> {
+        let uid = self.resolve_anywhere(uid)?;
+        self.list_share_for_uid(&uid)
+    }
+
+    fn list_share_for_uid(
+        &self,
+        uid: &NodeUid,
+    ) -> CoreResult<(Vec<ShareEntry>, Option<PublicLinkInfo>)> {
         let mut entries = Vec::new();
         for m in self
             .rt
-            .block_on(self.client.list_share_members(&uid))
+            .block_on(self.client.list_share_members(uid))
             .map_err(|e| CoreError::from_api(&e, "list members"))?
         {
             entries.push(ShareEntry {
@@ -87,7 +124,7 @@ impl Core {
         }
         for inv in self
             .rt
-            .block_on(self.client.list_share_invitations(&uid))
+            .block_on(self.client.list_share_invitations(uid))
             .map_err(|e| CoreError::from_api(&e, "list invitations"))?
         {
             entries.push(ShareEntry {
@@ -99,7 +136,7 @@ impl Core {
         }
         for ext in self
             .rt
-            .block_on(self.client.list_external_invitations(&uid))
+            .block_on(self.client.list_external_invitations(uid))
             .map_err(|e| CoreError::from_api(&e, "list external invitations"))?
         {
             entries.push(ShareEntry {
@@ -112,7 +149,7 @@ impl Core {
 
         let link = self
             .rt
-            .block_on(self.client.get_public_link(&uid))
+            .block_on(self.client.get_public_link(uid))
             .map_err(|e| CoreError::from_api(&e, "get public link"))?
             .map(public_link_info);
 
@@ -129,12 +166,35 @@ impl Core {
         role: &str,
     ) -> CoreResult<()> {
         let (_ino, uid) = self.resolve(rel)?;
+        self.update_share_role_for_uid(&uid, id, kind, role)
+    }
+
+    /// [`Core::update_share_role`] for a node addressed through any daemon
+    /// location.
+    pub(crate) fn update_share_role_by_uid(
+        &self,
+        uid: &str,
+        id: &str,
+        kind: ShareEntryKind,
+        role: &str,
+    ) -> CoreResult<()> {
+        let uid = self.resolve_anywhere(uid)?;
+        self.update_share_role_for_uid(&uid, id, kind, role)
+    }
+
+    fn update_share_role_for_uid(
+        &self,
+        uid: &NodeUid,
+        id: &str,
+        kind: ShareEntryKind,
+        role: &str,
+    ) -> CoreResult<()> {
         let role = role_from_str(role)?;
         match kind {
             ShareEntryKind::Member => {
                 let member = self
                     .rt
-                    .block_on(self.client.list_share_members(&uid))
+                    .block_on(self.client.list_share_members(uid))
                     .map_err(|e| CoreError::from_api(&e, "list members"))?
                     .into_iter()
                     .find(|m| m.membership_id.to_string() == id)
@@ -146,7 +206,7 @@ impl Core {
             ShareEntryKind::ProtonInvite => {
                 let inv = self
                     .rt
-                    .block_on(self.client.list_share_invitations(&uid))
+                    .block_on(self.client.list_share_invitations(uid))
                     .map_err(|e| CoreError::from_api(&e, "list invitations"))?
                     .into_iter()
                     .find(|i| i.invitation_id == id)
@@ -170,11 +230,32 @@ impl Core {
         kind: ShareEntryKind,
     ) -> CoreResult<()> {
         let (_ino, uid) = self.resolve(rel)?;
+        self.remove_share_entry_for_uid(&uid, id, kind)
+    }
+
+    /// [`Core::remove_share_entry`] for a node addressed through any daemon
+    /// location.
+    pub(crate) fn remove_share_entry_by_uid(
+        &self,
+        uid: &str,
+        id: &str,
+        kind: ShareEntryKind,
+    ) -> CoreResult<()> {
+        let uid = self.resolve_anywhere(uid)?;
+        self.remove_share_entry_for_uid(&uid, id, kind)
+    }
+
+    fn remove_share_entry_for_uid(
+        &self,
+        uid: &NodeUid,
+        id: &str,
+        kind: ShareEntryKind,
+    ) -> CoreResult<()> {
         match kind {
             ShareEntryKind::Member => {
                 let member = self
                     .rt
-                    .block_on(self.client.list_share_members(&uid))
+                    .block_on(self.client.list_share_members(uid))
                     .map_err(|e| CoreError::from_api(&e, "list members"))?
                     .into_iter()
                     .find(|m| m.membership_id.to_string() == id)
@@ -186,7 +267,7 @@ impl Core {
             ShareEntryKind::ProtonInvite => {
                 let inv = self
                     .rt
-                    .block_on(self.client.list_share_invitations(&uid))
+                    .block_on(self.client.list_share_invitations(uid))
                     .map_err(|e| CoreError::from_api(&e, "list invitations"))?
                     .into_iter()
                     .find(|i| i.invitation_id == id)
@@ -198,7 +279,7 @@ impl Core {
             ShareEntryKind::ExternalInvite => {
                 let ext = self
                     .rt
-                    .block_on(self.client.list_external_invitations(&uid))
+                    .block_on(self.client.list_external_invitations(uid))
                     .map_err(|e| CoreError::from_api(&e, "list external invitations"))?
                     .into_iter()
                     .find(|i| i.invitation_id == id)
@@ -219,13 +300,33 @@ impl Core {
         expires: Option<i64>,
     ) -> CoreResult<PublicLinkInfo> {
         let (_ino, uid) = self.resolve(rel)?;
+        self.create_public_link_for_uid(&uid, role, password, expires)
+    }
+
+    /// [`Core::create_public_link`] for a node addressed through any daemon
+    /// location.
+    pub(crate) fn create_public_link_by_uid(
+        &self,
+        uid: &str,
+        role: &str,
+        password: Option<&str>,
+        expires: Option<i64>,
+    ) -> CoreResult<PublicLinkInfo> {
+        let uid = self.resolve_anywhere(uid)?;
+        self.create_public_link_for_uid(&uid, role, password, expires)
+    }
+
+    fn create_public_link_for_uid(
+        &self,
+        uid: &NodeUid,
+        role: &str,
+        password: Option<&str>,
+        expires: Option<i64>,
+    ) -> CoreResult<PublicLinkInfo> {
         let role = role_from_str(role)?;
         let link = self
             .rt
-            .block_on(
-                self.client
-                    .create_public_link(&uid, role, password, expires),
-            )
+            .block_on(self.client.create_public_link(uid, role, password, expires))
             .map_err(|e| CoreError::from_api(&e, "create public link"))?;
         Ok(public_link_info(link))
     }
@@ -233,9 +334,20 @@ impl Core {
     /// Remove the public link `id` from the node at `rel`.
     pub(crate) fn remove_public_link(&self, rel: &Path, id: &str) -> CoreResult<()> {
         let (_ino, uid) = self.resolve(rel)?;
+        self.remove_public_link_for_uid(&uid, id)
+    }
+
+    /// [`Core::remove_public_link`] for a node addressed through any daemon
+    /// location.
+    pub(crate) fn remove_public_link_by_uid(&self, uid: &str, id: &str) -> CoreResult<()> {
+        let uid = self.resolve_anywhere(uid)?;
+        self.remove_public_link_for_uid(&uid, id)
+    }
+
+    fn remove_public_link_for_uid(&self, uid: &NodeUid, id: &str) -> CoreResult<()> {
         let link = self
             .rt
-            .block_on(self.client.get_public_link(&uid))
+            .block_on(self.client.get_public_link(uid))
             .map_err(|e| CoreError::from_api(&e, "get public link"))?
             .filter(|l| l.public_link_id == id)
             .ok_or_else(|| CoreError::not_found("public link not found"))?;

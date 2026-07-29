@@ -174,6 +174,28 @@ impl Db {
         Ok(map)
     }
 
+    /// Whether `uid` is represented by a mirror location.
+    ///
+    /// An on-demand location proves residency through its live inode state.
+    /// Mirror locations have no FUSE state, so their folder root comes from
+    /// `sync_folder` and descendants come from the last successful
+    /// `sync_entry` baseline.
+    pub fn mirror_contains_uid(&self, uid: &str) -> Result<bool> {
+        let conn = self.conn.lock();
+        conn.query_row(
+            "SELECT EXISTS(
+                 SELECT 1
+                   FROM sync_folder AS folder
+              LEFT JOIN sync_entry AS entry ON entry.folder_id = folder.id
+                  WHERE folder.mode = 'mirror'
+                    AND (folder.remote_uid = ?1 OR entry.remote_uid = ?1)
+             )",
+            params![uid],
+            |row| row.get(0),
+        )
+        .map_err(Into::into)
+    }
+
     /// Insert or replace one baseline row.
     pub fn sync_entry_upsert(&self, folder_id: i64, e: &StoredSyncEntry) -> Result<()> {
         let conn = self.conn.lock();

@@ -240,9 +240,20 @@ pub enum Request {
         role: String,
         message: Option<String>,
     },
+    /// The by-uid twin of [`Request::ShareNode`], for nodes proven to belong to
+    /// an on-demand or mirror device location. This is a distinct variant so an
+    /// older daemon rejects it instead of ignoring `uid` and acting on `path`.
+    ShareNodeByUid {
+        uid: String,
+        emails: Vec<String>,
+        role: String,
+        message: Option<String>,
+    },
     /// List the members, pending invitations and public link of the node at
     /// mountpoint-relative `path`. Replies with [`Response::Share`].
     ListShare { path: String },
+    /// The by-uid twin of [`Request::ListShare`].
+    ListShareByUid { uid: String },
     /// Change the role of a share entry (member or pending invitation) on the node
     /// at `path`. `id` and `kind` identify the entry (from [`Response::Share`]).
     /// Replies with [`Response::Ok`].
@@ -252,10 +263,23 @@ pub enum Request {
         kind: ShareEntryKind,
         role: String,
     },
+    /// The by-uid twin of [`Request::UpdateShareRole`].
+    UpdateShareRoleByUid {
+        uid: String,
+        id: String,
+        kind: ShareEntryKind,
+        role: String,
+    },
     /// Remove a share entry (member, pending Proton invite, or external invite)
     /// from the node at `path`. Replies with [`Response::Ok`].
     RemoveShareEntry {
         path: String,
+        id: String,
+        kind: ShareEntryKind,
+    },
+    /// The by-uid twin of [`Request::RemoveShareEntry`].
+    RemoveShareEntryByUid {
+        uid: String,
         id: String,
         kind: ShareEntryKind,
     },
@@ -268,9 +292,18 @@ pub enum Request {
         password: Option<String>,
         expires: Option<i64>,
     },
+    /// The by-uid twin of [`Request::CreatePublicLink`].
+    CreatePublicLinkByUid {
+        uid: String,
+        role: String,
+        password: Option<String>,
+        expires: Option<i64>,
+    },
     /// Remove the public link `id` from the node at `path`. Replies with
     /// [`Response::Ok`].
     RemovePublicLink { path: String, id: String },
+    /// The by-uid twin of [`Request::RemovePublicLink`].
+    RemovePublicLinkByUid { uid: String, id: String },
 
     // ---- shared by me -----------------------------------------------------
     /// List the nodes I have shared with others — collaborative shares that still
@@ -1580,9 +1613,24 @@ mod tests {
                 role: "editor".into(),
                 message: Some("hi".into()),
             },
+            Request::ShareNodeByUid {
+                uid: "vol~link".into(),
+                emails: vec!["x@proton.me".into(), "y@example.com".into()],
+                role: "editor".into(),
+                message: Some("hi".into()),
+            },
             Request::ListShare { path: "a/b".into() },
+            Request::ListShareByUid {
+                uid: "vol~link".into(),
+            },
             Request::UpdateShareRole {
                 path: "a/b".into(),
+                id: "mid-1".into(),
+                kind: ShareEntryKind::Member,
+                role: "admin".into(),
+            },
+            Request::UpdateShareRoleByUid {
+                uid: "vol~link".into(),
                 id: "mid-1".into(),
                 kind: ShareEntryKind::Member,
                 role: "admin".into(),
@@ -1592,14 +1640,29 @@ mod tests {
                 id: "iid-1".into(),
                 kind: ShareEntryKind::ExternalInvite,
             },
+            Request::RemoveShareEntryByUid {
+                uid: "vol~link".into(),
+                id: "iid-1".into(),
+                kind: ShareEntryKind::ExternalInvite,
+            },
             Request::CreatePublicLink {
                 path: "a/b".into(),
                 role: "viewer".into(),
                 password: Some("pw".into()),
                 expires: Some(1_700_000_000),
             },
+            Request::CreatePublicLinkByUid {
+                uid: "vol~link".into(),
+                role: "viewer".into(),
+                password: Some("pw".into()),
+                expires: Some(1_700_000_000),
+            },
             Request::RemovePublicLink {
                 path: "a/b".into(),
+                id: "url-1".into(),
+            },
+            Request::RemovePublicLinkByUid {
+                uid: "vol~link".into(),
                 id: "url-1".into(),
             },
             Request::ListSharedByMe,
@@ -1632,6 +1695,222 @@ mod tests {
             assert!(!line.contains('\n'), "wire form must be a single line");
             let back: Request = serde_json::from_str(&line).unwrap();
             assert_eq!(line, serde_json::to_string(&back).unwrap());
+        }
+    }
+
+    #[test]
+    fn path_share_requests_keep_their_existing_wire_shape() {
+        let cases = [
+            (
+                Request::ShareNode {
+                    path: "a/b".into(),
+                    emails: vec!["x@example.com".into()],
+                    role: "viewer".into(),
+                    message: None,
+                },
+                r#"{"ShareNode":{"path":"a/b","emails":["x@example.com"],"role":"viewer","message":null}}"#,
+            ),
+            (
+                Request::ListShare { path: "a/b".into() },
+                r#"{"ListShare":{"path":"a/b"}}"#,
+            ),
+            (
+                Request::UpdateShareRole {
+                    path: "a/b".into(),
+                    id: "member".into(),
+                    kind: ShareEntryKind::Member,
+                    role: "editor".into(),
+                },
+                r#"{"UpdateShareRole":{"path":"a/b","id":"member","kind":"Member","role":"editor"}}"#,
+            ),
+            (
+                Request::RemoveShareEntry {
+                    path: "a/b".into(),
+                    id: "invite".into(),
+                    kind: ShareEntryKind::ProtonInvite,
+                },
+                r#"{"RemoveShareEntry":{"path":"a/b","id":"invite","kind":"ProtonInvite"}}"#,
+            ),
+            (
+                Request::CreatePublicLink {
+                    path: "a/b".into(),
+                    role: "viewer".into(),
+                    password: None,
+                    expires: None,
+                },
+                r#"{"CreatePublicLink":{"path":"a/b","role":"viewer","password":null,"expires":null}}"#,
+            ),
+            (
+                Request::RemovePublicLink {
+                    path: "a/b".into(),
+                    id: "link".into(),
+                },
+                r#"{"RemovePublicLink":{"path":"a/b","id":"link"}}"#,
+            ),
+        ];
+
+        for (request, expected) in cases {
+            assert_eq!(serde_json::to_string(&request).unwrap(), expected);
+            assert!(
+                !expected.contains("\"uid\""),
+                "path variants must never acquire an optional uid"
+            );
+        }
+    }
+
+    #[test]
+    fn by_uid_share_requests_are_distinct_wire_variants() {
+        let cases = [
+            (
+                Request::ShareNodeByUid {
+                    uid: "vol~link".into(),
+                    emails: vec!["x@example.com".into()],
+                    role: "viewer".into(),
+                    message: None,
+                },
+                "ShareNodeByUid",
+            ),
+            (
+                Request::ListShareByUid {
+                    uid: "vol~link".into(),
+                },
+                "ListShareByUid",
+            ),
+            (
+                Request::UpdateShareRoleByUid {
+                    uid: "vol~link".into(),
+                    id: "member".into(),
+                    kind: ShareEntryKind::Member,
+                    role: "editor".into(),
+                },
+                "UpdateShareRoleByUid",
+            ),
+            (
+                Request::RemoveShareEntryByUid {
+                    uid: "vol~link".into(),
+                    id: "invite".into(),
+                    kind: ShareEntryKind::ProtonInvite,
+                },
+                "RemoveShareEntryByUid",
+            ),
+            (
+                Request::CreatePublicLinkByUid {
+                    uid: "vol~link".into(),
+                    role: "viewer".into(),
+                    password: None,
+                    expires: None,
+                },
+                "CreatePublicLinkByUid",
+            ),
+            (
+                Request::RemovePublicLinkByUid {
+                    uid: "vol~link".into(),
+                    id: "link".into(),
+                },
+                "RemovePublicLinkByUid",
+            ),
+        ];
+
+        for (request, variant) in cases {
+            let wire = serde_json::to_string(&request).unwrap();
+            let object = serde_json::from_str::<serde_json::Value>(&wire)
+                .unwrap()
+                .as_object()
+                .cloned()
+                .unwrap();
+            assert_eq!(object.len(), 1);
+            assert!(object.contains_key(variant));
+            let decoded = serde_json::from_str::<Request>(&wire).unwrap();
+            let decoded_uid = match &decoded {
+                Request::ShareNodeByUid { uid, .. }
+                | Request::ListShareByUid { uid }
+                | Request::UpdateShareRoleByUid { uid, .. }
+                | Request::RemoveShareEntryByUid { uid, .. }
+                | Request::CreatePublicLinkByUid { uid, .. }
+                | Request::RemovePublicLinkByUid { uid, .. } => uid,
+                other => panic!("decoded into the wrong dispatch variant: {other:?}"),
+            };
+            assert_eq!(decoded_uid, "vol~link");
+            assert_eq!(serde_json::to_string(&decoded).unwrap(), wire);
+        }
+    }
+
+    #[test]
+    fn legacy_daemons_reject_new_by_uid_variants() {
+        #[allow(dead_code)]
+        #[derive(serde::Deserialize)]
+        enum LegacyShareRequest {
+            ShareNode {
+                path: String,
+                emails: Vec<String>,
+                role: String,
+                message: Option<String>,
+            },
+            ListShare {
+                path: String,
+            },
+            UpdateShareRole {
+                path: String,
+                id: String,
+                kind: ShareEntryKind,
+                role: String,
+            },
+            RemoveShareEntry {
+                path: String,
+                id: String,
+                kind: ShareEntryKind,
+            },
+            CreatePublicLink {
+                path: String,
+                role: String,
+                password: Option<String>,
+                expires: Option<i64>,
+            },
+            RemovePublicLink {
+                path: String,
+                id: String,
+            },
+        }
+
+        let requests = [
+            Request::ShareNodeByUid {
+                uid: "vol~link".into(),
+                emails: Vec::new(),
+                role: "viewer".into(),
+                message: None,
+            },
+            Request::ListShareByUid {
+                uid: "vol~link".into(),
+            },
+            Request::UpdateShareRoleByUid {
+                uid: "vol~link".into(),
+                id: "member".into(),
+                kind: ShareEntryKind::Member,
+                role: "viewer".into(),
+            },
+            Request::RemoveShareEntryByUid {
+                uid: "vol~link".into(),
+                id: "member".into(),
+                kind: ShareEntryKind::Member,
+            },
+            Request::CreatePublicLinkByUid {
+                uid: "vol~link".into(),
+                role: "viewer".into(),
+                password: None,
+                expires: None,
+            },
+            Request::RemovePublicLinkByUid {
+                uid: "vol~link".into(),
+                id: "link".into(),
+            },
+        ];
+
+        for request in requests {
+            let wire = serde_json::to_string(&request).unwrap();
+            assert!(
+                serde_json::from_str::<LegacyShareRequest>(&wire).is_err(),
+                "an old daemon must reject {wire}, never reinterpret it as a path request"
+            );
         }
     }
 

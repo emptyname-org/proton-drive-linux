@@ -692,11 +692,37 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
             },
             Err(e) => CtlResponse::error(e),
         },
+        Ok(CtlRequest::ShareNodeByUid {
+            uid,
+            emails,
+            role,
+            message,
+        }) => match core.share_node_by_uid(&uid, &emails, &role, message.as_deref()) {
+            Ok((proton, external)) => {
+                core.log_activity(
+                    ActivityKind::Share,
+                    &uid,
+                    format!("{} recipient(s) as {role}", proton + external),
+                    true,
+                );
+                CtlResponse::Ok {
+                    message: format!("invited {proton} Proton and {external} external user(s)"),
+                }
+            }
+            Err(e) => {
+                core.log_activity(ActivityKind::Share, &uid, &e, false);
+                CtlResponse::error(e)
+            }
+        },
         Ok(CtlRequest::ListShare { path }) => match rel_to_mount(mountpoint, &path) {
             Ok(rel) => match core.list_share(&rel) {
                 Ok((entries, link)) => CtlResponse::Share { entries, link },
                 Err(e) => CtlResponse::error(e),
             },
+            Err(e) => CtlResponse::error(e),
+        },
+        Ok(CtlRequest::ListShareByUid { uid }) => match core.list_share_by_uid(&uid) {
+            Ok((entries, link)) => CtlResponse::Share { entries, link },
             Err(e) => CtlResponse::error(e),
         },
         Ok(CtlRequest::UpdateShareRole {
@@ -713,6 +739,17 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
             },
             Err(e) => CtlResponse::error(e),
         },
+        Ok(CtlRequest::UpdateShareRoleByUid {
+            uid,
+            id,
+            kind,
+            role,
+        }) => match core.update_share_role_by_uid(&uid, &id, kind, &role) {
+            Ok(()) => CtlResponse::Ok {
+                message: format!("role updated to {role}"),
+            },
+            Err(e) => CtlResponse::error(e),
+        },
         Ok(CtlRequest::RemoveShareEntry { path, id, kind }) => {
             match rel_to_mount(mountpoint, &path) {
                 Ok(rel) => match core.remove_share_entry(&rel, &id, kind) {
@@ -724,6 +761,17 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
                     }
                     Err(e) => CtlResponse::error(e),
                 },
+                Err(e) => CtlResponse::error(e),
+            }
+        }
+        Ok(CtlRequest::RemoveShareEntryByUid { uid, id, kind }) => {
+            match core.remove_share_entry_by_uid(&uid, &id, kind) {
+                Ok(()) => {
+                    core.log_activity(ActivityKind::Unshare, &uid, "access removed", true);
+                    CtlResponse::Ok {
+                        message: "removed".to_string(),
+                    }
+                }
                 Err(e) => CtlResponse::error(e),
             }
         }
@@ -745,6 +793,21 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
             },
             Err(e) => CtlResponse::error(e),
         },
+        Ok(CtlRequest::CreatePublicLinkByUid {
+            uid,
+            role,
+            password,
+            expires,
+        }) => match core.create_public_link_by_uid(&uid, &role, password.as_deref(), expires) {
+            Ok(link) => {
+                core.log_activity(ActivityKind::PublicLink, &uid, "link created", true);
+                CtlResponse::PublicLink { link }
+            }
+            Err(e) => {
+                core.log_activity(ActivityKind::PublicLink, &uid, &e, false);
+                CtlResponse::error(e)
+            }
+        },
         Ok(CtlRequest::RemovePublicLink { path, id }) => match rel_to_mount(mountpoint, &path) {
             Ok(rel) => match core.remove_public_link(&rel, &id) {
                 Ok(()) => {
@@ -757,6 +820,17 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
             },
             Err(e) => CtlResponse::error(e),
         },
+        Ok(CtlRequest::RemovePublicLinkByUid { uid, id }) => {
+            match core.remove_public_link_by_uid(&uid, &id) {
+                Ok(()) => {
+                    core.log_activity(ActivityKind::Unshare, &uid, "link removed", true);
+                    CtlResponse::Ok {
+                        message: "public link removed".to_string(),
+                    }
+                }
+                Err(e) => CtlResponse::error(e),
+            }
+        }
         Ok(CtlRequest::ListSharedWithMe) => match core.list_shared_with_me() {
             Ok(entries) => CtlResponse::Entries { entries },
             Err(e) => CtlResponse::error(e),

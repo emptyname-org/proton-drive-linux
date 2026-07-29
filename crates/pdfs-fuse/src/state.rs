@@ -173,6 +173,61 @@ pub(crate) struct State {
 }
 
 impl State {
+    /// Whether `uid` names an owned node currently reachable from this mount's
+    /// root. Resident entries can outlive their dentries for open-handle and
+    /// access-revocation semantics, so `by_uid` membership alone is not proof
+    /// that a control-socket operation may address the node.
+    pub(crate) fn owns_visible_uid(&self, uid: &NodeUid) -> bool {
+        let Some(root) = self.entries.get(&crate::ROOT_INO) else {
+            return false;
+        };
+        if uid.volume_id != root.uid.volume_id {
+            return false;
+        }
+
+        let Some(&target) = self.by_uid.get(uid) else {
+            return false;
+        };
+        let mut current = target;
+        let mut seen = HashSet::new();
+        loop {
+            if !seen.insert(current) {
+                return false;
+            }
+            let Some(entry) = self.entries.get(&current) else {
+                return false;
+            };
+            if entry.uid.volume_id != root.uid.volume_id
+                || entry.unlinked
+                || entry.node.trashed
+                || entry.uid != entry.node.uid
+                || self.by_uid.get(&entry.uid) != Some(&current)
+            {
+                return false;
+            }
+            if current == crate::ROOT_INO {
+                return true;
+            }
+
+            let parent = entry.parent;
+            if parent == 0 || parent == current {
+                return false;
+            }
+            let Some(parent_entry) = self.entries.get(&parent) else {
+                return false;
+            };
+            if entry.node.parent_uid.as_ref() != Some(&parent_entry.uid)
+                || self
+                    .children
+                    .get(&parent)
+                    .is_some_and(|children| !children.contains(&current))
+            {
+                return false;
+            }
+            current = parent;
+        }
+    }
+
     pub(crate) fn require_writable(&self, ino: u64) -> Result<(), fuser::Errno> {
         match self.entries.get(&ino) {
             Some(entry) if entry.writable() => Ok(()),
