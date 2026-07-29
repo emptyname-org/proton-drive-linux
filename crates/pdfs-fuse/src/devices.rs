@@ -489,6 +489,7 @@ impl Core {
     /// (devices.md Phase 3).
     pub(crate) fn fork_state(&self) -> Core {
         let mut fork = self.clone();
+        fork.primary = false;
         let share_access = self.state.lock().share_access.clone();
         fork.state = Arc::new(Mutex::new(State {
             entries: HashMap::new(),

@@ -62,18 +62,18 @@ use pdfs_core::control::{
 };
 use pdfs_core::db::{
     Db, LOCAL_VOLUME, OP_CREATE, OP_MKDIR, OP_RENAME, OP_REVISION, OP_TRASH, PARK_UNTIL, PendingOp,
-    RenameMeta, StoredNode, StoredSyncFolder, StoredTrash,
+    PublishedSharedRoot, RenameMeta, StoredNode, StoredSyncFolder, StoredTrash,
 };
 use pdfs_core::localindex;
 use pdfs_core::search::relevance_score;
 use pdfs_core::syncignore::is_transient_name;
-use pdfs_core::{Access, CoreError, CoreResult, perm_bits};
+use pdfs_core::{Access, CoreError, CoreResult, access_for, perm_bits};
 use proton_drive_rs::proton_sdk::api::ResponseCode;
 use proton_drive_rs::proton_sdk::error::ProtonError;
-use proton_drive_rs::proton_sdk::ids::{DriveEventId, LinkId, NodeUid, VolumeId};
+use proton_drive_rs::proton_sdk::ids::{DriveEventId, LinkId, NodeUid, ShareId, VolumeId};
 use proton_drive_rs::{
     DriveEvent, DriveEventScopeId, MemberRole, Node, NodeKind, ProtonDriveClient,
-    ProtonPhotosClient, RevisionReader, ThumbnailType,
+    ProtonPhotosClient, RevisionReader, SharedWithMeItem, ThumbnailType,
 };
 
 mod background;
@@ -93,6 +93,7 @@ mod sweep;
 mod sync;
 mod transfers;
 mod upload;
+mod r#virtual;
 mod workers;
 use background::{run_event_sync, run_local_index};
 pub(crate) use mount::is_stale_mount;
@@ -102,6 +103,11 @@ use reads::{ReaderSlot, STREAM_BYPASS_MIN, StreamRing};
 use state::{Entry, Intervals, PendingRevision, State, WriteHandle};
 use tracing::{debug, error, info, warn};
 use transfers::{CountingWriter, JobGuard, OwnedCountingReader, TransferRegistry};
+use r#virtual::{
+    SharedListingPlan, SharedRefreshDeadlines, disambiguate_shared_names, is_own_or_virtual_uid,
+    is_primary_root_listing, is_virtual_uid, listing_needs_refresh, refresh_generation_is_current,
+    shared_listing_plan, shared_with_me_uid, virtual_node, virtual_root_name,
+};
 use workers::{FUSE_WORKERS, Lane, Workers};
 
 /// Attribute/entry cache lifetime handed back to the kernel. Long because the
@@ -151,6 +157,9 @@ const TIMELINE_ENRICH_CHUNK: usize = 200;
 /// one listing a user changes and then immediately looks at — though our own
 /// mutations also invalidate it outright, so this only covers other clients.
 const TRASH_TTL: Duration = Duration::from_secs(60);
+/// Shared roots and foreign-volume folders have no event manager. Revalidate
+/// them on access while online; stale persisted listings remain usable offline.
+const SHARED_LISTING_TTL: Duration = Duration::from_secs(60);
 /// How many trashed nodes are materialized per
 /// [`ProtonDriveClient::enumerate_nodes`] call, and persisted as a batch. The
 /// trash of an account that has been through a conflict storm runs to thousands
@@ -174,6 +183,9 @@ const TRASH_FIRST_WAIT: Duration = Duration::from_secs(20);
 const PHOTOS_SYNCED_MS: &str = "photos_synced_ms";
 const PHOTOS_AVAILABLE: &str = "photos_available";
 const TRASH_SYNCED_MS: &str = "trash_synced_ms";
+const SHARED_WITH_ME_NAME: &str = "shared_with_me_name";
+const SHARED_WITH_ME_SYNCED_MS: &str = "shared_with_me_synced_ms";
+const SHARED_FOLDER_SYNCED_PREFIX: &str = "shared_folder_synced_ms:";
 
 /// How stale the local-file index may get before the background scanner rebuilds
 /// it. A rescan is a full walk of `$HOME`, so this trades index freshness against
@@ -213,6 +225,12 @@ const SIZE_UPGRADE_CHUNK: usize = 150;
 struct Core {
     client: ProtonDriveClient,
     rt: tokio::runtime::Handle,
+    /// The daemon's My Files root. Forked on-demand sessions retain this value
+    /// so ownership checks never mistake their own mount root for account scope.
+    primary_root_uid: NodeUid,
+    /// False only for a forked on-demand device mount. The synthetic shared
+    /// directory belongs exclusively to the primary My Files inode space.
+    primary: bool,
     state: Arc<Mutex<State>>,
     cache: Arc<ContentCache>,
     /// Open [`RevisionReader`]s keyed by node, so the block fetches of a file
@@ -232,6 +250,14 @@ struct Core {
     /// `State` maps. Every mutation writes through here, and the maps rehydrate
     /// from it on mount (plan.md P1).
     db: Arc<Db>,
+    /// Serializes only shared-list publication and access-loss invalidation.
+    /// Network calls happen before taking it.
+    shared_publication: Arc<Mutex<()>>,
+    /// Invalidates in-flight shared responses when access/list events arrive.
+    shared_generation: Arc<AtomicU64>,
+    /// Successful refreshes suppress retries even if persisting their timestamp
+    /// fails. Shared across primary/fork clones and cleared by access events.
+    shared_refresh_deadlines: Arc<Mutex<SharedRefreshDeadlines>>,
     /// False while the API is unreachable and we are serving the cached tree
     /// (offline.md Phase 1). Set by the probe thread; read by front-ends through
     /// `Response::Status` so the UI can say so rather than leaving the user to
@@ -658,6 +684,99 @@ fn release_can_discard_unlinked(db: &Db, uid: &NodeUid) -> bool {
     }
 }
 
+struct AcceptedShares {
+    uids: Vec<NodeUid>,
+    /// `None` means duplicate listing rows disagreed on provenance.
+    share_ids: HashMap<NodeUid, Option<ShareId>>,
+}
+
+fn accepted_share_provenance(items: Vec<SharedWithMeItem>) -> AcceptedShares {
+    let mut uids = Vec::new();
+    let mut share_ids = HashMap::new();
+    for item in items {
+        match share_ids.entry(item.uid.clone()) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                uids.push(item.uid);
+                entry.insert(Some(item.share_id));
+            }
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                if entry.get().as_ref() != Some(&item.share_id) {
+                    entry.insert(None);
+                }
+            }
+        }
+    }
+    AcceptedShares { uids, share_ids }
+}
+
+fn shared_root_access(nodes: &[&Node], expected_share: Option<&ShareId>) -> Access {
+    let Some(expected_share) = expected_share else {
+        return Access::Viewer;
+    };
+    let mut observed = None;
+    for node in nodes {
+        let Some(membership) = node.membership.as_ref() else {
+            return Access::Viewer;
+        };
+        if &membership.share_id != expected_share {
+            return Access::Viewer;
+        }
+        let Some(role) = membership.role_exact() else {
+            return Access::Viewer;
+        };
+        let access = access_for(Some(role), Access::Viewer, true);
+        if observed.is_some_and(|prior| prior != access) {
+            return Access::Viewer;
+        }
+        observed = Some(access);
+    }
+    observed.unwrap_or(Access::Viewer)
+}
+
+fn prepare_shared_roots(
+    accepted: &AcceptedShares,
+    mut materialized: Vec<Node>,
+    parent: &NodeUid,
+) -> Vec<PublishedSharedRoot> {
+    materialized.retain(|node| accepted.share_ids.contains_key(&node.uid));
+    materialized.sort_by(|a, b| {
+        a.uid
+            .to_string()
+            .cmp(&b.uid.to_string())
+            .then_with(|| a.name.cmp(&b.name))
+    });
+    let mut published = Vec::new();
+    let mut start = 0usize;
+    while start < materialized.len() {
+        let uid = materialized[start].uid.clone();
+        let mut end = start + 1;
+        while end < materialized.len() && materialized[end].uid == uid {
+            end += 1;
+        }
+        let access = shared_root_access(
+            &materialized[start..end].iter().collect::<Vec<_>>(),
+            accepted.share_ids.get(&uid).and_then(Option::as_ref),
+        );
+        let mut node = materialized[start].clone();
+        node.parent_uid = Some(parent.clone());
+        node.trashed = false;
+        published.push(PublishedSharedRoot { node, access });
+        start = end;
+    }
+    let mut named: Vec<Node> = published.iter().map(|root| root.node.clone()).collect();
+    disambiguate_shared_names(&mut named);
+    let names: HashMap<NodeUid, String> = named
+        .into_iter()
+        .map(|node| (node.uid, node.name))
+        .collect();
+    for root in &mut published {
+        if let Some(name) = names.get(&root.node.uid) {
+            root.node.name.clone_from(name);
+        }
+    }
+    published
+}
+
 impl Core {
     /// Record that this daemon just changed `uid` on the remote, so the event
     /// feed's echo of that change is recognised instead of re-applied. Called
@@ -1011,29 +1130,281 @@ impl Core {
         apply_pending_sizes(nodes, &sizes);
     }
 
+    fn prepare_virtual_root(&self, real_names: &HashSet<String>) -> Result<(Node, bool), Errno> {
+        let pinned = self.db.state_str(SHARED_WITH_ME_NAME).map_err(|error| {
+            error!(%error, "reading shared-root display name failed");
+            Errno::EIO
+        })?;
+        let (name, visible) = virtual_root_name(real_names, pinned.as_deref());
+        if pinned.is_none() {
+            self.db
+                .set_state_str(SHARED_WITH_ME_NAME, &name)
+                .map_err(|error| {
+                    error!(%error, "persisting shared-root display name failed");
+                    Errno::EIO
+                })?;
+        }
+
+        let uid = shared_with_me_uid();
+        let mut node = self
+            .db
+            .node_by_uid(&uid.to_string())
+            .map_err(|error| {
+                error!(%error, "reading synthetic shared root failed");
+                Errno::EIO
+            })?
+            .unwrap_or_else(|| {
+                virtual_node(self.primary_root_uid.clone(), name.clone(), now_secs())
+            });
+        node.parent_uid = Some(self.primary_root_uid.clone());
+        node.name = name;
+        node.kind = NodeKind::Folder;
+        // A later real-name collision suppresses both the dentry and its search
+        // hit. The row and pinned name remain, and clearing the collision
+        // restores both by writing `trashed = false` again.
+        node.trashed = !visible;
+        node.membership = None;
+        self.db.ensure_virtual_root(&node).map_err(|error| {
+            error!(%error, "persisting synthetic shared root failed");
+            Errno::EIO
+        })?;
+        Ok((node, visible))
+    }
+
+    /// Reconcile the synthetic dentry against an already-known primary-root
+    /// listing. The node remains persisted and pinned even while a real folder
+    /// of the same name temporarily suppresses its dentry.
+    fn reconcile_virtual_root_dentry(
+        &self,
+        parent_ino: u64,
+        real_names: HashSet<String>,
+    ) -> Result<(), Errno> {
+        let (node, visible) = self.prepare_virtual_root(&real_names)?;
+        let uid = node.uid.clone();
+        let mut st = self.state.lock();
+        st.share_access.insert(uid, Access::Viewer);
+        let virtual_ino = st.intern_mem(parent_ino, node);
+        let children = st.children.entry(parent_ino).or_default();
+        children.retain(|ino| *ino != virtual_ino);
+        if visible {
+            children.push(virtual_ino);
+        }
+        drop(st);
+        self.flush_access_changes();
+        Ok(())
+    }
+
+    fn resident_real_root_names(&self, ino: u64) -> HashSet<String> {
+        let st = self.state.lock();
+        st.children
+            .get(&ino)
+            .into_iter()
+            .flatten()
+            .filter_map(|child| st.entries.get(child))
+            .filter(|entry| !is_virtual_uid(&entry.uid))
+            .map(|entry| entry.node.name.clone())
+            .collect()
+    }
+
+    fn shared_folder_freshness_key(uid: &NodeUid) -> String {
+        format!("{SHARED_FOLDER_SYNCED_PREFIX}{uid}")
+    }
+
+    fn shared_listing_stale(&self, key: &str) -> bool {
+        if self
+            .shared_refresh_deadlines
+            .lock()
+            .is_fresh(key, Instant::now())
+        {
+            return false;
+        }
+        self.listing_stale(key, SHARED_LISTING_TTL)
+    }
+
+    fn mark_shared_refresh_success(&self, key: &str) {
+        self.shared_refresh_deadlines
+            .lock()
+            .mark(key, Instant::now(), SHARED_LISTING_TTL);
+        if let Err(error) = self.db.set_state_i64(key, now_millis()) {
+            warn!(key, %error, "persisting shared-list freshness failed");
+        }
+    }
+
+    fn invalidate_shared_refreshes(&self) {
+        self.shared_generation.fetch_add(1, Ordering::SeqCst);
+        self.shared_refresh_deadlines.lock().clear();
+    }
+
+    fn is_own_or_virtual(&self, uid: &NodeUid) -> bool {
+        is_own_or_virtual_uid(uid, &self.primary_root_uid.volume_id)
+    }
+
+    fn ensure_shared_children(&self, ino: u64) -> Result<(), Errno> {
+        let online = self.online.load(Ordering::Relaxed);
+        let resident = self.state.lock().children.contains_key(&ino);
+        match shared_listing_plan(
+            resident,
+            online,
+            self.shared_listing_stale(SHARED_WITH_ME_SYNCED_MS),
+        ) {
+            SharedListingPlan::Resident => return Ok(()),
+            SharedListingPlan::Persisted => {
+                // A completed snapshot remains useful offline even after an
+                // event expired its freshness stamp.
+                let nodes = self
+                    .db
+                    .visible_children(&shared_with_me_uid())
+                    .map_err(|error| {
+                        error!(%error, "loading persisted shared roots failed");
+                        Errno::EIO
+                    })?;
+                let mut st = self.state.lock();
+                if st.children.contains_key(&ino) {
+                    return Ok(());
+                }
+                let children = nodes
+                    .into_iter()
+                    .map(|node| {
+                        let access = st
+                            .share_access
+                            .get(&node.uid)
+                            .copied()
+                            .unwrap_or(Access::Viewer);
+                        st.intern_published_share_root(ino, node, access)
+                    })
+                    .collect();
+                st.children.insert(ino, children);
+                drop(st);
+                self.flush_access_changes();
+                return Ok(());
+            }
+            SharedListingPlan::Refresh => {}
+        }
+
+        let generation = self.shared_generation.load(Ordering::SeqCst);
+        let accepted = accepted_share_provenance(
+            self.rt
+                .block_on(self.client.enumerate_shared_with_me())
+                .map_err(|error| {
+                    error!(%error, "enumerating shared roots failed");
+                    Errno::EIO
+                })?,
+        );
+        let nodes = if accepted.uids.is_empty() {
+            Vec::new()
+        } else {
+            self.rt
+                .block_on(self.client.enumerate_nodes_light(&accepted.uids))
+                .map_err(|error| {
+                    error!(%error, "materializing shared roots failed");
+                    Errno::EIO
+                })?
+        };
+        let virtual_uid = shared_with_me_uid();
+        let published = prepare_shared_roots(&accepted, nodes, &virtual_uid);
+
+        let _publication = self.shared_publication.lock();
+        if !refresh_generation_is_current(generation, self.shared_generation.load(Ordering::SeqCst))
+        {
+            return Err(Errno::EAGAIN);
+        }
+        let removed = match self
+            .db
+            .publish_shared_roots(&virtual_uid, &accepted.uids, &published)
+        {
+            Ok(removed) => removed,
+            Err(error) => {
+                error!(%error, "publishing shared-root listing failed");
+                let mut st = self.state.lock();
+                for uid in &accepted.uids {
+                    st.downgrade_shared_subtree(uid);
+                }
+                drop(st);
+                self.flush_access_changes();
+                return Err(Errno::EIO);
+            }
+        };
+        let snapshot = self.db.visible_children(&virtual_uid).map_err(|error| {
+            error!(%error, "loading published shared-root listing failed");
+            Errno::EIO
+        })?;
+        let published_access: HashMap<NodeUid, Access> = published
+            .iter()
+            .map(|root| (root.node.uid.clone(), root.access))
+            .collect();
+        let mut st = self.state.lock();
+        for uid in &removed {
+            st.hide_shared_root(uid);
+        }
+        let mut children = Vec::with_capacity(snapshot.len());
+        for node in snapshot {
+            let uid = node.uid.clone();
+            let access = published_access
+                .get(&uid)
+                .copied()
+                .unwrap_or(Access::Viewer);
+            let child = st.intern_published_share_root(ino, node, access);
+            children.push(child);
+        }
+        st.children.insert(ino, children);
+        drop(st);
+        self.flush_access_changes();
+        self.mark_shared_refresh_success(SHARED_WITH_ME_SYNCED_MS);
+        if let Some(notifier) = self.notifier.get() {
+            let _ = notifier.inval_inode(INodeNo(ino), 0, 0);
+        }
+        Ok(())
+    }
+
     /// Enumerate `ino`'s children from the remote and cache them. No-op if the
     /// directory has already been listed. Network I/O happens without the lock
     /// held so concurrent metadata reads aren't blocked behind a fetch.
     fn ensure_children(&self, ino: u64) -> Result<(), Errno> {
-        let folder_uid = {
+        let (folder_uid, cached) = {
             let st = self.state.lock();
-            if st.children.contains_key(&ino) {
-                return Ok(());
-            }
             match st.entries.get(&ino) {
-                Some(e) => e.uid.clone(),
+                Some(e) => (e.uid.clone(), st.children.contains_key(&ino)),
                 None => return Err(Errno::ENOENT),
             }
         };
+        if is_virtual_uid(&folder_uid) {
+            return self.ensure_shared_children(ino);
+        }
 
+        let primary_root =
+            is_primary_root_listing(self.primary, &folder_uid, &self.primary_root_uid);
+        let foreign = !self.is_own_or_virtual(&folder_uid) && !is_local_uid(&folder_uid);
+        let foreign_key = foreign.then(|| Self::shared_folder_freshness_key(&folder_uid));
+        let refresh_foreign = foreign_key.as_deref().is_some_and(|key| {
+            listing_needs_refresh(
+                self.online.load(Ordering::Relaxed),
+                self.shared_listing_stale(key),
+            )
+        });
+        if cached && !refresh_foreign {
+            if primary_root {
+                self.reconcile_virtual_root_dentry(ino, self.resident_real_root_names(ino))?;
+            }
+            return Ok(());
+        }
         // Offline fast path: a folder the DB still records as fully enumerated
         // can be rebuilt from disk without hitting the API, even if its listing
         // was trimmed from the hot cache mid-run.
-        match self.db.children_if_listed(&folder_uid) {
+        let cached_nodes = if refresh_foreign {
+            Ok(None)
+        } else {
+            self.db.children_if_listed(&folder_uid)
+        };
+        match cached_nodes {
             Ok(Some(mut nodes)) => {
+                if primary_root {
+                    nodes.retain(|node| !is_virtual_uid(&node.uid));
+                }
                 // Before the lock: a DB row carries the size the server last
                 // sealed, which a queued write is ahead of (B11).
                 self.stamp_pending_sizes(&mut nodes);
+                let real_names: HashSet<String> =
+                    nodes.iter().map(|node| node.name.clone()).collect();
                 let hidden = self.hidden.lock().clone();
                 let mut st = self.state.lock();
                 if st.children.contains_key(&ino) {
@@ -1059,6 +1430,9 @@ impl Core {
                 st.children.insert(ino, child_inos);
                 drop(st);
                 self.flush_access_changes();
+                if primary_root {
+                    self.reconcile_virtual_root_dentry(ino, real_names)?;
+                }
                 // Rows persisted from a cheap enumeration whose upgrade never
                 // ran (a restart in between, say) still owe their real sizes.
                 self.spawn_size_upgrade(ino, needs_size);
@@ -1068,6 +1442,8 @@ impl Core {
             Err(e) => warn!(%folder_uid, error = %e, "db children_if_listed failed"),
         }
 
+        let refresh_generation =
+            refresh_foreign.then(|| self.shared_generation.load(Ordering::SeqCst));
         let uids = self
             .rt
             .block_on(self.client.enumerate_folder_children_node_uids(&folder_uid))
@@ -1094,18 +1470,75 @@ impl Core {
         // Same as the DB path above: the remote's size for a file with a write
         // still queued is the pre-write one (B11).
         self.stamp_pending_sizes(&mut nodes);
+        let real_names: HashSet<String> = nodes.iter().map(|node| node.name.clone()).collect();
         let hidden = self.hidden.lock().clone();
+        let mut filtered_nodes: Vec<Node> = nodes
+            .into_iter()
+            .filter(|node| node_visible(node, &folder_uid, &hidden))
+            .collect();
+        if foreign {
+            for node in &mut filtered_nodes {
+                node.parent_uid = Some(folder_uid.clone());
+            }
+            let _publication = self.shared_publication.lock();
+            if !refresh_generation_is_current(
+                refresh_generation.expect("foreign refresh has a generation"),
+                self.shared_generation.load(Ordering::SeqCst),
+            ) {
+                return Err(Errno::EAGAIN);
+            }
+            let removed = self
+                .db
+                .publish_foreign_children(&folder_uid, &uids, &filtered_nodes)
+                .map_err(|error| {
+                    error!(%folder_uid, %error, "publishing foreign-folder listing failed");
+                    Errno::EIO
+                })?;
+            let mut snapshot = self.db.visible_children(&folder_uid).map_err(|error| {
+                error!(%folder_uid, %error, "loading published foreign-folder listing failed");
+                Errno::EIO
+            })?;
+            self.stamp_pending_sizes(&mut snapshot);
+            snapshot.retain(|node| node_visible(node, &folder_uid, &hidden));
+            let needs_size: Vec<NodeUid> = snapshot
+                .iter()
+                .filter(|node| {
+                    matches!(
+                        &node.kind,
+                        NodeKind::File {
+                            claimed_size: None,
+                            ..
+                        }
+                    )
+                })
+                .map(|node| node.uid.clone())
+                .collect();
+            let mut st = self.state.lock();
+            for uid in &removed {
+                st.hide_foreign_subtree(uid);
+            }
+            let children = snapshot
+                .into_iter()
+                .map(|node| st.intern_from_db(ino, node))
+                .collect();
+            st.children.insert(ino, children);
+            drop(st);
+            self.flush_access_changes();
+            self.mark_shared_refresh_success(
+                foreign_key
+                    .as_deref()
+                    .expect("foreign refresh has a freshness key"),
+            );
+            self.spawn_size_upgrade(ino, needs_size);
+            return Ok(());
+        }
 
         let mut st = self.state.lock();
         // Lost the race? Another thread already populated it.
         if st.children.contains_key(&ino) {
             return Ok(());
         }
-        let mut child_inos = Vec::with_capacity(nodes.len());
-        let filtered_nodes: Vec<Node> = nodes
-            .into_iter()
-            .filter(|node| node_visible(node, &folder_uid, &hidden))
-            .collect();
+        let mut child_inos = Vec::with_capacity(filtered_nodes.len());
         // Files whose real size the cheap enumeration could not read. Collected
         // before interning so the upgrade below has the uids without re-walking.
         let needs_size: Vec<NodeUid> = filtered_nodes
@@ -1131,6 +1564,9 @@ impl Core {
         }
         drop(st);
         self.flush_access_changes();
+        if primary_root {
+            self.reconcile_virtual_root_dentry(ino, real_names)?;
+        }
         self.spawn_size_upgrade(ino, needs_size);
         Ok(())
     }
@@ -4035,11 +4471,12 @@ mod pending_size_tests {
 mod tests {
     use super::{
         Access, AccessFlags, Errno, HashMap, Intervals, PendingRevision, SELF_CHANGE_TTL_MS,
-        StateRegistry, conflict_name, copy_pending_for_truncate, fuse_name, is_stale_mount,
-        node_visible, note_self_change, parse_node_uid, preserve_on_access_denied,
+        ShareId, SharedWithMeItem, StateRegistry, accepted_share_provenance, conflict_name,
+        copy_pending_for_truncate, fuse_name, is_stale_mount, node_visible, note_self_change,
+        parse_node_uid, prepare_shared_roots, preserve_on_access_denied,
         release_can_discard_unlinked, release_must_retain_queued_trash, release_unlinked_entry,
         rename_needs_queue, require_node_parent_access, require_rename_access, require_uid_access,
-        take_self_change,
+        shared_with_me_uid, take_self_change,
     };
     use crate::filesystem::access_allowed;
     use pdfs_core::cache::{Baseline, StagedWrite};
@@ -4448,6 +4885,84 @@ mod tests {
         assert!(require_uid_access(&db, &uid, &[Access::Editor]).is_ok());
     }
 
+    #[test]
+    fn shared_listing_provenance_must_agree_before_editor_is_granted() {
+        use proton_drive_rs::ShareMembership;
+        use proton_drive_rs::proton_sdk::ids::ShareMembershipId;
+
+        let uid = NodeUid::new(VolumeId::from("foreign"), LinkId::from("root"));
+        let share_a = ShareId::from("share-a");
+        let share_b = ShareId::from("share-b");
+        let parent = shared_with_me_uid();
+        let item = |share_id: ShareId| SharedWithMeItem {
+            uid: uid.clone(),
+            share_id,
+        };
+        let node = |share_id: Option<ShareId>, permissions: i32| {
+            let mut node = node_helper("root", "none", "Shared", true);
+            node.uid = uid.clone();
+            node.membership = share_id.map(|share_id| ShareMembership {
+                share_id,
+                membership_id: ShareMembershipId::from("membership"),
+                permissions,
+            });
+            node
+        };
+
+        let accepted =
+            accepted_share_provenance(vec![item(share_a.clone()), item(share_a.clone())]);
+        assert_eq!(
+            prepare_shared_roots(&accepted, vec![node(Some(share_a.clone()), 6)], &parent)[0]
+                .access,
+            Access::Editor
+        );
+        for materialized in [
+            node(None, 6),
+            node(Some(share_b.clone()), 6),
+            node(Some(share_a.clone()), 12345),
+        ] {
+            assert_eq!(
+                prepare_shared_roots(&accepted, vec![materialized], &parent)[0].access,
+                Access::Viewer
+            );
+        }
+
+        let conflicting = accepted_share_provenance(vec![item(share_a), item(share_b)]);
+        assert_eq!(
+            prepare_shared_roots(
+                &conflicting,
+                vec![node(Some(ShareId::from("share-a")), 6)],
+                &parent
+            )[0]
+            .access,
+            Access::Viewer,
+            "duplicate UID provenance disagreement must fail closed"
+        );
+    }
+
+    #[test]
+    fn virtual_bulk_upload_destination_is_denied_by_runtime_authority() {
+        let (mut state, _dir) = state_test_helper();
+        let root = state.intern(0, node_helper("root", "none", "My Files", true));
+        let mut virtual_node = node_helper("sharedwithme", "root", "Shared with me", true);
+        virtual_node.uid = shared_with_me_uid();
+        state
+            .db
+            .set_share_access(&virtual_node.uid, Access::Viewer)
+            .unwrap();
+        state
+            .share_access
+            .insert(virtual_node.uid.clone(), Access::Viewer);
+        let virtual_ino = state.intern(root, virtual_node);
+        let uid = state.entries[&virtual_ino].uid.clone();
+        assert_eq!(
+            require_uid_access(&state.db, &uid, &[Access::Viewer])
+                .unwrap_err()
+                .code(),
+            libc::EACCES
+        );
+    }
+
     fn function_source<'a>(source: &'a str, signature: &str) -> &'a str {
         let start = source.find(signature).expect("function signature exists");
         let body = &source[start..];
@@ -4550,6 +5065,14 @@ mod tests {
             assert_before(function, "source_parent_uid", gate);
             assert_before(function, gate, remote_call);
         }
+
+        let upload = include_str!("upload.rs");
+        let run_uploads = function_source(upload, "async fn run_uploads(");
+        assert_before(run_uploads, "require_uid_writable", ".upload_file_from");
+        let bulk = function_source(upload, "pub(super) fn upload_paths(");
+        assert_before(bulk, "require_uid_writable", "collect_uploads");
+        let folder = function_source(upload, "fn ensure_remote_folder(");
+        assert_before(folder, "require_uid_writable(parent_uid)", ".create_folder");
     }
 
     #[test]

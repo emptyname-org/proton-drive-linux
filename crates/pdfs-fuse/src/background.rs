@@ -36,6 +36,21 @@ fn invalidate_access_changes(notifier: Option<&Notifier>, changed: &[u64]) {
     }
 }
 
+fn hide_foreign_deleted_and_notify(st: &mut State, notifier: Option<&Notifier>, uid: &NodeUid) {
+    let child = st.by_uid.get(uid).copied();
+    let dentry = child.and_then(|ino| {
+        st.entries
+            .get(&ino)
+            .map(|entry| (entry.parent, entry.node.name.clone()))
+    });
+    let changed = st.downgrade_shared_subtree(uid);
+    st.hide_foreign_subtree(uid);
+    invalidate_access_changes(notifier, &changed);
+    if let (Some(notifier), Some((parent, name)), Some(child)) = (notifier, dentry, child) {
+        let _ = notifier.delete(INodeNo(parent), INodeNo(child), OsStr::new(&name));
+    }
+}
+
 /// Persist the fail-closed part of an access event and install the same denial
 /// in resident state even when SQLite rejects the write. The caller must not
 /// acknowledge the event when this returns an error.
@@ -61,6 +76,34 @@ fn apply_access_downgrade(
     }
 }
 
+fn apply_foreign_delete(
+    db: &Db,
+    uid: &NodeUid,
+    mut deny_and_hide: impl FnMut(&NodeUid),
+) -> pdfs_core::Result<()> {
+    let result = db.tombstone_foreign_subtree(uid);
+    deny_and_hide(uid);
+    result
+}
+
+fn is_foreign_node_delete(event: &DriveEvent, own_volume: &VolumeId) -> bool {
+    match event {
+        DriveEvent::NodeDeleted { node_uid, .. } => {
+            !is_own_or_virtual_uid(node_uid, own_volume) && !is_local_uid(node_uid)
+        }
+        _ => false,
+    }
+}
+
+fn event_serializes_shared_publication(event: &DriveEvent, own_volume: &VolumeId) -> bool {
+    matches!(
+        event,
+        DriveEvent::ContinuityLost { .. }
+            | DriveEvent::ScopeAccessLost { .. }
+            | DriveEvent::SharedWithMeUpdated { .. }
+    ) || is_foreign_node_delete(event, own_volume)
+}
+
 /// Apply one remote event to the local cache and notify the kernel so it drops
 /// any stale cached metadata/data for the affected inodes.
 ///
@@ -78,15 +121,32 @@ fn apply_access_downgrade(
 /// mount must be notified through its **own** channel; that pairing is what
 /// [`Core::for_each_mount`] exists to preserve.
 fn apply_event(core: &Core, event: &DriveEvent, dirty: &mut DirtyParents) -> pdfs_core::Result<()> {
-    let access_result = apply_access_downgrade(&core.db, event, |root| {
-        core.for_each_mount(|st, notifier| {
-            let changed = match root {
-                Some(uid) => st.downgrade_shared_subtree(uid),
-                None => st.downgrade_known_shared_access(),
-            };
-            invalidate_access_changes(notifier, &changed);
-        });
-    });
+    let foreign_delete = is_foreign_node_delete(event, &core.primary_root_uid.volume_id);
+    let serializes_shared_publication =
+        event_serializes_shared_publication(event, &core.primary_root_uid.volume_id);
+    let _publication = serializes_shared_publication.then(|| core.shared_publication.lock());
+    if serializes_shared_publication {
+        core.invalidate_shared_refreshes();
+    }
+    let mut apply_result = if let DriveEvent::NodeDeleted { node_uid, .. } = event
+        && foreign_delete
+    {
+        apply_foreign_delete(&core.db, node_uid, |uid| {
+            core.for_each_mount(|st, notifier| {
+                hide_foreign_deleted_and_notify(st, notifier, uid);
+            });
+        })
+    } else {
+        apply_access_downgrade(&core.db, event, |root| {
+            core.for_each_mount(|st, notifier| {
+                let changed = match root {
+                    Some(uid) => st.downgrade_shared_subtree(uid),
+                    None => st.downgrade_known_shared_access(),
+                };
+                invalidate_access_changes(notifier, &changed);
+            });
+        })
+    };
     match event {
         DriveEvent::NodeUpdated {
             node_uid,
@@ -148,9 +208,11 @@ fn apply_event(core: &Core, event: &DriveEvent, dirty: &mut DirtyParents) -> pdf
         }
         DriveEvent::NodeDeleted { node_uid, .. } => {
             core.cache.evict(node_uid);
-            core.for_each_mount(|st, notifier| {
-                forget_and_notify(st, notifier, node_uid);
-            });
+            if !foreign_delete {
+                core.for_each_mount(|st, notifier| {
+                    forget_and_notify(st, notifier, node_uid);
+                });
+            }
         }
         // Losing event continuity or any shared-access signal makes persisted
         // shared roots untrustworthy. Keep owned/device trees unchanged, but
@@ -160,6 +222,7 @@ fn apply_event(core: &Core, event: &DriveEvent, dirty: &mut DirtyParents) -> pdf
         | DriveEvent::ScopeAccessLost { .. }
         | DriveEvent::SharedWithMeUpdated { .. } => {
             warn!("event access continuity lost; downgrading shared trees and resyncing lazily");
+            apply_result = apply_result.and(core.db.clear_state(SHARED_WITH_ME_SYNCED_MS));
             core.for_each_mount(|st, notifier| {
                 let dirs: Vec<u64> = st.children.keys().copied().collect();
                 for &ino in &dirs {
@@ -174,7 +237,7 @@ fn apply_event(core: &Core, event: &DriveEvent, dirty: &mut DirtyParents) -> pdf
         // caller persisting the event id.
         DriveEvent::CursorAdvanced { .. } => {}
     }
-    access_result
+    apply_result
 }
 
 fn acknowledge_applied_event(
@@ -467,6 +530,172 @@ mod tests {
 
     fn uid(link: &str) -> NodeUid {
         NodeUid::new(VolumeId::from("vol"), LinkId::from(link))
+    }
+
+    fn folder(volume: &str, link: &str, parent: Option<NodeUid>, name: &str) -> Node {
+        Node {
+            uid: NodeUid::new(VolumeId::from(volume), LinkId::from(link)),
+            parent_uid: parent,
+            kind: NodeKind::Folder,
+            name: name.to_string(),
+            creation_time: 1,
+            modification_time: 1,
+            trashed: false,
+            is_shared: false,
+            is_shared_publicly: false,
+            signature_email: None,
+            membership: None,
+            verification: Default::default(),
+        }
+    }
+
+    #[test]
+    fn foreign_delete_invalidates_an_earlier_refresh_generation() {
+        let own_volume = VolumeId::from("own");
+        let event = DriveEvent::NodeDeleted {
+            id: DriveEventId::from("foreign-delete"),
+            node_uid: NodeUid::new(VolumeId::from("foreign"), LinkId::from("child")),
+            parent_node_uid: None,
+        };
+        let generation = AtomicU64::new(7);
+        let captured = generation.load(Ordering::SeqCst);
+
+        assert!(event_serializes_shared_publication(&event, &own_volume));
+        generation.fetch_add(1, Ordering::SeqCst);
+
+        assert!(!refresh_generation_is_current(
+            captured,
+            generation.load(Ordering::SeqCst)
+        ));
+        let own_delete = DriveEvent::NodeDeleted {
+            id: DriveEventId::from("own-delete"),
+            node_uid: NodeUid::new(own_volume.clone(), LinkId::from("child")),
+            parent_node_uid: None,
+        };
+        assert!(!event_serializes_shared_publication(
+            &own_delete,
+            &own_volume
+        ));
+    }
+
+    #[test]
+    fn foreign_delete_tombstones_subtree_and_advances_cursor_after_success() {
+        let db = Db::open(std::path::Path::new(":memory:")).unwrap();
+        let root = folder("own", "root", None, "My Files");
+        let deleted = folder(
+            "foreign",
+            "deleted",
+            Some(root.uid.clone()),
+            "Deleted foreign",
+        );
+        let deep = folder(
+            "foreign",
+            "deep",
+            Some(deleted.uid.clone()),
+            "Searchable descendant",
+        );
+        db.upsert_nodes(&[root, deleted.clone(), deep.clone()])
+            .unwrap();
+        db.set_share_access(&deleted.uid, Access::Editor).unwrap();
+        db.enqueue_op(&PendingOp {
+            id: 0,
+            kind: OP_RENAME.to_string(),
+            uid: deep.uid.to_string(),
+            parent_uid: Some(deleted.uid.to_string()),
+            name: Some("pending".to_string()),
+            blob_path: None,
+            meta_json: Some("{}".to_string()),
+            created_at: 1,
+            attempts: 0,
+            last_error: None,
+            next_attempt_at: 0,
+        })
+        .unwrap();
+        let event = DriveEvent::NodeDeleted {
+            id: DriveEventId::from("foreign-delete-success"),
+            node_uid: deleted.uid.clone(),
+            parent_node_uid: deleted.parent_uid.clone(),
+        };
+        let denied = Cell::new(false);
+
+        let applied = apply_foreign_delete(&db, &deleted.uid, |_| denied.set(true));
+        let acknowledged = acknowledge_applied_event(&db, &event, applied).unwrap();
+
+        assert!(denied.get());
+        assert_eq!(acknowledged.as_str(), "foreign-delete-success");
+        assert_eq!(
+            db.get_event_cursor().unwrap().as_deref(),
+            Some("foreign-delete-success")
+        );
+        for uid in [&deleted.uid, &deep.uid] {
+            assert!(db.node_by_uid(&uid.to_string()).unwrap().unwrap().trashed);
+        }
+        assert!(db.search("Searchable", 10).unwrap().is_empty());
+        assert_eq!(db.pending_ops().unwrap().len(), 1);
+        assert_eq!(db.share_access(&deleted.uid).unwrap(), Some(Access::Viewer));
+    }
+
+    #[test]
+    fn foreign_delete_db_failure_denies_memory_and_retains_prior_cursor() {
+        let db = Db::open(std::path::Path::new(":memory:")).unwrap();
+        let root = folder("own", "root", None, "My Files");
+        let deleted = folder(
+            "foreign",
+            "deleted",
+            Some(root.uid.clone()),
+            "Deleted foreign",
+        );
+        let deep = folder(
+            "foreign",
+            "deep",
+            Some(deleted.uid.clone()),
+            "Still searchable",
+        );
+        db.upsert_nodes(&[root, deleted.clone(), deep.clone()])
+            .unwrap();
+        db.set_share_access(&deleted.uid, Access::Editor).unwrap();
+        db.set_event_cursor("prior-event").unwrap();
+        db.with_conn(|conn| {
+            conn.execute_batch(
+                "CREATE TRIGGER reject_foreign_tombstone
+                 BEFORE UPDATE OF trashed ON nodes
+                 WHEN OLD.uid = 'foreign~deleted'
+                 BEGIN SELECT RAISE(ABORT, 'forced tombstone failure'); END;",
+            )?;
+            Ok(())
+        })
+        .unwrap();
+        let event = DriveEvent::NodeDeleted {
+            id: DriveEventId::from("foreign-delete-failed"),
+            node_uid: deleted.uid.clone(),
+            parent_node_uid: deleted.parent_uid.clone(),
+        };
+        let denied = Cell::new(false);
+
+        let applied = apply_foreign_delete(&db, &deleted.uid, |_| denied.set(true));
+
+        assert!(applied.is_err());
+        assert!(
+            denied.get(),
+            "resident state must fail closed on DB failure"
+        );
+        assert!(acknowledge_applied_event(&db, &event, applied).is_err());
+        assert_eq!(
+            db.get_event_cursor().unwrap().as_deref(),
+            Some("prior-event")
+        );
+        assert!(
+            !db.node_by_uid(&deleted.uid.to_string())
+                .unwrap()
+                .unwrap()
+                .trashed
+        );
+        assert_eq!(db.search("searchable", 10).unwrap().len(), 1);
+        assert_eq!(
+            db.share_access(&deleted.uid).unwrap(),
+            Some(Access::Editor),
+            "the failed atomic transaction must not partially publish"
+        );
     }
 
     #[test]

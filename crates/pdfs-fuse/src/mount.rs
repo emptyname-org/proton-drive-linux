@@ -191,6 +191,8 @@ pub fn mount(
     let core = Core {
         client: client.clone(),
         rt: rt.clone(),
+        primary_root_uid: root.uid.clone(),
+        primary: true,
         state: Arc::new(Mutex::new(State {
             entries: HashMap::new(),
             by_uid: HashMap::new(),
@@ -208,6 +210,9 @@ pub fn mount(
         stream_ring: Arc::new(Mutex::new(StreamRing::default())),
         workers: Arc::new(Workers::new(FUSE_WORKERS)?),
         db,
+        shared_publication: Arc::new(Mutex::new(())),
+        shared_generation: Arc::new(AtomicU64::new(0)),
+        shared_refresh_deadlines: Arc::new(Mutex::new(SharedRefreshDeadlines::default())),
         online: Arc::new(AtomicBool::new(online)),
         pending: Arc::new(Mutex::new(HashMap::new())),
         hidden: Arc::new(Mutex::new(HashSet::new())),

@@ -82,7 +82,11 @@ impl Core {
                 return;
             }
         };
-        let nodes: Vec<_> = stored.into_iter().map(|s| s.node).collect();
+        let nodes: Vec<_> = stored
+            .into_iter()
+            .map(|stored| stored.node)
+            .filter(|node| self.is_own_or_virtual(&node.uid))
+            .collect();
 
         // Index live (non-trashed) files by (parent, name) for sibling lookup.
         let mut by_parent_name: HashMap<(String, &str), &_> = HashMap::new();

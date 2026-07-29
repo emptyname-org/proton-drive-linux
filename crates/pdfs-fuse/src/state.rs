@@ -10,8 +10,10 @@ use std::sync::Arc;
 use pdfs_core::cache::StagedWrite;
 use pdfs_core::db::Db;
 use pdfs_core::{Access, access_for};
+#[cfg(test)]
+use proton_drive_rs::MemberRole;
 use proton_drive_rs::proton_sdk::ids::NodeUid;
-use proton_drive_rs::{MemberRole, Node, NodeKind};
+use proton_drive_rs::{Node, NodeKind};
 use tracing::warn;
 
 /// A node known to the filesystem, addressed by its kernel inode.
@@ -227,7 +229,7 @@ impl State {
     /// `share_access`. P3 can call this method only when its share-root endpoint
     /// explicitly observed a role; explicit absence or an unknown wire role is
     /// represented by `None` and fails closed to Viewer.
-    #[allow(dead_code)] // P3 consumes this explicit-provenance hook.
+    #[cfg(test)]
     pub(crate) fn record_observed_share_root_role(
         &mut self,
         uid: &NodeUid,
@@ -264,6 +266,50 @@ impl State {
         changed.extend(self.recompute_descendant_access(root));
         self.access_changes.extend(changed.iter().copied());
         changed
+    }
+
+    /// Install access already committed atomically with the root node. Unlike
+    /// the observation hook this performs no database write and cannot swallow
+    /// a publication failure.
+    pub(crate) fn intern_published_share_root(
+        &mut self,
+        parent: u64,
+        node: Node,
+        access: Access,
+    ) -> u64 {
+        self.share_access.insert(node.uid.clone(), access);
+        self.intern_mem_with_access(parent, node, access)
+    }
+
+    /// Withdraw a revoked shared root from the namespace without deleting its
+    /// resident inode or persisted authority. Open handles remain usable for
+    /// reads, while removing the root's cached listing guarantees a later
+    /// reappearance re-enumerates descendants instead of exposing stale rows.
+    pub(crate) fn hide_shared_root(&mut self, uid: &NodeUid) -> Vec<u64> {
+        let changed = self.downgrade_shared_subtree(uid);
+        self.hide_subtree_mem(uid);
+        changed
+    }
+
+    /// Withdraw a foreign child removed by its authoritative folder listing.
+    /// Authority is retained because this is content deletion, not access loss.
+    pub(crate) fn hide_foreign_subtree(&mut self, uid: &NodeUid) {
+        self.hide_subtree_mem(uid);
+    }
+
+    fn hide_subtree_mem(&mut self, uid: &NodeUid) {
+        let Some(&ino) = self.by_uid.get(uid) else {
+            return;
+        };
+        let Some(entry) = self.entries.get_mut(&ino) else {
+            return;
+        };
+        entry.node.trashed = true;
+        let parent = entry.parent;
+        if let Some(children) = self.children.get_mut(&parent) {
+            children.retain(|child| *child != ino);
+        }
+        self.children.remove(&ino);
     }
 
     fn resident_children(&self) -> HashMap<u64, Vec<u64>> {
@@ -482,8 +528,12 @@ impl State {
     /// only. Every caller owes the DB a write-through — see the callers below;
     /// the split exists so a batch can pay for one transaction instead of `n`.
     pub(crate) fn intern_mem(&mut self, parent: u64, node: Node) -> u64 {
+        let access = self.access_for_node(parent, &node);
+        self.intern_mem_with_access(parent, node, access)
+    }
+
+    fn intern_mem_with_access(&mut self, parent: u64, node: Node, access: Access) -> u64 {
         if let Some(&ino) = self.by_uid.get(&node.uid) {
-            let access = self.access_for_node(parent, &node);
             let changed = self
                 .entries
                 .get(&ino)
@@ -500,7 +550,6 @@ impl State {
             }
             return ino;
         }
-        let access = self.access_for_node(parent, &node);
         let ino = self.next_ino;
         self.next_ino += 1;
         self.by_uid.insert(node.uid.clone(), ino);
@@ -1024,6 +1073,64 @@ mod tests {
     }
 
     #[test]
+    fn omitted_accepted_root_is_visible_but_resident_access_fails_closed() {
+        let (mut st, _dir) = state();
+        let owned_root = st.intern(0, node("root", "none", "My Files", true));
+        let virtual_uid = NodeUid::new(VolumeId::from("virtual"), LinkId::from("sharedwithme"));
+        let mut virtual_root = node("placeholder", "root", "Shared with me", true);
+        virtual_root.uid = virtual_uid.clone();
+        st.db.upsert_node(&virtual_root).unwrap();
+        st.db
+            .set_share_access(&virtual_uid, Access::Viewer)
+            .unwrap();
+        let virtual_ino = st.intern_published_share_root(owned_root, virtual_root, Access::Viewer);
+
+        let mut shared = node("shared", "placeholder", "Retained", true);
+        shared.parent_uid = Some(virtual_uid.clone());
+        shared.membership = Some(membership(6));
+        st.db.upsert_node(&shared).unwrap();
+        st.db.set_share_access(&shared.uid, Access::Editor).unwrap();
+        let shared_ino =
+            st.intern_published_share_root(virtual_ino, shared.clone(), Access::Editor);
+        let child = st.intern(
+            shared_ino,
+            node("shared-child", "shared", "pending.txt", false),
+        );
+        st.db
+            .enqueue_op(&pdfs_core::db::PendingOp {
+                id: 0,
+                kind: pdfs_core::db::OP_RENAME.to_string(),
+                uid: uid("shared-child").to_string(),
+                parent_uid: Some(shared.uid.to_string()),
+                name: Some("pending-renamed.txt".to_string()),
+                blob_path: None,
+                meta_json: Some("{}".to_string()),
+                created_at: 1,
+                attempts: 0,
+                last_error: None,
+                next_attempt_at: 0,
+            })
+            .unwrap();
+        assert_eq!(st.entries[&shared_ino].access, Access::Editor);
+        assert_eq!(st.entries[&child].access, Access::Editor);
+
+        st.db
+            .publish_shared_roots(&virtual_uid, std::slice::from_ref(&shared.uid), &[])
+            .unwrap();
+        let snapshot = st.db.visible_children(&virtual_uid).unwrap();
+        assert_eq!(snapshot.len(), 1);
+        st.intern_published_share_root(virtual_ino, snapshot[0].clone(), Access::Viewer);
+
+        assert_eq!(
+            st.db.share_access(&shared.uid).unwrap(),
+            Some(Access::Viewer)
+        );
+        assert_eq!(st.entries[&shared_ino].access, Access::Viewer);
+        assert_eq!(st.entries[&child].access, Access::Viewer);
+        assert_eq!(st.db.pending_ops().unwrap().len(), 1);
+    }
+
+    #[test]
     fn persisted_share_access_controls_offline_hydration() {
         let (mut st, _dir) = state();
         let root_node = node("root", "none", "My Files", true);
@@ -1158,6 +1265,50 @@ mod tests {
         let pending = st.take_access_changes();
         assert!(pending.contains(&shared));
         assert!(pending.contains(&child));
+    }
+
+    #[test]
+    fn synthetic_container_and_observed_roles_drive_shared_access() {
+        let (mut st, _dir) = state();
+        let owned_root = st.intern(0, node("root", "none", "My Files", true));
+        let virtual_uid = NodeUid::new(VolumeId::from("virtual"), LinkId::from("sharedwithme"));
+        let mut virtual_node = node("sharedwithme", "root", "Shared with me", true);
+        virtual_node.uid = virtual_uid.clone();
+        st.db
+            .set_share_access(&virtual_uid, Access::Viewer)
+            .unwrap();
+        st.share_access.insert(virtual_uid.clone(), Access::Viewer);
+        let virtual_ino = st.intern(owned_root, virtual_node);
+        st.children.insert(virtual_ino, Vec::new());
+        assert_eq!(st.entries[&virtual_ino].access, Access::Viewer);
+
+        let viewer = st.intern(virtual_ino, node("viewer", "sharedwithme", "Viewer", true));
+        let editor = st.intern(virtual_ino, node("editor", "sharedwithme", "Editor", true));
+        let unknown = st.intern(
+            virtual_ino,
+            node("unknown", "sharedwithme", "Unknown", true),
+        );
+        st.record_observed_share_root_role(&uid("viewer"), Some(MemberRole::Viewer));
+        st.record_observed_share_root_role(&uid("editor"), Some(MemberRole::Editor));
+        st.record_observed_share_root_role(&uid("unknown"), None);
+        let child = st.intern(editor, node("child", "editor", "child.txt", false));
+
+        assert_eq!(st.entries[&viewer].access, Access::Viewer);
+        assert_eq!(st.entries[&editor].access, Access::Editor);
+        assert_eq!(st.entries[&unknown].access, Access::Viewer);
+        assert_eq!(st.entries[&child].access, Access::Editor);
+
+        st.children
+            .get_mut(&virtual_ino)
+            .unwrap()
+            .extend([viewer, editor, unknown]);
+        let changed = st.hide_shared_root(&uid("editor"));
+        assert!(changed.contains(&editor));
+        assert!(changed.contains(&child));
+        assert!(!st.children[&virtual_ino].contains(&editor));
+        assert!(!st.children.contains_key(&editor));
+        assert_eq!(st.entries[&editor].access, Access::Viewer);
+        assert_eq!(st.entries[&child].access, Access::Viewer);
     }
 
     #[test]

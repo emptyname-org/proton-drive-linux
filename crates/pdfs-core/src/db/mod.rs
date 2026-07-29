@@ -41,7 +41,7 @@ pub use cache::CacheEntryInput;
 pub use devices::StoredDevice;
 pub use local::LocalFileHit;
 pub use maintenance::{DbStats, VacuumOutcome};
-pub use nodes::{SearchHit, StoredNode};
+pub use nodes::{PublishedSharedRoot, SearchHit, StoredNode};
 pub use ops::{
     AttachedBlob, LOCAL_VOLUME, OP_CREATE, OP_MKDIR, OP_RENAME, OP_REVISION, OP_TRASH, PARK_UNTIL,
     PendingCounts, PendingOp, RenameMeta, op_supersedes,

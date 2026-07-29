@@ -87,6 +87,12 @@ fn uid(link: &str) -> NodeUid {
     NodeUid::new(VolumeId::from("vol"), LinkId::from(link))
 }
 
+fn now_test_id() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
 // `NodeVerification` is not re-exported, so build test nodes by
 // deserializing JSON (the field has a serde default and can be omitted).
 fn node_from(parent: serde_json::Value, link: &str, name: &str, kind: serde_json::Value) -> Node {
@@ -274,6 +280,13 @@ fn file(link: &str, parent: &str, name: &str, size: i64) -> Node {
     )
 }
 
+fn foreign_folder(volume: &str, link: &str, parent: NodeUid, name: &str) -> Node {
+    let mut node = folder(link, None, name);
+    node.uid = NodeUid::new(VolumeId::from(volume), LinkId::from(link));
+    node.parent_uid = Some(parent);
+    node
+}
+
 /// Recovering the root by uid is what lets the daemon mount offline
 /// (offline.md Phase 1): the uid is remembered in `sync_state`, the node
 /// itself comes back out of `nodes`.
@@ -436,6 +449,375 @@ fn children_if_listed_excludes_trashed() {
         db.children_if_listed(&uid("root")).unwrap().unwrap().len(),
         0
     );
+}
+
+#[test]
+fn shared_root_replacement_tombstones_without_losing_work_or_authority() {
+    let db = Db::open_in_memory().unwrap();
+    let own_root = folder("root", None, "My Files");
+    let virtual_uid = NodeUid::new(VolumeId::from("virtual"), LinkId::from("sharedwithme"));
+    let virtual_root = foreign_folder(
+        "virtual",
+        "sharedwithme",
+        own_root.uid.clone(),
+        "Shared with me",
+    );
+    let shared = foreign_folder("foreign", "share", virtual_uid.clone(), "Project");
+    let child = foreign_folder("foreign", "child", shared.uid.clone(), "Secret");
+    db.upsert_nodes(&[own_root, virtual_root, shared.clone(), child.clone()])
+        .unwrap();
+    db.set_share_access(&shared.uid, crate::Access::Editor)
+        .unwrap();
+    db.enqueue_op(&PendingOp {
+        id: 0,
+        kind: OP_REVISION.to_string(),
+        uid: child.uid.to_string(),
+        parent_uid: Some(shared.uid.to_string()),
+        name: Some(child.name.clone()),
+        blob_path: Some("/staging/shared-edit".to_string()),
+        meta_json: Some("{}".to_string()),
+        created_at: 1,
+        attempts: 0,
+        last_error: None,
+        next_attempt_at: 0,
+    })
+    .unwrap();
+    assert_eq!(db.search("Secret", 10).unwrap().len(), 1);
+
+    let removed = db.publish_shared_roots(&virtual_uid, &[], &[]).unwrap();
+    assert_eq!(removed, vec![shared.uid.clone()]);
+    assert!(db.visible_children(&virtual_uid).unwrap().is_empty());
+    assert!(
+        db.node_by_uid(&shared.uid.to_string())
+            .unwrap()
+            .unwrap()
+            .trashed
+    );
+    assert!(
+        db.node_by_uid(&child.uid.to_string())
+            .unwrap()
+            .unwrap()
+            .trashed
+    );
+    assert!(db.search("Secret", 10).unwrap().is_empty());
+    assert_eq!(db.pending_ops().unwrap().len(), 1);
+    assert_eq!(
+        db.share_access(&shared.uid).unwrap(),
+        Some(crate::Access::Viewer)
+    );
+
+    let mut reappeared = shared.clone();
+    reappeared.trashed = false;
+    assert!(
+        db.publish_shared_roots(
+            &virtual_uid,
+            std::slice::from_ref(&shared.uid),
+            &[PublishedSharedRoot {
+                node: reappeared,
+                access: crate::Access::Viewer,
+            }],
+        )
+        .unwrap()
+        .is_empty()
+    );
+    let restored = db.visible_children(&virtual_uid).unwrap();
+    assert_eq!(restored.len(), 1);
+    assert_eq!(restored[0].parent_uid.as_ref(), Some(&virtual_uid));
+    assert!(!restored[0].trashed);
+    assert!(
+        db.node_by_uid(&child.uid.to_string())
+            .unwrap()
+            .unwrap()
+            .trashed,
+        "descendants remain hidden until their folder is re-enumerated"
+    );
+    assert_eq!(db.pending_ops().unwrap().len(), 1);
+    assert_eq!(
+        db.share_access(&shared.uid).unwrap(),
+        Some(crate::Access::Viewer),
+        "reappearance stays fail-closed until an observed role refresh"
+    );
+}
+
+#[test]
+fn shared_root_node_and_authority_publication_roll_back_together() {
+    let db = Db::open_in_memory().unwrap();
+    let own_root = folder("root", None, "My Files");
+    let virtual_uid = NodeUid::new(VolumeId::from("virtual"), LinkId::from("sharedwithme"));
+    let virtual_root = foreign_folder(
+        "virtual",
+        "sharedwithme",
+        own_root.uid.clone(),
+        "Shared with me",
+    );
+    let shared = foreign_folder("foreign", "share", virtual_uid.clone(), "Before");
+    db.upsert_nodes(&[own_root, virtual_root, shared.clone()])
+        .unwrap();
+    db.set_share_access(&shared.uid, crate::Access::Viewer)
+        .unwrap();
+    db.set_listed(&virtual_uid, false).unwrap();
+    db.with_conn(|conn| {
+        conn.execute_batch(
+            "CREATE TRIGGER reject_shared_authority
+             BEFORE UPDATE ON share_access
+             WHEN NEW.root_uid = 'foreign~share'
+             BEGIN SELECT RAISE(ABORT, 'injected authority failure'); END;",
+        )?;
+        Ok(())
+    })
+    .unwrap();
+
+    let mut changed = shared.clone();
+    changed.name = "After".into();
+    let result = db.publish_shared_roots(
+        &virtual_uid,
+        std::slice::from_ref(&shared.uid),
+        &[PublishedSharedRoot {
+            node: changed,
+            access: crate::Access::Editor,
+        }],
+    );
+    assert!(result.is_err());
+    assert_eq!(
+        db.node_by_uid(&shared.uid.to_string())
+            .unwrap()
+            .unwrap()
+            .name,
+        "Before"
+    );
+    assert_eq!(
+        db.share_access(&shared.uid).unwrap(),
+        Some(crate::Access::Viewer)
+    );
+    assert!(db.children_if_listed(&virtual_uid).unwrap().is_none());
+}
+
+#[test]
+fn accepted_but_unmaterialized_shared_root_keeps_its_snapshot() {
+    let db = Db::open_in_memory().unwrap();
+    let own_root = folder("root", None, "My Files");
+    let virtual_uid = NodeUid::new(VolumeId::from("virtual"), LinkId::from("sharedwithme"));
+    let virtual_root = foreign_folder(
+        "virtual",
+        "sharedwithme",
+        own_root.uid.clone(),
+        "Shared with me",
+    );
+    let shared = foreign_folder("foreign", "share", virtual_uid.clone(), "Retained");
+    db.upsert_nodes(&[own_root, virtual_root, shared.clone()])
+        .unwrap();
+    db.set_share_access(&shared.uid, crate::Access::Editor)
+        .unwrap();
+    db.enqueue_op(&PendingOp {
+        id: 0,
+        kind: OP_RENAME.to_string(),
+        uid: shared.uid.to_string(),
+        parent_uid: Some(virtual_uid.to_string()),
+        name: Some("Retained locally".to_string()),
+        blob_path: None,
+        meta_json: Some("{}".to_string()),
+        created_at: 1,
+        attempts: 0,
+        last_error: None,
+        next_attempt_at: 0,
+    })
+    .unwrap();
+
+    let removed = db
+        .publish_shared_roots(&virtual_uid, std::slice::from_ref(&shared.uid), &[])
+        .unwrap();
+    assert!(removed.is_empty());
+    assert_eq!(db.visible_children(&virtual_uid).unwrap().len(), 1);
+    assert_eq!(db.pending_ops().unwrap().len(), 1);
+    assert_eq!(
+        db.share_access(&shared.uid).unwrap(),
+        Some(crate::Access::Viewer),
+        "an accepted root without verified materialized membership fails closed"
+    );
+}
+
+#[test]
+fn foreign_listing_reconciles_authoritative_uids_and_survives_restart_shape() {
+    let db = Db::open_in_memory().unwrap();
+    let own_root = folder("root", None, "My Files");
+    let virtual_uid = NodeUid::new(VolumeId::from("virtual"), LinkId::from("sharedwithme"));
+    let virtual_root = foreign_folder(
+        "virtual",
+        "sharedwithme",
+        own_root.uid.clone(),
+        "Shared with me",
+    );
+    let shared = foreign_folder("foreign", "share", virtual_uid, "Shared");
+    let kept = foreign_folder("foreign", "kept", shared.uid.clone(), "Kept");
+    let removed = foreign_folder("foreign", "removed", shared.uid.clone(), "Removed");
+    let deep = foreign_folder("foreign", "deep", removed.uid.clone(), "Deep secret");
+    db.upsert_nodes(&[
+        own_root,
+        virtual_root,
+        shared.clone(),
+        kept.clone(),
+        removed.clone(),
+        deep.clone(),
+    ])
+    .unwrap();
+    db.enqueue_op(&PendingOp {
+        id: 0,
+        kind: OP_REVISION.to_string(),
+        uid: deep.uid.to_string(),
+        parent_uid: Some(removed.uid.to_string()),
+        name: Some(deep.name.clone()),
+        blob_path: Some("/staging/foreign".into()),
+        meta_json: Some("{}".into()),
+        created_at: 1,
+        attempts: 0,
+        last_error: None,
+        next_attempt_at: 0,
+    })
+    .unwrap();
+
+    let removed_uids = db
+        .publish_foreign_children(&shared.uid, std::slice::from_ref(&kept.uid), &[])
+        .unwrap();
+    assert_eq!(removed_uids, vec![removed.uid.clone()]);
+    let snapshot = db.visible_children(&shared.uid).unwrap();
+    assert_eq!(snapshot.len(), 1);
+    assert_eq!(snapshot[0].uid, kept.uid);
+    assert!(
+        db.node_by_uid(&deep.uid.to_string())
+            .unwrap()
+            .unwrap()
+            .trashed
+    );
+    assert!(db.search("secret", 10).unwrap().is_empty());
+    assert_eq!(db.pending_ops().unwrap().len(), 1);
+    assert_eq!(
+        db.children_if_listed(&shared.uid).unwrap().unwrap().len(),
+        1,
+        "restart hydration sees the completed authoritative snapshot"
+    );
+}
+
+#[test]
+fn foreign_delete_tombstones_the_subtree_without_losing_pending_work() {
+    let db = Db::open_in_memory().unwrap();
+    let own_root = folder("root", None, "My Files");
+    let virtual_uid = NodeUid::new(VolumeId::from("virtual"), LinkId::from("sharedwithme"));
+    let virtual_root = foreign_folder(
+        "virtual",
+        "sharedwithme",
+        own_root.uid.clone(),
+        "Shared with me",
+    );
+    let shared = foreign_folder("foreign", "share", virtual_uid, "Shared");
+    let deleted = foreign_folder("foreign", "deleted", shared.uid.clone(), "Deleted");
+    let deep = foreign_folder("foreign", "deep", deleted.uid.clone(), "Searchable deep");
+    db.upsert_nodes(&[
+        own_root,
+        virtual_root,
+        shared,
+        deleted.clone(),
+        deep.clone(),
+    ])
+    .unwrap();
+    db.set_share_access(&deleted.uid, crate::Access::Editor)
+        .unwrap();
+    db.enqueue_op(&PendingOp {
+        id: 0,
+        kind: OP_REVISION.to_string(),
+        uid: deep.uid.to_string(),
+        parent_uid: Some(deleted.uid.to_string()),
+        name: Some(deep.name.clone()),
+        blob_path: Some("/staging/deleted-foreign".to_string()),
+        meta_json: Some("{}".to_string()),
+        created_at: 1,
+        attempts: 0,
+        last_error: None,
+        next_attempt_at: 0,
+    })
+    .unwrap();
+    assert_eq!(db.search("Searchable", 10).unwrap().len(), 1);
+
+    db.tombstone_foreign_subtree(&deleted.uid).unwrap();
+
+    for uid in [&deleted.uid, &deep.uid] {
+        assert!(db.node_by_uid(&uid.to_string()).unwrap().unwrap().trashed);
+    }
+    assert!(db.search("Searchable", 10).unwrap().is_empty());
+    assert_eq!(db.pending_ops().unwrap().len(), 1);
+    assert_eq!(
+        db.share_access(&deleted.uid).unwrap(),
+        Some(crate::Access::Viewer)
+    );
+}
+
+#[test]
+fn hidden_virtual_root_removes_descendants_from_fts_and_restores_them() {
+    let db = Db::open_in_memory().unwrap();
+    let own_root = folder("root", None, "My Files");
+    let virtual_uid = NodeUid::new(VolumeId::from("virtual"), LinkId::from("sharedwithme"));
+    let mut virtual_root = foreign_folder(
+        "virtual",
+        "sharedwithme",
+        own_root.uid.clone(),
+        "Shared with me",
+    );
+    let shared = foreign_folder("foreign", "share", virtual_uid, "Shared");
+    let child = foreign_folder(
+        "foreign",
+        "child",
+        shared.uid.clone(),
+        "Findable descendant",
+    );
+    db.upsert_node(&own_root).unwrap();
+    assert!(db.ensure_virtual_root(&virtual_root).unwrap());
+    db.upsert_nodes(&[shared, child.clone()]).unwrap();
+    assert_eq!(db.search("Findable", 10).unwrap().len(), 1);
+
+    virtual_root.trashed = true;
+    assert!(db.ensure_virtual_root(&virtual_root).unwrap());
+    assert!(db.search("Findable", 10).unwrap().is_empty());
+    assert!(
+        !db.node_by_uid(&child.uid.to_string())
+            .unwrap()
+            .unwrap()
+            .trashed,
+        "valid descendants are hidden by ancestry, not revoked"
+    );
+
+    virtual_root.trashed = false;
+    assert!(db.ensure_virtual_root(&virtual_root).unwrap());
+    assert_eq!(db.search("Findable", 10).unwrap().len(), 1);
+    let before = db.with_conn(|conn| Ok(conn.total_changes())).unwrap();
+    assert!(!db.ensure_virtual_root(&virtual_root).unwrap());
+    let after = db.with_conn(|conn| Ok(conn.total_changes())).unwrap();
+    assert_eq!(
+        before, after,
+        "unchanged root lookup performs no DB/FTS writes"
+    );
+}
+
+#[test]
+fn shared_root_pinned_name_survives_database_reopen() {
+    let path = std::env::temp_dir().join(format!(
+        "pdfs-shared-name-{}-{}.db",
+        std::process::id(),
+        now_test_id()
+    ));
+    {
+        let db = Db::open(&path).unwrap();
+        db.set_state_str("shared_with_me_name", "Shared with me (Proton 4)")
+            .unwrap();
+    }
+    let reopened = Db::open(&path).unwrap();
+    assert_eq!(
+        reopened
+            .state_str("shared_with_me_name")
+            .unwrap()
+            .as_deref(),
+        Some("Shared with me (Proton 4)")
+    );
+    drop(reopened);
+    let _ = std::fs::remove_file(path);
 }
 
 fn local(path: &str, name: &str, is_dir: bool) -> LocalEntry {

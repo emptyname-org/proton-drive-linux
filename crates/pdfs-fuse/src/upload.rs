@@ -63,6 +63,12 @@ async fn run_uploads(
                 .transfers
                 .begin(&t.name, "", TransferDirection::Upload, t.size);
             let reader = OwnedCountingReader::new(file, guard);
+            if let Err(error) = core.require_uid_writable(&t.parent_uid) {
+                return Err((
+                    t.name,
+                    format!("destination access denied: errno {}", error.code()),
+                ));
+            }
             match core
                 .client
                 .upload_file_from(
@@ -110,6 +116,8 @@ impl Core {
         let (pino, parent_uid) = self.resolve(parent_rel)?;
         self.ensure_children(pino)
             .map_err(|e| self.errno_error(e, "enumerate"))?;
+        self.require_uid_writable(&parent_uid)
+            .map_err(|error| self.errno_error(error, "upload destination"))?;
 
         // Phase 1 (sequential): build the remote folder skeleton and collect the
         // flat list of files to upload. Folders must exist before their children,
@@ -207,19 +215,24 @@ impl Core {
         }
         self.ensure_children(pino)
             .map_err(|e| self.errno_error(e, "enumerate"))?;
-        {
+        let existing = {
             let st = self.state.lock();
-            if let Some(kids) = st.children.get(&pino) {
-                for &ino in kids {
-                    if let Some(e) = st.entries.get(&ino)
-                        && e.node.is_folder()
-                        && e.node.name == name
-                    {
-                        return Ok((ino, e.uid.clone()));
-                    }
-                }
-            }
+            st.children.get(&pino).and_then(|kids| {
+                kids.iter().find_map(|ino| {
+                    st.entries
+                        .get(ino)
+                        .filter(|entry| entry.node.is_folder() && entry.node.name == name)
+                        .map(|entry| (*ino, entry.uid.clone()))
+                })
+            })
+        };
+        if let Some((ino, uid)) = existing {
+            self.require_uid_writable(&uid)
+                .map_err(|error| self.errno_error(error, "upload destination"))?;
+            return Ok((ino, uid));
         }
+        self.require_uid_writable(parent_uid)
+            .map_err(|error| self.errno_error(error, "upload destination"))?;
         let new_uid = self
             .rt
             .block_on(
@@ -239,6 +252,8 @@ impl Core {
         }
         drop(st);
         self.flush_access_changes();
+        self.require_uid_writable(&new_uid)
+            .map_err(|error| self.errno_error(error, "created upload destination"))?;
         Ok((ino, new_uid))
     }
 

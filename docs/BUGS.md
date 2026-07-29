@@ -1432,8 +1432,8 @@ added later, but it must retain the row and blob.
 
 ## B34 — Writable POSIX Exposure of Read-Only Shared Folders (MED-07)
 
-**Status:** Fixed in code by P2 (2026-07-29); live credentialed shared-tree and second-account
-acceptance pending P3/P7
+**Status:** Fixed in code by P2/P3 (2026-07-29); P3 now exposes the shared tree, while credentialed
+second-account and live FUSE acceptance remain pending P7
 **Found:** 2026-07-21, multi-agent permissions audit (`audit_bugs.md` MED-07)  
 **Where:** `crates/pdfs-fuse/src/lib.rs`, `crates/pdfs-fuse/src/sharing.rs`
 
@@ -1444,9 +1444,9 @@ entries, exposes read-only POSIX modes, and gates mutations at handler, queue, a
 Downgrades fail closed and are not acknowledged past failed durable state updates.
 
 **Verification:** The local workspace passes formatting, locked checks, clippy with warnings denied,
-and all 324 workspace tests, including access inheritance, mutation gating, queued-operation
-authorization, and downgrade failure paths. Live credentialed shared-tree and second-account
-acceptance cannot run until P3 exposes the tree and remains required in P7.
+and all 347 workspace tests, including P3 virtual-tree materialization and access inheritance plus
+mutation gating, queued-operation authorization, and downgrade failure paths. Credentialed
+second-account and live FUSE acceptance have not been run and remain required in P7.
 
 ---
 
