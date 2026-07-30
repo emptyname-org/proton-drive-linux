@@ -31,9 +31,7 @@ jobs:
             libsecret-1-dev \
             libdbus-1-dev \
             desktop-file-utils \
-            rpm \
-            rpm-sign \
-            dpkg-sig
+            rpm
 
       - name: Set up Rust
         uses: actions-rust-lang/setup-rust-toolchain@v1
@@ -135,19 +133,6 @@ jobs:
 
           # Build Debian package
           dpkg-deb --build deb proton-drive-linux_${{ env.VERSION }}_amd64.deb
-
-      - name: Sign Debian package (.deb)
-        env:
-          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
-          GPG_KEY_NAME: ${{ secrets.GPG_KEY_NAME }}
-          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
-        run: |
-          if [ -n "$GPG_PRIVATE_KEY" ] && [ -n "$GPG_KEY_NAME" ]; then
-            echo "$GPG_PRIVATE_KEY" | gpg --import
-            dpkg-sig -k "${GPG_KEY_NAME}" -s builder -g "--batch --pinentry-mode loopback --passphrase ${GPG_PASSPHRASE}" *.deb
-          else
-            echo "Skipping deb signing: GPG_PRIVATE_KEY or GPG_KEY_NAME secret is not set."
-          fi
 
       - name: Package Fedora package (.rpm)
         run: |
