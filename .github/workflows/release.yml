@@ -162,7 +162,7 @@ jobs:
           GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
         run: |
           if [ -n "$GPG_PRIVATE_KEY" ] && [ -n "$GPG_KEY_NAME" ]; then
-            echo "$GPG_PRIVATE_KEY" | gpg --import
+            echo "$GPG_PRIVATE_KEY" | gpg --batch --pinentry-mode loopback --passphrase "$GPG_PASSPHRASE" --import
             
             cat <<EOF > ~/.rpmmacros
           %_signature gpg
