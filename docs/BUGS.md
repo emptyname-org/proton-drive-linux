@@ -12,6 +12,21 @@ Conventions:
 
 ---
 
+## B78 — Profile backup fails: Cannot create file at the root of a device
+
+**Status:** Open
+**Found:** 2026-07-29, user reported `upload profile: proton api error NotEnoughPermissions (http 422): Cannot create file at the root of a device`
+
+The background task that backs up the machine's profile (sync folder mappings, pins, cache budget) currently attempts to write `profile.json` directly to the device root node (`device.root_uid`) on the Drive backend. The Proton Drive API has started enforcing a restriction that files cannot be created directly at the root of a device; they must be placed inside a folder.
+
+**Consequence:** The upload is rejected with HTTP 422. The daemon retries when changes happen but the profile is never successfully backed up. Local changes (pinning, adding a sync folder) still take effect locally, but they will not be restorable on a new machine.
+
+**Planned Fix:** Match the original `RECOVERY.md` spec by putting it in a `.proton-drive-linux` folder within the device root.
+- `pdfs-fuse/src/profile.rs:save_profile`: Look up (or create) the `.proton-drive-linux` folder under the device root, and upload `profile.json` there instead.
+- `pdfs-fuse/src/profile.rs:load_profile`: Check for `PROFILE_FILE_NAME` inside `.proton-drive-linux` first, falling back to the device root to allow older, existing profiles to be restored until they are overwritten.
+
+---
+
 ## B1 — FUSE rename loses the file (data loss)
 
 **Status:** Fixed (verified 2026-07-20)

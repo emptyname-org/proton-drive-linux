@@ -13,6 +13,7 @@ jobs:
   build-release:
     name: Build and Release
     runs-on: ubuntu-24.04
+    environment: 'rpm signing'
 
     steps:
       - name: Checkout repository
@@ -30,7 +31,8 @@ jobs:
             libsecret-1-dev \
             libdbus-1-dev \
             desktop-file-utils \
-            rpm
+            rpm \
+            rpm-sign
 
       - name: Set up Rust
         uses: actions-rust-lang/setup-rust-toolchain@v1
@@ -153,6 +155,26 @@ jobs:
             
           # Copy built RPM to root directory
           cp rpmbuild/RPMS/x86_64/*.rpm .
+
+      - name: Sign Fedora package (.rpm)
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+          GPG_KEY_NAME: ${{ secrets.GPG_KEY_NAME }}
+          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+        run: |
+          if [ -n "$GPG_PRIVATE_KEY" ] && [ -n "$GPG_KEY_NAME" ]; then
+            echo "$GPG_PRIVATE_KEY" | gpg --import
+            
+            cat <<EOF > ~/.rpmmacros
+          %_signature gpg
+          %_gpg_name ${GPG_KEY_NAME}
+          %__gpg_sign_cmd %{__gpg} gpg --batch --verbose --no-armor --pinentry-mode loopback --passphrase %{_gpg_passphrase} --no-secmem-warning -u "%{_gpg_name}" -sbo %{__signature_filename} --digest-algo sha256 %{__plaintext_filename}
+          EOF
+          
+            rpm --addsign --define "_gpg_passphrase $GPG_PASSPHRASE" *.rpm
+          else
+            echo "Skipping RPM signing: GPG_PRIVATE_KEY or GPG_KEY_NAME secret is not set."
+          fi
 
 
       - name: Upload Workflow Artifacts

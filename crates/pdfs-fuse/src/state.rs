@@ -448,8 +448,13 @@ impl State {
         let roots: Vec<u64> = self
             .entries
             .iter()
-            .filter(|entry| {
-                let (_, entry) = entry;
+            .filter(|&(&ino, entry)| {
+                // The filesystem root (parent == self) is always owned; never
+                // downgrade it even if it carries membership from the owner
+                // sharing this folder with someone else.
+                if entry.parent == ino {
+                    return false;
+                }
                 entry.access != Access::Owner
                     || entry.node.membership.is_some()
                     || self.share_access.contains_key(&entry.uid)
@@ -494,10 +499,12 @@ impl State {
                 return Access::Unknown;
             }
             let stored = state.share_access.get(&entry.uid).copied();
-            let access = if let Some(stored) = stored {
-                stored
-            } else if entry.parent == ino {
+            // The root of this mount is always owned, regardless of any
+            // stale share_access row that a global downgrade may have left.
+            let access = if entry.parent == ino {
                 Access::Owner
+            } else if let Some(stored) = stored {
+                stored
             } else if !state.entries.contains_key(&entry.parent) {
                 entry
                     .node
@@ -538,8 +545,12 @@ impl State {
         }
         let discovered: Vec<(NodeUid, Access)> = self
             .entries
-            .values()
-            .filter_map(|entry| {
+            .iter()
+            .filter_map(|(&ino, entry)| {
+                // The filesystem root is owned, not a discovered share root.
+                if entry.parent == ino {
+                    return None;
+                }
                 let parent_access = self
                     .entries
                     .get(&entry.parent)

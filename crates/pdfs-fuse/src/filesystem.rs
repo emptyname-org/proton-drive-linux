@@ -992,7 +992,15 @@ impl ProtonFs {
                 warn!(uid = %root.uid, error = %e, "db upsert root failed");
             }
             st.by_uid.insert(root.uid.clone(), ROOT_INO);
-            let access = st.access_for_node(ROOT_INO, &root);
+            // The filesystem root is always owned — it must never be
+            // classified as a shared root, even when the API returns
+            // membership data (which happens when the owner shares the
+            // folder with someone else).  Clean up any stale share_access
+            // row that a previous downgrade_all_share_access may have
+            // written for this uid, so hydrate_access cannot pick it up.
+            let access = Access::Owner;
+            st.share_access.remove(&root.uid);
+            let _ = st.db.delete_share_access(&root.uid);
             st.entries.insert(
                 ROOT_INO,
                 Entry {
