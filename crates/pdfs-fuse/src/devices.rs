@@ -383,6 +383,15 @@ impl Core {
             })?
             .to_string();
 
+        // Syncing a local `.proton-drive-linux` would land on the folder holding
+        // this device's own profile (`find_device_child_folder` reuses by name),
+        // and the sync engine would then delete or overwrite it.
+        if name == pdfs_core::profile::PROFILE_DIR_NAME {
+            return Err(CoreError::invalid(format!(
+                "{name} is reserved for this device's profile backup"
+            )));
+        }
+
         let device = self.ensure_device()?;
         let root_uid = parse_uid(&device.root_uid).ok_or_else(|| {
             CoreError::internal(format!("bad device root uid: {}", device.root_uid))

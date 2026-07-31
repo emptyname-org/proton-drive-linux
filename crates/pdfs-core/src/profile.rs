@@ -19,8 +19,17 @@ use serde::{Deserialize, Serialize};
 
 use crate::mounts::MountMode;
 
-/// File name of the profile inside the device root folder.
+/// File name of the profile.
 pub const PROFILE_FILE_NAME: &str = "profile.json";
+
+/// Folder, directly under the device root, that holds the profile.
+///
+/// The API refuses `Cannot create file at the root of a device` (HTTP 422), so
+/// the profile cannot live at the device root itself even though that is where
+/// it logically belongs (docs/BUGS.md B68/B78). A dotted name keeps it out of
+/// the way in the web UI, and the restore ignores it when listing the device's
+/// restorable folders.
+pub const PROFILE_DIR_NAME: &str = ".proton-drive-linux";
 
 /// Format version of the profile document.
 ///

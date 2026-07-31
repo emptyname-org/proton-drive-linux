@@ -13,7 +13,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use pdfs_core::control::RestorableFolder;
 use pdfs_core::mounts::MountMode;
-use pdfs_core::profile::{PROFILE_FILE_NAME, PROFILE_VERSION, Profile, ProfileFolder, ProfilePin};
+use pdfs_core::profile::{
+    PROFILE_DIR_NAME, PROFILE_FILE_NAME, PROFILE_VERSION, Profile, ProfileFolder, ProfilePin,
+};
 use pdfs_core::{CoreError, CoreResult};
 use proton_drive_rs::proton_sdk::ids::NodeUid;
 use tracing::{info, warn};
@@ -64,8 +66,9 @@ impl Core {
         });
     }
 
-    /// Serialize this machine's arrangement and upload it to `profile.json` in
-    /// the device root, replacing any existing one.
+    /// Serialize this machine's arrangement and upload it to `profile.json`
+    /// inside the device's `.proton-drive-linux` folder, replacing any existing
+    /// one.
     ///
     /// Does nothing when no device is registered: a machine that has never
     /// synced a folder has nothing to describe, and registering a device just to
@@ -86,11 +89,15 @@ impl Core {
         let bytes = profile.to_bytes().map_err(CoreError::internal)?;
         let len = bytes.len() as i64;
 
+        // The device root itself rejects file creation (B78), so the profile
+        // lives one level down, in a folder created on first save.
+        let dir_uid = self.ensure_profile_dir(&root_uid)?;
+
         // Replace the existing document rather than adding a second file of the
-        // same name: the profile is a single mutable record, and a device root
-        // with `profile.json` and `profile (1).json` in it teaches the restore
+        // same name: the profile is a single mutable record, and a folder with
+        // `profile.json` and `profile (1).json` in it teaches the restore
         // nothing about which to trust.
-        let existing = self.find_device_child_file(&root_uid, PROFILE_FILE_NAME)?;
+        let existing = self.find_device_child_file(&dir_uid, PROFILE_FILE_NAME)?;
         match existing {
             Some(uid) => self
                 .rt
@@ -106,7 +113,7 @@ impl Core {
             None => {
                 self.rt
                     .block_on(self.client.upload_file_replacing_draft_from(
-                        &root_uid,
+                        &dir_uid,
                         PROFILE_FILE_NAME,
                         "application/json",
                         Cursor::new(bytes),
@@ -164,18 +171,18 @@ impl Core {
         })
     }
 
-    /// An untrashed *file* named `name` directly under the device root.
+    /// An untrashed *file* named `name` directly under `parent_uid`.
     ///
     /// The sibling of `find_device_child_folder`; kept separate because a folder
     /// named `profile.json` must not be mistaken for the profile.
     fn find_device_child_file(
         &self,
-        root_uid: &NodeUid,
+        parent_uid: &NodeUid,
         name: &str,
     ) -> CoreResult<Option<NodeUid>> {
         let uids = self
             .rt
-            .block_on(self.client.enumerate_folder_children_node_uids(root_uid))
+            .block_on(self.client.enumerate_folder_children_node_uids(parent_uid))
             .map_err(|e| CoreError::from_api(&e, "list device root"))?;
         if uids.is_empty() {
             return Ok(None);
@@ -190,10 +197,47 @@ impl Core {
             .map(|n| n.uid))
     }
 
-    /// Download and parse the profile in the device root, if there is one.
+    /// The device's `.proton-drive-linux` folder, creating it if this is the
+    /// first save on this device.
+    ///
+    /// Reused by stable identity rather than recreated: a second folder of the
+    /// same name would split the profile across two documents, and the restore
+    /// would have no way to tell which is current.
+    fn ensure_profile_dir(&self, root_uid: &NodeUid) -> CoreResult<NodeUid> {
+        if let Some(uid) = self.find_device_child_folder(root_uid, PROFILE_DIR_NAME)? {
+            return Ok(uid);
+        }
+        let uid = self
+            .rt
+            .block_on(
+                self.client
+                    .create_folder(root_uid, PROFILE_DIR_NAME, Some(now_secs())),
+            )
+            .map_err(|e| CoreError::from_api(&e, "create profile folder"))?;
+        info!(name = PROFILE_DIR_NAME, "created device profile folder");
+        Ok(uid)
+    }
+
+    /// Download and parse this device's profile, if there is one.
+    ///
+    /// Looks in `.proton-drive-linux/` first and falls back to the device root,
+    /// where clients before the B78 fix wrote it. The fallback is read-only: the
+    /// next save writes to the folder, and the legacy document is left alone
+    /// rather than trashed, so an older client on another machine keeps working.
     fn load_profile(&self, root_uid: &NodeUid) -> CoreResult<Option<Profile>> {
-        let Some(uid) = self.find_device_child_file(root_uid, PROFILE_FILE_NAME)? else {
-            return Ok(None);
+        let current = match self.find_device_child_folder(root_uid, PROFILE_DIR_NAME)? {
+            Some(dir_uid) => self.find_device_child_file(&dir_uid, PROFILE_FILE_NAME)?,
+            None => None,
+        };
+        let uid = match current {
+            Some(uid) => uid,
+            None => match self.find_device_child_file(root_uid, PROFILE_FILE_NAME)? {
+                Some(uid) => {
+                    info!("reading legacy profile from the device root");
+                    uid
+                }
+                None => return Ok(None),
+            },
         };
         let mut buf: Vec<u8> = Vec::new();
         self.rt
@@ -252,7 +296,10 @@ impl Core {
 
         Ok(nodes
             .into_iter()
-            .filter(|n| n.is_folder() && !n.trashed)
+            // `.proton-drive-linux` holds the profile itself, not user data:
+            // offering it as a restorable folder would sync the bookkeeping
+            // back onto the machine it describes.
+            .filter(|n| n.is_folder() && !n.trashed && n.name != PROFILE_DIR_NAME)
             .map(|n| {
                 let uid = n.uid.to_string();
                 let saved = profile
@@ -400,6 +447,79 @@ mod tests {
         assert_eq!(restore_mode("ondemand"), Some(MountMode::OnDemand));
         assert_eq!(restore_mode("streaming"), None);
         assert_eq!(restore_mode("unknown"), None);
+    }
+
+    /// The device root refuses file creation (B78), so every upload in
+    /// `save_profile` must be addressed to the profile folder. Checked against
+    /// the source because both branches are pure network calls.
+    #[test]
+    fn the_profile_is_never_uploaded_to_the_device_root() {
+        let source = include_str!("profile.rs");
+        let save = function_source(source, "fn save_profile(");
+        assert!(
+            save.contains("ensure_profile_dir(&root_uid)"),
+            "save_profile resolves the profile folder"
+        );
+        for upload in ["upload_new_revision_from", "upload_file_replacing_draft_from"] {
+            let call = save.find(upload).expect("upload call exists");
+            let args = &save[call..];
+            let root = args.find("&root_uid").unwrap_or(usize::MAX);
+            let dir = args.find("&dir_uid").unwrap_or(usize::MAX);
+            assert!(dir < root, "{upload} must target the profile folder");
+        }
+    }
+
+    /// A read has to keep finding profiles written before the fix, which sat in
+    /// the device root.
+    #[test]
+    fn loading_falls_back_to_a_legacy_device_root_profile() {
+        let source = include_str!("profile.rs");
+        let load = function_source(source, "fn load_profile(");
+        assert!(load.contains("PROFILE_DIR_NAME"), "prefers the folder");
+        assert!(
+            load.find("PROFILE_DIR_NAME").unwrap()
+                < load.find("legacy profile").expect("legacy fallback exists"),
+            "the folder is consulted before the device root"
+        );
+    }
+
+    /// The profile folder is the client's own bookkeeping: neither the restore
+    /// picker nor `add_sync_folder` may treat it as a user folder.
+    #[test]
+    fn the_profile_folder_is_not_offered_as_user_data() {
+        let restorable = function_source(include_str!("profile.rs"), "fn list_restorable_folders(");
+        assert!(
+            restorable.contains("n.name != PROFILE_DIR_NAME"),
+            "restorable folders exclude the profile folder"
+        );
+        let add = function_source(include_str!("devices.rs"), "fn add_sync_folder(");
+        assert_before(add, "PROFILE_DIR_NAME", "ensure_device()");
+    }
+
+    fn function_source<'a>(source: &'a str, signature: &str) -> &'a str {
+        let start = source.find(signature).expect("function signature exists");
+        let body = &source[start..];
+        let open = body.find('{').expect("function body starts");
+        let mut depth = 0usize;
+        for (offset, byte) in body.as_bytes()[open..].iter().enumerate() {
+            match byte {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return &body[..open + offset + 1];
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("function body closes")
+    }
+
+    fn assert_before(source: &str, first: &str, second: &str) {
+        let first_at = source.find(first).expect("first operation exists");
+        let second_at = source.find(second).expect("second operation exists");
+        assert!(first_at < second_at, "{first} must precede {second}");
     }
 
     /// A path whose parent exists but which does not itself is exactly the
