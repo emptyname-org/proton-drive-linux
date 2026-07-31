@@ -14,6 +14,7 @@ A fast, unofficial Proton Drive client for Linux. This client features an advanc
 - **Unified Search Launcher (HUD)**: A resident Google Drive-style launcher (`pdfs-prompt`) that searches Proton Drive and local files together, ranks the best matches, tolerates abbreviations and typos, and is ideal for a system-wide hotkey.
 - **Secure Credential Storage**: Integrates with the system Secret Service (GNOME Keyring, KWallet, etc.) with smart in-memory credential caching to avoid UI thread blockages.
 - **Proton Photos Support**: Access your Proton Photos timeline, view thumbnails, and download backed-up media natively (available in the GUI as a navigation tab and via the CLI).
+- **Photo Albums**: Browse your albums — including the ones shared with you — from the Albums view of the Photos page, or with `pdfs albums` / `pdfs album <uid>`. Album contents open in the same gallery as the timeline.
 - **Human Verification (CAPTCHA) Recovery**: Detects sign-in gates (VPN/new IP challenges) and launches an embedded `WebKitWebView` dialog to safely complete the challenge, transparently retrying authentication with the earned token.
 - **Selective Sync (`.pdfsignore`)**: Keep build trees, dependency directories, and editor leftovers out of synced folders using gitignore-style rules.
 - **Data-Safe Offline Writes**: Durable scratch/staging files and a transactional pending queue preserve acknowledged writes across network failures and restarts.

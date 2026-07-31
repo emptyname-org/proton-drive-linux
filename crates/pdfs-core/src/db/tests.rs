@@ -1334,6 +1334,8 @@ fn migration_v17_adds_share_access_to_a_v16_fixture() {
             "DROP TRIGGER mount_sync_folder_insert;
              DROP TABLE mount;
              DROP TABLE share_access;
+             DROP TABLE album_photos;
+             DROP TABLE albums;
              UPDATE sync_state SET value = '16' WHERE key = 'schema_version';",
         )
         .unwrap();
@@ -1347,9 +1349,10 @@ fn migration_v17_adds_share_access_to_a_v16_fixture() {
     let root = uid("offline-share");
     db.set_share_access(&root, crate::Access::Viewer).unwrap();
     assert_eq!(db.share_access(&root).unwrap(), Some(crate::Access::Viewer));
+    // Migrating an old fixture always lands on head, whatever head is today.
     assert_eq!(
         db.state_str("schema_version").unwrap().as_deref(),
-        Some("18")
+        Some(SCHEMA_VERSION.to_string().as_str())
     );
 
     drop(db);
@@ -1438,9 +1441,10 @@ fn migration_v18_projects_v17_sync_folders_and_cascades_deletes() {
         1,
         "the V18 foreign key must remove the device projection"
     );
+    // Migrating an old fixture always lands on head, whatever head is today.
     assert_eq!(
         db.state_str("schema_version").unwrap().as_deref(),
-        Some("18")
+        Some(SCHEMA_VERSION.to_string().as_str())
     );
 
     drop(db);
@@ -2842,6 +2846,8 @@ fn test_db_has_children_and_trashed_filtering() {
         is_shared_publicly: false,
         signature_email: None,
         membership: None,
+        photo: None,
+        album: None,
         verification: Default::default(),
     };
     db.upsert_node(&parent_node).unwrap();
@@ -2866,6 +2872,8 @@ fn test_db_has_children_and_trashed_filtering() {
         is_shared_publicly: false,
         signature_email: None,
         membership: None,
+        photo: None,
+        album: None,
         verification: Default::default(),
     };
     db.upsert_node(&child_node).unwrap();
@@ -2908,4 +2916,137 @@ fn test_db_has_create_op() {
 
     db.delete_ops_for_uid(local_uid).unwrap();
     assert!(!db.has_create_op(local_uid).unwrap(), "op deleted");
+}
+
+/// The album listing is a wholesale replacement, and an album that leaves the
+/// listing must take its contents with it — nothing else ever deletes those rows.
+#[test]
+fn albums_replace_drops_the_contents_of_an_album_that_left() {
+    let db = Db::open_in_memory().unwrap();
+    let album = |uid: &str, name: &str, activity: Option<i64>| StoredAlbum {
+        uid: uid.into(),
+        name: name.into(),
+        photo_count: 2,
+        cover_uid: Some("cover".into()),
+        last_activity: activity,
+        shared: false,
+    };
+    db.albums_replace(&[
+        album("a1", "Trip", Some(500)),
+        album("a2", "Cats", Some(400)),
+    ])
+    .unwrap();
+    db.album_photos_replace("a1", &[("p1".into(), 300, None, None)])
+        .unwrap();
+    db.album_photos_replace("a2", &[("p2".into(), 200, None, None)])
+        .unwrap();
+
+    // The next refresh no longer has a2 — it was deleted, or unshared.
+    db.albums_replace(&[album("a1", "Trip", Some(600))])
+        .unwrap();
+
+    assert_eq!(db.albums_count().unwrap(), 1);
+    assert_eq!(db.album_photos_count("a1").unwrap(), 1);
+    assert_eq!(
+        db.album_photos_count("a2").unwrap(),
+        0,
+        "a departed album's photos go with it"
+    );
+}
+
+/// An album's contents are replaced like the timeline: server order is kept, and
+/// what a thumbnail attempt cost a download to learn survives the refresh.
+#[test]
+fn album_photos_replace_keeps_what_was_learned() {
+    let db = Db::open_in_memory().unwrap();
+    db.albums_replace(&[StoredAlbum {
+        uid: "a1".into(),
+        name: "Trip".into(),
+        photo_count: 3,
+        cover_uid: None,
+        last_activity: None,
+        shared: true,
+    }])
+    .unwrap();
+    db.album_photos_replace(
+        "a1",
+        &[
+            ("p1".into(), 300, None, Some("video/mp4".into())),
+            ("p2".into(), 200, None, None),
+        ],
+    )
+    .unwrap();
+
+    db.album_photo_set_thumb("p1", THUMB_HAVE, Some(1.5))
+        .unwrap();
+    db.album_photo_set_thumb("p2", THUMB_NONE, None).unwrap();
+
+    db.album_photos_replace(
+        "a1",
+        &[
+            ("p0".into(), 400, Some("new.jpg".into()), None),
+            ("p1".into(), 300, None, None),
+            ("p2".into(), 200, None, None),
+        ],
+    )
+    .unwrap();
+
+    let page = db.album_photos_page("a1", 0, 10).unwrap();
+    assert_eq!(
+        page.iter().map(|p| p.uid.as_str()).collect::<Vec<_>>(),
+        ["p0", "p1", "p2"],
+        "the album's own order is preserved"
+    );
+    assert_eq!(page[1].ratio, Some(1.5));
+    assert_eq!(page[1].thumb_state, THUMB_HAVE);
+    assert_eq!(page[2].thumb_state, THUMB_NONE);
+    // The media type is learned-and-kept, so p1 stays classified as a video even
+    // though the second refresh carried none.
+    assert_eq!(page[1].kind, crate::control::PhotoKind::Video);
+    assert_eq!(page[0].thumb_state, THUMB_UNKNOWN);
+
+    // Paging is relative to the album, and the shared flag round-trips.
+    let second = db.album_photos_page("a1", 1, 1).unwrap();
+    assert_eq!(second.len(), 1);
+    assert_eq!(second[0].uid, "p1");
+    assert!(db.albums_list().unwrap()[0].shared);
+}
+
+/// A photo held only by an album — everything in an album shared with us — is
+/// still resolvable for its capture time, which is what tags its cached
+/// thumbnail. One row per uid, even when the photo is in several albums.
+#[test]
+fn album_photos_by_uid_resolves_a_photo_outside_the_timeline() {
+    let db = Db::open_in_memory().unwrap();
+    db.album_photos_replace("a1", &[("p1".into(), 300, None, None)])
+        .unwrap();
+    db.album_photos_replace("a2", &[("p1".into(), 300, None, None)])
+        .unwrap();
+
+    let found = db
+        .album_photos_by_uid(&["p1".into(), "absent".into()])
+        .unwrap();
+    assert_eq!(found.len(), 1, "a photo in two albums resolves once");
+    assert_eq!(found[0].capture_time, 300);
+    assert!(db.album_photos_by_uid(&[]).unwrap().is_empty());
+}
+
+/// Per-album freshness stamps are keyed by uid, so invalidating them all is a
+/// prefix sweep — and it must not take unrelated keys with it.
+#[test]
+fn clear_state_prefix_takes_only_the_prefixed_keys() {
+    let db = Db::open_in_memory().unwrap();
+    db.set_state_i64("album_synced_ms:vol~a1", 1).unwrap();
+    db.set_state_i64("album_synced_ms:vol~a2", 2).unwrap();
+    db.set_state_i64("albums_synced_ms", 3).unwrap();
+
+    db.clear_state_prefix("album_synced_ms:").unwrap();
+
+    assert_eq!(db.state_i64("album_synced_ms:vol~a1").unwrap(), None);
+    assert_eq!(db.state_i64("album_synced_ms:vol~a2").unwrap(), None);
+    assert_eq!(
+        db.state_i64("albums_synced_ms").unwrap(),
+        Some(3),
+        "the listing's own stamp is not a per-album one"
+    );
 }

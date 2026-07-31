@@ -9,7 +9,7 @@ use super::Db;
 use crate::Result;
 
 /// Current schema version. Bump on every forward migration added below.
-pub(super) const SCHEMA_VERSION: i64 = 18;
+pub(super) const SCHEMA_VERSION: i64 = 19;
 
 impl Db {
     pub(super) fn migrate(&self) -> Result<()> {
@@ -94,6 +94,9 @@ impl Db {
         }
         if current < 18 {
             tx.execute_batch(MIGRATION_V18)?;
+        }
+        if current < 19 {
+            tx.execute_batch(MIGRATION_V19)?;
         }
         tx.execute(
             "INSERT INTO sync_state (key, value) VALUES ('schema_version', ?1)
@@ -471,4 +474,40 @@ BEGIN
   INSERT OR IGNORE INTO mount (kind, sync_folder_id)
   VALUES ('device', NEW.id);
 END;
+";
+
+/// Schema v19: photo albums and their contents. Both are projections of the
+/// server's listings — like `photos`, they are replaced wholesale on refresh —
+/// so the Albums view opens from disk instead of re-enumerating every launch.
+///
+/// `album_photos` carries its own `ratio` / `thumb_state` rather than joining
+/// `photos`: an album shared with us lives on the sharer's volume, so its
+/// photos are not in our timeline at all and would otherwise have nowhere to
+/// remember what a thumbnail attempt learned.
+const MIGRATION_V19: &str = "
+CREATE TABLE albums (
+  uid           TEXT PRIMARY KEY,
+  name          TEXT NOT NULL,
+  photo_count   INTEGER NOT NULL DEFAULT 0,
+  cover_uid     TEXT,
+  last_activity INTEGER,
+  shared        INTEGER NOT NULL DEFAULT 0,
+  seq           INTEGER NOT NULL
+);
+
+CREATE TABLE album_photos (
+  album_uid    TEXT NOT NULL,
+  uid          TEXT NOT NULL,
+  capture_time INTEGER NOT NULL,
+  name         TEXT,
+  media_type   TEXT,
+  kind         INTEGER NOT NULL DEFAULT 0,
+  ratio        REAL,
+  thumb_state  INTEGER NOT NULL DEFAULT 0,
+  seq          INTEGER NOT NULL,
+  PRIMARY KEY (album_uid, uid)
+);
+
+CREATE INDEX idx_album_photos_seq ON album_photos(album_uid, seq);
+CREATE INDEX idx_album_photos_uid ON album_photos(uid);
 ";

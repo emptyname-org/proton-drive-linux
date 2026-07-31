@@ -71,6 +71,20 @@ pub enum Request {
         #[serde(default)]
         kind: Option<PhotoKind>,
     },
+    /// List the account's photo albums, newest activity first, including the
+    /// albums other people share with us. Metadata only — an album's cover
+    /// thumbnail is fetched with [`Request::PhotoThumbs`] like any other photo.
+    /// Replies with [`Response::Albums`].
+    PhotoAlbums,
+    /// Fetch a page of one album's photos, newest capture first. Same reply
+    /// shape as [`Request::PhotosTimeline`] ([`Response::Photos`]), so a
+    /// front-end paints an album with the gallery it already has. `uid` is the
+    /// album node's uid, as reported by [`Request::PhotoAlbums`].
+    AlbumPhotos {
+        uid: String,
+        offset: usize,
+        limit: usize,
+    },
     /// Fetch thumbnails for the given photo uids, downloading the ones not
     /// already cached (one batched round-trip) and replying with their on-disk
     /// paths. Keep the batch small — it is served on demand, as tiles scroll in.
@@ -952,6 +966,29 @@ pub struct PhotoMonth {
     pub count: usize,
 }
 
+/// One album in a [`Response::Albums`] listing.
+///
+/// An album is a folder node on the photos volume carrying album properties, so
+/// it has an ordinary name; everything else here comes from those properties.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct AlbumInfo {
+    /// Album node uid in `volume~link` form — what [`Request::AlbumPhotos`]
+    /// takes.
+    pub uid: String,
+    pub name: String,
+    /// How many photos the server says the album holds.
+    pub photo_count: usize,
+    /// The photo shown as the album's cover, when it has one. Its thumbnail is
+    /// fetched with [`Request::PhotoThumbs`] like any other photo.
+    pub cover_uid: Option<String>,
+    /// Epoch seconds of the last change to the album's contents, when the server
+    /// reports one. The listing is ordered by it, newest first.
+    pub last_activity: Option<i64>,
+    /// True when this album lives on someone else's photos volume — it is shared
+    /// with us rather than ours.
+    pub shared: bool,
+}
+
 /// One photo in a [`Request::PhotosTimeline`] page.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct PhotoItem {
@@ -1106,6 +1143,13 @@ pub enum Response {
         /// `kind` filter. Older daemons omit it; a front-end then shows no counts.
         #[serde(default)]
         counts: Option<(usize, usize, usize)>,
+    },
+    /// The account's photo albums (reply to [`Request::PhotoAlbums`]).
+    /// `available` is false when the account has no photos volume, matching
+    /// [`Response::Photos`].
+    Albums {
+        available: bool,
+        items: Vec<AlbumInfo>,
     },
     /// The months the timeline spans (reply to [`Request::PhotoMonths`]),
     /// newest first.

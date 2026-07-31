@@ -22,6 +22,7 @@ use crate::Result;
 use std::path::Path;
 
 mod activity;
+mod albums;
 mod cache;
 mod devices;
 mod local;
@@ -38,6 +39,7 @@ mod sync;
 mod trash;
 mod utils;
 
+pub use albums::StoredAlbum;
 pub use cache::CacheEntryInput;
 pub use devices::StoredDevice;
 pub use local::LocalFileHit;

@@ -94,4 +94,26 @@ impl Db {
         conn.execute("DELETE FROM sync_state WHERE key = ?1", params![key])?;
         Ok(())
     }
+
+    /// Drop every `sync_state` key starting with `prefix` — the per-entity
+    /// stamps (one album, one shared folder) that are keyed by uid and so have
+    /// no fixed name to clear individually.
+    pub fn clear_state_prefix(&self, prefix: &str) -> Result<()> {
+        let conn = self.conn.lock();
+        // `\` escapes the LIKE wildcards, so a prefix containing `%` or `_`
+        // (a uid never does today, but this is not the place to rely on that)
+        // matches literally instead of sweeping unrelated keys.
+        let pattern = format!(
+            "{}%",
+            prefix
+                .replace('\\', "\\\\")
+                .replace('%', "\\%")
+                .replace('_', "\\_")
+        );
+        conn.execute(
+            "DELETE FROM sync_state WHERE key LIKE ?1 ESCAPE '\\'",
+            params![pattern],
+        )?;
+        Ok(())
+    }
 }

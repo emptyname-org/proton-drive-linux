@@ -47,6 +47,9 @@ pub(crate) fn virtual_node(parent_uid: NodeUid, name: String, timestamp: i64) ->
         is_shared_publicly: false,
         signature_email: None,
         membership: None,
+        // A synthetic folder is neither a photo nor an album.
+        photo: None,
+        album: None,
         verification: Default::default(),
     }
 }

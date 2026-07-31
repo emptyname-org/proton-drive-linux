@@ -376,6 +376,7 @@ pub fn mount(
         hidden: Arc::new(Mutex::new(HashSet::new())),
         drain_wake: Arc::new((Mutex::new(false), Condvar::new())),
         timeline_refreshing: Arc::new(AtomicBool::new(false)),
+        albums_refreshing: Arc::new(AtomicBool::new(false)),
         trash_refreshing: Arc::new(AtomicBool::new(false)),
         trash_progress: Arc::new(tokio::sync::Notify::new()),
         conflict_notified: Arc::new(Mutex::new(HashSet::new())),

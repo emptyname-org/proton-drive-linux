@@ -145,6 +145,19 @@ enum Command {
         #[arg(long, default_value_t = 0)]
         offset: usize,
     },
+    /// List the photo albums (including ones shared with this account).
+    Albums,
+    /// List the photos in one album (newest capture first).
+    Album {
+        /// Album node uid in `volume~link` form (from `pdfs albums`).
+        uid: String,
+        /// Max photos to list.
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+        /// Skip this many photos from the start of the album.
+        #[arg(long, default_value_t = 0)]
+        offset: usize,
+    },
     /// Download a photo by uid (`volume~link`) and print its cached path.
     OpenPhoto {
         /// Photo node uid in `volume~link` form (from `pdfs photos`).
@@ -517,6 +530,8 @@ fn main() -> Result<()> {
         Command::Pins => cmd_pins(),
         Command::Ls { path } => cmd_ls(path),
         Command::Photos { limit, offset } => cmd_photos(limit, offset),
+        Command::Albums => cmd_albums(),
+        Command::Album { uid, limit, offset } => cmd_album(uid, limit, offset),
         Command::OpenPhoto { uid } => cmd_open_photo(uid),
         Command::Search { query, limit } => cmd_search(query, limit),
         Command::Rename { path, new_name } => cmd_rename(path, new_name),
@@ -1485,26 +1500,64 @@ fn cmd_photos(limit: usize, offset: usize) -> Result<()> {
             println!("This account has no photos volume.")
         }
         CtlResponse::Photos { items, .. } if items.is_empty() => println!("No photos."),
-        CtlResponse::Photos { items, .. } => {
-            // The timeline reply only carries thumbnails already in the cache, so
-            // pull the rest of the page's in one batch to print a path per photo.
-            let uids: Vec<String> = items.iter().map(|p| p.uid.clone()).collect();
-            let thumbs: HashMap<String, Option<String>> =
-                match control_request(CtlRequest::PhotoThumbs { uids })? {
-                    CtlResponse::Thumbs { items } => {
-                        items.into_iter().map(|t| (t.uid, t.path)).collect()
-                    }
-                    _ => HashMap::new(),
+        CtlResponse::Photos { items, .. } => print_photo_page(items)?,
+        CtlResponse::Error { message, kind } => bail!("{}", cli_error(kind, &message)),
+        other => bail!("unexpected response: {other:?}"),
+    }
+    Ok(())
+}
+
+/// Print one page of photos as `capture-time  uid  thumbnail-path`.
+///
+/// A timeline or album reply only carries thumbnails already in the cache, so
+/// the rest of the page's are pulled in one batch rather than left blank.
+fn print_photo_page(items: Vec<pdfs_core::control::PhotoItem>) -> Result<()> {
+    let uids: Vec<String> = items.iter().map(|p| p.uid.clone()).collect();
+    let thumbs: HashMap<String, Option<String>> =
+        match control_request(CtlRequest::PhotoThumbs { uids })? {
+            CtlResponse::Thumbs { items } => items.into_iter().map(|t| (t.uid, t.path)).collect(),
+            _ => HashMap::new(),
+        };
+    for p in items {
+        let thumb = thumbs
+            .get(&p.uid)
+            .and_then(|p| p.as_deref())
+            .or(p.thumb_path.as_deref())
+            .unwrap_or("(no thumbnail)");
+        println!("{}  {}  {thumb}", p.capture_time, p.uid);
+    }
+    Ok(())
+}
+
+fn cmd_albums() -> Result<()> {
+    match control_request(CtlRequest::PhotoAlbums)? {
+        CtlResponse::Albums {
+            available: false, ..
+        } => println!("This account has no photos volume."),
+        CtlResponse::Albums { items, .. } if items.is_empty() => println!("No albums."),
+        CtlResponse::Albums { items, .. } => {
+            for album in items {
+                let shared = if album.shared {
+                    " (shared with me)"
+                } else {
+                    ""
                 };
-            for p in items {
-                let thumb = thumbs
-                    .get(&p.uid)
-                    .and_then(|p| p.as_deref())
-                    .or(p.thumb_path.as_deref())
-                    .unwrap_or("(no thumbnail)");
-                println!("{}  {}  {thumb}", p.capture_time, p.uid);
+                println!(
+                    "{:>6}  {}  {}{shared}",
+                    album.photo_count, album.uid, album.name
+                );
             }
         }
+        CtlResponse::Error { message, kind } => bail!("{}", cli_error(kind, &message)),
+        other => bail!("unexpected response: {other:?}"),
+    }
+    Ok(())
+}
+
+fn cmd_album(uid: String, limit: usize, offset: usize) -> Result<()> {
+    match control_request(CtlRequest::AlbumPhotos { uid, offset, limit })? {
+        CtlResponse::Photos { items, .. } if items.is_empty() => println!("No photos."),
+        CtlResponse::Photos { items, .. } => print_photo_page(items)?,
         CtlResponse::Error { message, kind } => bail!("{}", cli_error(kind, &message)),
         other => bail!("unexpected response: {other:?}"),
     }

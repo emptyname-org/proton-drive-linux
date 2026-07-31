@@ -76,6 +76,7 @@ use proton_drive_rs::{
     ProtonPhotosClient, RevisionReader, SharedWithMeItem, ThumbnailType,
 };
 
+mod albums;
 mod background;
 mod control;
 use control::run_control_socket;
@@ -184,6 +185,11 @@ const TRASH_FIRST_WAIT: Duration = Duration::from_secs(20);
 /// doesn't re-ask the server on every page request).
 const PHOTOS_SYNCED_MS: &str = "photos_synced_ms";
 const PHOTOS_AVAILABLE: &str = "photos_available";
+/// Freshness stamp of the album listing, and of one album's contents (suffixed
+/// with the album uid). Separate from the timeline's: albums are enumerated by
+/// their own endpoints, and an album is only fetched when it is opened.
+const ALBUMS_SYNCED_MS: &str = "albums_synced_ms";
+const ALBUM_SYNCED_PREFIX: &str = "album_synced_ms:";
 const TRASH_SYNCED_MS: &str = "trash_synced_ms";
 const SHARED_WITH_ME_NAME: &str = "shared_with_me_name";
 const SHARED_WITH_ME_SYNCED_MS: &str = "shared_with_me_synced_ms";
@@ -343,6 +349,8 @@ struct Core {
     /// already running, so a burst of page requests against a stale listing kicks
     /// off one refresh rather than one per request.
     timeline_refreshing: Arc<AtomicBool>,
+    /// The same, for the album listing.
+    albums_refreshing: Arc<AtomicBool>,
     trash_refreshing: Arc<AtomicBool>,
     /// Fires whenever a trash refresh persists a batch or finishes, so a
     /// `ListTrash` request waiting on a first-ever refresh wakes on progress
@@ -4040,6 +4048,9 @@ fn local_node(uid: NodeUid, parent_uid: NodeUid, name: String, is_dir: bool) -> 
         is_shared_publicly: false,
         signature_email: None,
         membership: None,
+        // A locally fabricated node is on the main volume, never a photo/album.
+        photo: None,
+        album: None,
         // Nothing signed it: it has never been near the crypto layer.
         verification: Default::default(),
     }
@@ -4628,6 +4639,8 @@ mod pending_size_tests {
             is_shared_publicly: false,
             signature_email: None,
             membership: None,
+            photo: None,
+            album: None,
             verification: Default::default(),
         }
     }
@@ -6170,6 +6183,8 @@ mod tests {
             is_shared_publicly: false,
             signature_email: None,
             membership: None,
+            photo: None,
+            album: None,
             verification: Default::default(),
         }
     }

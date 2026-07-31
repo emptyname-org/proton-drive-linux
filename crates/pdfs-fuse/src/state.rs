@@ -966,6 +966,8 @@ mod tests {
             is_shared_publicly: false,
             signature_email: None,
             membership: None,
+            photo: None,
+            album: None,
             verification: Default::default(),
         }
     }

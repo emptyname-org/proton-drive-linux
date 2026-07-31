@@ -185,6 +185,9 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
                 }
                 RefreshScope::Photos => {
                     core.invalidate_photos();
+                    // Whatever changed the timeline can just as easily have
+                    // changed an album; one scope covers the whole photos view.
+                    core.invalidate_albums();
                     Ok(())
                 }
             };
@@ -212,6 +215,31 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
                 counts: None,
             },
             Err(e) => CtlResponse::error(e),
+        },
+        Ok(CtlRequest::PhotoAlbums) => match core.albums() {
+            Ok(Some(items)) => CtlResponse::Albums {
+                available: true,
+                items,
+            },
+            Ok(None) => CtlResponse::Albums {
+                available: false,
+                items: Vec::new(),
+            },
+            Err(e) => CtlResponse::error(e),
+        },
+        Ok(CtlRequest::AlbumPhotos { uid, offset, limit }) => match parse_uid(&uid) {
+            // An album page is a timeline page as far as the front-end is
+            // concerned, so it comes back in the same reply — with `counts`
+            // unset, which describe the whole timeline rather than this album.
+            Some(album) => match core.album_photos(&album, offset, limit) {
+                Ok(items) => CtlResponse::Photos {
+                    available: true,
+                    items,
+                    counts: None,
+                },
+                Err(e) => CtlResponse::error(e),
+            },
+            None => CtlResponse::error(CoreError::invalid(format!("bad album uid: {uid}"))),
         },
         Ok(CtlRequest::PhotoMonths { kind }) => match core.db.photos_months(kind) {
             Ok(months) => CtlResponse::PhotoMonths {

@@ -8,24 +8,53 @@ pub(crate) struct GalleryState {
     /// The day sections rendered by the Photos ListView, rebuilt from
     /// [`Self::model`] by [`repaint_gallery`].
     pub(crate) groups: gio::ListStore,
-    /// Target row height in px, retuned by Ctrl+scroll / Ctrl+± (see
-    /// [`zoom_gallery`]). Each tile keeps its own aspect ratio; rows are
-    /// justified to the content width around this height.
+    /// Target tile edge in px, retuned by Ctrl+scroll / Ctrl+± (see
+    /// [`zoom_gallery`]). The grid fits as many square tiles of about this size
+    /// as the content width holds.
     pub(crate) tile: Cell<i32>,
-    /// Swaps the Photos content area between the timeline and its status page.
+    /// Swaps the Photos content area between the timeline, its status page, and
+    /// the Albums grid.
     pub(crate) content: gtk4::Stack,
     pub(crate) status: adw::StatusPage,
     pub(crate) retry: gtk4::Button,
     pub(crate) more: gtk4::Button,
     pub(crate) upload: gtk4::Button,
+    /// "Photos", or the album's name while one is open.
+    pub(crate) title: gtk4::Label,
     /// "1,204 photos" under the page title.
     pub(crate) subtitle: gtk4::Label,
+    /// The album grid, and the stack that swaps it for its own status page.
+    pub(crate) albums: gtk4::FlowBox,
+    pub(crate) albums_stack: gtk4::Stack,
+    pub(crate) albums_status: adw::StatusPage,
+    /// The Photos/Albums switcher, and the box holding it — hidden while an
+    /// album is open, where the back button leads instead.
+    pub(crate) photos_btn: gtk4::ToggleButton,
+    pub(crate) albums_btn: gtk4::ToggleButton,
+    pub(crate) view_switch: gtk4::Box,
+    /// True while the album listing is in flight, so a re-entry into the Albums
+    /// view can't stack requests.
+    pub(crate) albums_loading: Cell<bool>,
+    /// The album currently open, or `None` when the timeline is showing. Set by
+    /// [`open_album`]; read by [`load_gallery`], which pages that album instead
+    /// of the timeline while it is set.
+    pub(crate) album: RefCell<Option<AlbumInfo>>,
+    /// Leaves an open album for the grid it was opened from. Visible only while
+    /// an album is open.
+    pub(crate) back: gtk4::Button,
+    /// The kind toggles and the date jump, hidden while an album is open — an
+    /// album page is served whole, not filtered.
+    pub(crate) filters: gtk4::Box,
     /// Which tab (Photos / Videos / Raw) the timeline is filtered to, or `None`
     /// for All. Read by [`load_gallery`] and set by the filter toggles.
     pub(crate) kind: Cell<Option<PhotoKind>>,
     /// The filter toggles, index-aligned with [`kind_for_tab`], kept so their
     /// labels can carry live per-kind counts.
     pub(crate) tabs: [gtk4::ToggleButton; 4],
+    /// Whole-timeline `(photos, videos, raw)` counts from the last page that
+    /// carried them, so the subtitle can say how big the library *is* rather
+    /// than how much of it has been paged in.
+    pub(crate) counts: Cell<Option<(usize, usize, usize)>>,
     /// The date-jump dropdown ("All dates" then a month per timeline entry), and
     /// the `[from, to)` window each of its rows selects (index-aligned; `None` is
     /// "All dates"). Selecting a row loads that month via [`load_gallery`].
@@ -40,21 +69,14 @@ pub(crate) struct GalleryState {
     /// True while a timeline page is in flight, so the scroll-to-the-end paging
     /// can't fire a second request for the page already coming.
     pub(crate) loading: Cell<bool>,
-    /// Content width the sections are currently justified to. Updated when the
-    /// ListView is resized, which re-justifies the visible sections.
+    /// Content width the grid is currently laid out to. Updated when the
+    /// ListView is resized, which re-flows the visible sections.
     pub(crate) width: Cell<i32>,
     /// Decoded thumbnails by photo uid, with the insertion order that evicts the
     /// oldest past [`TEXTURE_CACHE_MAX`]. Scrolling back over a day therefore
     /// repaints from memory instead of re-decoding from disk.
     pub(crate) photo_tex: RefCell<HashMap<String, gtk4::gdk::Texture>>,
     pub(crate) photo_tex_order: RefCell<VecDeque<String>>,
-    /// Aspect ratio (w/h) per uid, learned when a thumbnail is decoded and
-    /// persisted to disk, so a relaunch justifies its rows correctly on the first
-    /// frame instead of reflowing as thumbnails arrive.
-    pub(crate) photo_ratio: RefCell<HashMap<String, f64>>,
-    /// Ratios learned since the last save, so the ratio file is only rewritten
-    /// when it actually changed.
-    pub(crate) photo_ratio_dirty: Cell<bool>,
     /// Photos the daemon reported as having no thumbnail at all, so a tile that
     /// can never be filled isn't requested again on every scroll past it.
     pub(crate) photo_nothumb: RefCell<HashSet<String>>,
@@ -75,46 +97,33 @@ pub(crate) struct GalleryState {
     pub(crate) decode_queue: RefCell<VecDeque<(String, String)>>,
     pub(crate) decode_idle: Cell<bool>,
     /// Pending debounce timers for the thumbnail queue flush and the section
-    /// re-justify, replaced on each new trigger so only the last one fires.
+    /// re-flow, replaced on each new trigger so only the last one fires.
     pub(crate) thumb_source: RefCell<Option<glib::SourceId>>,
     pub(crate) relayout_source: RefCell<Option<glib::SourceId>>,
     /// The day sections currently realised by the ListView, by their index in
-    /// [`Self::groups`]. A learned ratio or a resize re-justifies these
-    /// in place — rebuilding the ListStore instead would reset the scroll
-    /// position out from under the user.
+    /// [`Self::groups`]. A resize or a zoom step re-flows these in place —
+    /// rebuilding the ListStore instead would reset the scroll position out from
+    /// under the user.
     pub(crate) bound: RefCell<HashMap<u32, gtk4::Box>>,
 }
 
 /// How many photos to pull per [`Request::PhotosTimeline`] page.
 pub(crate) const PHOTOS_PAGE: usize = 60;
 
-/// Gallery row height in px: the zoom range, its default, and the step one
-/// Ctrl+scroll notch (or Ctrl+±) moves it by. Rows are justified to the full
-/// content width, so this is the *target* height a row lands near, not an exact
-/// tile size (see [`justify_rows`]).
+/// Gallery tile edge in px: the zoom range, its default, and the step one
+/// Ctrl+scroll notch (or Ctrl+±) moves it by. The grid divides the content width
+/// evenly, so this is the *target* a tile lands near rather than its exact size
+/// (see [`plan_grid`]).
 pub(crate) const TILE_MIN: i32 = 90;
 
 pub(crate) const TILE_MAX: i32 = 340;
 
-pub(crate) const TILE_DEFAULT: i32 = 220;
+pub(crate) const TILE_DEFAULT: i32 = 180;
 
 pub(crate) const TILE_STEP: i32 = 30;
 
 /// Gap between tiles, horizontally and vertically.
-pub(crate) const TILE_GAP: i32 = 6;
-
-/// Aspect ratio (w/h) assumed for a photo whose thumbnail hasn't been decoded
-/// yet, so a tile can be laid out before its image exists. Landscape 3:2, the
-/// commonest camera/phone ratio; once the thumbnail lands the real ratio
-/// replaces it and the section re-justifies in place.
-pub(crate) const RATIO_UNKNOWN: f64 = 1.5;
-
-/// Aspect ratios are clamped to this range before a row is packed: one absurd
-/// panorama, or a sliver of a portrait, must not be able to squash the row it
-/// lands in down to nothing. The tile still shows the whole image.
-pub(crate) const RATIO_MIN: f64 = 0.4;
-
-pub(crate) const RATIO_MAX: f64 = 3.5;
+pub(crate) const TILE_GAP: i32 = 8;
 
 /// How many thumbnails one on-demand [`Request::PhotoThumbs`] batch asks for.
 /// Small, so the first tiles on screen fill in quickly rather than the whole
@@ -134,7 +143,7 @@ pub(crate) const THUMB_RETRY: Duration = Duration::from_secs(4);
 /// this caps the gallery's footprint while covering several screens of scroll.
 pub(crate) const TEXTURE_CACHE_MAX: usize = 600;
 
-/// Pause after a resize/zoom before the visible sections are re-justified.
+/// Pause after a resize/zoom before the visible sections are re-flowed.
 pub(crate) const RELAYOUT_DEBOUNCE: Duration = Duration::from_millis(80);
 
 /// One day-section of the photos timeline: a heading plus the photos captured
@@ -153,9 +162,11 @@ pub(crate) struct GalleryWidgets {
     pub(crate) model: gio::ListStore,
     /// Day sections rendered by the ListView, derived from `model`.
     pub(crate) groups: gio::ListStore,
-    /// Swaps between the timeline and the empty/loading/error status page.
+    /// Swaps between the timeline, the empty/loading/error status page, and the
+    /// Albums grid.
     pub(crate) content: gtk4::Stack,
     pub(crate) status: adw::StatusPage,
+    pub(crate) title: gtk4::Label,
     pub(crate) subtitle: gtk4::Label,
     pub(crate) more: gtk4::Button,
     pub(crate) list: gtk4::ListView,
@@ -163,6 +174,17 @@ pub(crate) struct GalleryWidgets {
     pub(crate) retry: gtk4::Button,
     pub(crate) upload: gtk4::Button,
     pub(crate) refresh: gtk4::Button,
+    /// The Albums grid, its own status page and the stack between them, plus the
+    /// Photos/Albums switcher and the back button out of an album.
+    pub(crate) albums: gtk4::FlowBox,
+    pub(crate) albums_stack: gtk4::Stack,
+    pub(crate) albums_status: adw::StatusPage,
+    pub(crate) photos_btn: gtk4::ToggleButton,
+    pub(crate) albums_btn: gtk4::ToggleButton,
+    pub(crate) view_switch: gtk4::Box,
+    pub(crate) back: gtk4::Button,
+    /// The kind toggles and date jump, as one box so an album view can hide them.
+    pub(crate) filters: gtk4::Box,
     /// The All / Photos / Videos / Raw filter toggles, in that order (index maps
     /// to [`kind_for_tab`]).
     pub(crate) tabs: [gtk4::ToggleButton; 4],
@@ -217,7 +239,7 @@ pub(crate) fn build_gallery_page() -> (gtk4::Widget, GalleryWidgets) {
     more.add_css_class("pill");
     more.set_visible(false);
 
-    // Horizontal scrolling is never wanted: rows are justified to the viewport
+    // Horizontal scrolling is never wanted: the grid is sized to the viewport
     // width, and a stray hscrollbar would fight the layout.
     let scroll = gtk4::ScrolledWindow::builder()
         .vexpand(true)
@@ -226,7 +248,7 @@ pub(crate) fn build_gallery_page() -> (gtk4::Widget, GalleryWidgets) {
         .build();
 
     let title_label = gtk4::Label::builder()
-        .label("Photos")
+        .label("Gallery")
         .halign(gtk4::Align::Start)
         .build();
     title_label.add_css_class("title-2");
@@ -243,6 +265,17 @@ pub(crate) fn build_gallery_page() -> (gtk4::Widget, GalleryWidgets) {
     titles.append(&title_label);
     titles.append(&subtitle);
 
+    // Leaves an open album for the grid it came from. Only an open album shows
+    // it — the Albums toggle is what leaves the grid itself.
+    let back = gtk4::Button::builder()
+        .icon_name("go-previous-symbolic")
+        .tooltip_text("Back to albums")
+        .valign(gtk4::Align::Center)
+        .visible(false)
+        .build();
+    back.add_css_class("flat");
+    back.add_css_class("circular");
+
     let upload = gtk4::Button::builder()
         .label("Upload")
         .icon_name("list-add-symbolic")
@@ -253,6 +286,7 @@ pub(crate) fn build_gallery_page() -> (gtk4::Widget, GalleryWidgets) {
     let refresh = refresh_button();
 
     let header_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+    header_box.append(&back);
     header_box.append(&titles);
     header_box.append(&refresh);
     header_box.append(&upload);
@@ -287,23 +321,73 @@ pub(crate) fn build_gallery_page() -> (gtk4::Widget, GalleryWidgets) {
     dates.add_css_class("pill");
     dates.set_tooltip_text(Some("Jump to a month"));
 
-    let filter_bar = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
-    filter_bar.append(&tab_group);
+    // The kind toggles and the date jump travel together: they filter the
+    // timeline, and neither applies to the album grid or to an open album.
+    let filters = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+    filters.set_hexpand(true);
+    filters.append(&tab_group);
     let spacer = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
     spacer.set_hexpand(true);
-    filter_bar.append(&spacer);
-    filter_bar.append(&dates);
+    filters.append(&spacer);
+    filters.append(&dates);
+
+    // The page's two views, as one segmented control under the title: the
+    // timeline, and the albums. This is navigation, not a filter — which is why
+    // it sits above the filter row rather than beside the kind toggles.
+    let photos_btn = gtk4::ToggleButton::builder()
+        .label("Photos")
+        .active(true)
+        .build();
+    let albums_btn = gtk4::ToggleButton::builder().label("Albums").build();
+    albums_btn.set_group(Some(&photos_btn));
+    let view_switch = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
+    view_switch.add_css_class("linked");
+    view_switch.add_css_class("view-switch");
+    view_switch.set_halign(gtk4::Align::Start);
+    for btn in [&photos_btn, &albums_btn] {
+        btn.add_css_class("pill");
+        view_switch.append(btn);
+    }
+
+    let filter_bar = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+    filter_bar.append(&filters);
 
     // The timeline (plus its pager) or the status page, never both.
     let timeline = gtk4::Box::new(gtk4::Orientation::Vertical, 12);
     timeline.append(&scroll);
     timeline.append(&more);
 
+    // The album grid: cover-first cards that flow to the width they are given.
+    let albums = gtk4::FlowBox::builder()
+        .selection_mode(gtk4::SelectionMode::None)
+        .homogeneous(true)
+        .row_spacing(TILE_GAP as u32 * 2)
+        .column_spacing(TILE_GAP as u32 * 2)
+        .min_children_per_line(2)
+        .max_children_per_line(8)
+        .valign(gtk4::Align::Start)
+        .build();
+    let albums_scroll = gtk4::ScrolledWindow::builder()
+        .vexpand(true)
+        .hscrollbar_policy(gtk4::PolicyType::Never)
+        .child(&albums)
+        .build();
+    let albums_status = adw::StatusPage::builder()
+        .icon_name("view-grid-symbolic")
+        .vexpand(true)
+        .build();
+    albums_status.add_css_class("compact");
+    let albums_stack = gtk4::Stack::new();
+    albums_stack.set_vexpand(true);
+    albums_stack.add_named(&albums_scroll, Some("grid"));
+    albums_stack.add_named(&albums_status, Some("status"));
+
     let content = gtk4::Stack::new();
     content.set_vexpand(true);
     content.set_transition_type(gtk4::StackTransitionType::Crossfade);
     content.add_named(&timeline, Some("timeline"));
     content.add_named(&status, Some("status"));
+    content.add_named(&albums_stack, Some("albums"));
 
     let inner = gtk4::Box::new(gtk4::Orientation::Vertical, 12);
     inner.set_margin_top(12);
@@ -311,6 +395,7 @@ pub(crate) fn build_gallery_page() -> (gtk4::Widget, GalleryWidgets) {
     inner.set_margin_start(12);
     inner.set_margin_end(12);
     inner.append(&header_box);
+    inner.append(&view_switch);
     inner.append(&filter_bar);
     inner.append(&content);
 
@@ -321,6 +406,7 @@ pub(crate) fn build_gallery_page() -> (gtk4::Widget, GalleryWidgets) {
             groups,
             content,
             status,
+            title: title_label,
             subtitle,
             more,
             list,
@@ -330,6 +416,14 @@ pub(crate) fn build_gallery_page() -> (gtk4::Widget, GalleryWidgets) {
             refresh,
             tabs,
             dates,
+            albums,
+            albums_stack,
+            albums_status,
+            photos_btn,
+            albums_btn,
+            view_switch,
+            back,
+            filters,
         },
     )
 }
@@ -416,14 +510,29 @@ pub(crate) fn refresh_photo_months(ui: &Rc<Ui>) {
 /// behind it is disabled — you can't filter to an empty set — but the currently
 /// selected one stays clickable so you can always switch back off it.
 pub(crate) fn update_gallery_tabs(ui: &Rc<Ui>, counts: (usize, usize, usize)) {
+    ui.gallery.counts.set(Some(counts));
     let (photos, videos, raw) = counts;
     let totals = [photos + videos + raw, photos, videos, raw];
     for (index, tab) in ui.gallery.tabs.iter().enumerate() {
         let name = ["All", "Photos", "Videos", "Raw"][index];
         let n = totals[index];
-        tab.set_label(&format!("{name} {n}"));
+        tab.set_label(&format!("{name}  {}", thousands(n)));
         tab.set_sensitive(n > 0 || tab.is_active());
     }
+}
+
+/// `1422` as `1,422`. Six-figure libraries are ordinary, and an unseparated run
+/// of digits in a tab label is unreadable at a glance.
+pub(crate) fn thousands(n: usize) -> String {
+    let digits = n.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
 }
 
 /// Wire the gallery: install the section factory, the zoom gestures, the pager
@@ -485,8 +594,8 @@ pub(crate) fn wire_gallery(ui: &Rc<Ui>, list: &gtk4::ListView, scroll: &gtk4::Sc
     });
     list.set_factory(Some(&factory));
 
-    // Rows are justified to the content width, so a resize re-justifies whatever
-    // is on screen (offscreen sections pick the new width up when they bind).
+    // The grid divides the content width, so a resize re-flows whatever is on
+    // screen (offscreen sections pick the new width up when they bind).
     let ui_width = ui.clone();
     list.connect_notify_local(Some("width"), move |list, _| {
         let width = list.width();
@@ -673,114 +782,55 @@ pub(crate) fn wire_gallery(ui: &Rc<Ui>, list: &gtk4::ListView, scroll: &gtk4::Sc
     });
 }
 
-/// One tile in a justified row: the photo, and the pixel size it was justified to.
+/// One tile of the grid: the photo, and the square edge it was sized to.
 pub(crate) struct Tile {
     pub(crate) photo: PhotoItem,
-    pub(crate) width: i32,
-    pub(crate) height: i32,
+    pub(crate) edge: i32,
 }
 
-/// Break one day's photos into rows that each fill `width` exactly, at heights
-/// near [`Ui::gallery_tile`] — the layout every modern photo gallery uses, and
-/// the reason nothing here has to be cropped: each tile keeps its own aspect
-/// ratio, and it is the row *height* that flexes to make the widths add up.
+/// Break one day's photos into rows of equal square tiles that span `width` —
+/// the layout a phone gallery uses, and the reason a day holding two photos
+/// looks like every other day rather than like a mistake.
 ///
-/// Greedy, one pass: keep adding photos to the row: the more photos share it, the
-/// shorter it has to be to fit. The moment that height drops to the target, the
-/// row is as full as it should be and is emitted. The trailing row keeps the
-/// target height instead of being stretched, so a day with three photos doesn't
-/// blow them up to fill a screen-wide row.
-///
-/// Photos whose thumbnail hasn't been decoded yet are laid out at
-/// [`RATIO_UNKNOWN`]; [`Ui::store_texture`] reports the real ratio when it lands
-/// and the section is re-justified in place.
-pub(crate) fn justify_rows(ui: &Rc<Ui>, photos: &[PhotoItem], width: i32) -> Vec<Vec<Tile>> {
-    let ratios: Vec<f64> = photos.iter().map(|photo| ui.ratio(&photo.uid)).collect();
-    let target = f64::from(ui.gallery.tile.get());
-    let plan = plan_rows(&ratios, target, f64::from(width));
-
-    let mut photos = photos.iter();
-    plan.into_iter()
+/// Each tile is centre-cropped to its square (the full frame is one click away
+/// in the lightbox), so nothing here depends on knowing a photo's aspect ratio
+/// and a row never has to be re-flowed when a thumbnail finally lands.
+pub(crate) fn grid_rows(ui: &Rc<Ui>, photos: &[PhotoItem], width: i32) -> Vec<Vec<Tile>> {
+    let (columns, edge) = plan_grid(ui.gallery.tile.get(), width);
+    photos
+        .chunks(columns)
         .map(|row| {
-            row.into_iter()
-                .filter_map(|(width, height)| {
-                    photos.next().map(|photo| Tile {
-                        photo: photo.clone(),
-                        width,
-                        height,
-                    })
+            row.iter()
+                .map(|photo| Tile {
+                    photo: photo.clone(),
+                    edge,
                 })
                 .collect()
         })
         .collect()
 }
 
-/// The row-packing math behind [`justify_rows`], over nothing but aspect ratios:
-/// takes each photo's ratio (w/h) in order and returns the pixel `(width,
-/// height)` of every tile, grouped into rows.
-pub(crate) fn plan_rows(ratios: &[f64], target: f64, width: f64) -> Vec<Vec<(i32, i32)>> {
-    let avail = width.max(f64::from(TILE_MIN));
-    let gap = f64::from(TILE_GAP);
-
-    // The height a row of `n` photos with `sum_ratio` total ratio must take for
-    // its widths (plus gaps) to add up to exactly `avail`.
-    let row_height = |sum_ratio: f64, n: usize| {
-        let gaps = gap * (n.saturating_sub(1)) as f64;
-        (avail - gaps) / sum_ratio
-    };
-
-    let mut rows: Vec<Vec<(i32, i32)>> = Vec::new();
-    let mut row: Vec<f64> = Vec::new();
-    let mut sum_ratio = 0.0;
-
-    for ratio in ratios {
-        let ratio = ratio.clamp(RATIO_MIN, RATIO_MAX);
-        row.push(ratio);
-        sum_ratio += ratio;
-
-        let height = row_height(sum_ratio, row.len());
-        if height <= target {
-            rows.push(size_row(&row, height, avail, true));
-            row.clear();
-            sum_ratio = 0.0;
-        }
-    }
-    if !row.is_empty() {
-        let height = row_height(sum_ratio, row.len()).min(target);
-        rows.push(size_row(&row, height, avail, false));
-    }
-    rows
+/// The grid math: how many columns fit in `width` at roughly `target` px per
+/// tile, and the exact square edge that divides the width between them.
+///
+/// The column count is what rounds — the edge then absorbs the remainder, so the
+/// grid spans the full width at every window size instead of leaving a ragged
+/// margin. Never fewer than one column, however narrow the window gets.
+pub(crate) fn plan_grid(target: i32, width: i32) -> (usize, i32) {
+    let avail = width.max(TILE_MIN);
+    let target = target.clamp(TILE_MIN, TILE_MAX);
+    // A row of n tiles occupies n*edge + (n-1)*gap, so n tiles of the target size
+    // fit while n*(target + gap) - gap <= avail.
+    let columns = ((avail + TILE_GAP) / (target + TILE_GAP)).max(1) as usize;
+    let gaps = TILE_GAP * (columns as i32 - 1);
+    let edge = ((avail - gaps) / columns as i32).max(1);
+    (columns, edge)
 }
 
-/// Size one row's tiles at `height`. A `justified` row is nudged so its widths
-/// plus gaps hit `avail` exactly — rounding each width independently leaves a
-/// few px of ragged right edge, so the last tile absorbs the remainder.
-pub(crate) fn size_row(
-    ratios: &[f64],
-    height: f64,
-    avail: f64,
-    justified: bool,
-) -> Vec<(i32, i32)> {
-    let height = height.round().max(1.0);
-    let mut sizes: Vec<(i32, i32)> = ratios
-        .iter()
-        .map(|ratio| ((ratio * height).round().max(1.0) as i32, height as i32))
-        .collect();
-
-    if justified {
-        let gaps = TILE_GAP * (sizes.len().saturating_sub(1)) as i32;
-        let used: i32 = sizes.iter().rev().skip(1).map(|(width, _)| *width).sum();
-        if let Some(last) = sizes.last_mut() {
-            last.0 = (avail as i32 - gaps - used).max(1);
-        }
-    }
-    sizes
-}
-
-/// (Re)build a bound day-section's tiles: justify this day's photos to the
+/// (Re)build a bound day-section's tiles: lay this day's photos out to the
 /// current content width and hand each tile whatever thumbnail is already in
 /// memory, queueing the rest. Replaces the section's rows in place, leaving the
-/// heading — so a re-justify never touches the ListView's model or scroll.
+/// heading — so a re-flow never touches the ListView's model or scroll.
 pub(crate) fn fill_section(ui: &Rc<Ui>, section: &gtk4::Box, photos: &[PhotoItem]) {
     let Some(heading) = section.first_child() else {
         return;
@@ -791,8 +841,11 @@ pub(crate) fn fill_section(ui: &Rc<Ui>, section: &gtk4::Box, photos: &[PhotoItem
 
     let width = gallery_width(ui);
     let rows = gtk4::Box::new(gtk4::Orientation::Vertical, TILE_GAP);
-    for row in justify_rows(ui, photos, width) {
+    for row in grid_rows(ui, photos, width) {
         let row_box = gtk4::Box::new(gtk4::Orientation::Horizontal, TILE_GAP);
+        // A short last row stays left-aligned at the same tile size rather than
+        // stretching: an even grid is the whole point of the square layout.
+        row_box.set_halign(gtk4::Align::Start);
         for tile in row {
             row_box.append(&photo_tile(ui, tile));
         }
@@ -802,8 +855,8 @@ pub(crate) fn fill_section(ui: &Rc<Ui>, section: &gtk4::Box, photos: &[PhotoItem
     schedule_thumbs(ui);
 }
 
-/// The width justified rows are laid out to: the ListView's own width, less a
-/// couple of px so a rounding error can't push a row into a horizontal overflow.
+/// The width the grid is laid out to: the ListView's own width, less a couple of
+/// px so a rounding error can't push a row into a horizontal overflow.
 /// Falls back to a sane guess before the first allocation.
 pub(crate) fn gallery_width(ui: &Rc<Ui>) -> i32 {
     match ui.gallery.width.get() {
@@ -822,12 +875,17 @@ pub(crate) fn gallery_width(ui: &Rc<Ui>) -> i32 {
 /// one keeps an image glyph instead of an empty rectangle.
 pub(crate) fn photo_tile(ui: &Rc<Ui>, tile: Tile) -> gtk4::Button {
     let picture = gtk4::Picture::builder()
-        // The tile is exactly the thumbnail's own aspect ratio, so Cover scales
-        // it and crops nothing; it only bites during the brief window where the
-        // ratio is still a guess, and the re-justify then fixes the tile.
+        // Cover fills the square and crops the overflow, so a portrait photo
+        // sits flush in its tile instead of floating in letterbox bars. The
+        // expands are what make the picture take the whole overlay: without
+        // them it is allocated its natural size and the crop never happens.
         .content_fit(gtk4::ContentFit::Cover)
         .can_shrink(true)
+        .hexpand(true)
+        .vexpand(true)
         .build();
+    // Zoomed on hover by the stylesheet; the tile clips the overflow.
+    picture.add_css_class("photo-thumb");
 
     let placeholder = gtk4::Image::builder()
         .icon_name("image-x-generic-symbolic")
@@ -871,8 +929,8 @@ pub(crate) fn photo_tile(ui: &Rc<Ui>, tile: Tile) -> gtk4::Button {
 
     let button = gtk4::Button::builder()
         .child(&overlay)
-        .width_request(tile.width)
-        .height_request(tile.height)
+        .width_request(tile.edge)
+        .height_request(tile.edge)
         .tooltip_text(format_capture_time(tile.photo.capture_time))
         .build();
     button.add_css_class("photo-tile");
@@ -1052,7 +1110,6 @@ pub(crate) fn schedule_decode(ui: &Rc<Ui>) {
             let mut queue = ui.gallery.decode_queue.borrow_mut();
             (0..4).filter_map(|_| queue.pop_front()).collect()
         };
-        let mut relayout = false;
         for (uid, path) in batch {
             let texture = match gtk4::gdk::Texture::from_filename(&path) {
                 Ok(texture) => texture,
@@ -1062,28 +1119,23 @@ pub(crate) fn schedule_decode(ui: &Rc<Ui>) {
                     continue;
                 }
             };
-            // A ratio we hadn't seen means the tile was sized against a guess.
-            relayout |= ui.store_texture(&uid, texture.clone());
+            ui.store_texture(&uid, texture.clone());
             if let Some(picture) = ui.gallery.thumb_wanted.borrow_mut().remove(&uid) {
                 picture.set_paintable(Some(&texture));
             }
         }
-        if relayout {
-            schedule_relayout(&ui);
-        }
 
         if ui.gallery.decode_queue.borrow().is_empty() {
             ui.gallery.decode_idle.set(false);
-            ui.save_ratios();
             return glib::ControlFlow::Break;
         }
         glib::ControlFlow::Continue
     });
 }
 
-/// Re-justify the sections on screen shortly. Debounced, because the triggers
-/// (a window resize, a zoom step, a burst of decoded thumbnails) all arrive in
-/// floods and only the final state matters.
+/// Re-flow the sections on screen shortly. Debounced, because the triggers (a
+/// window resize, a zoom step) arrive in floods and only the final state
+/// matters.
 pub(crate) fn schedule_relayout(ui: &Rc<Ui>) {
     if let Some(id) = ui.gallery.relayout_source.borrow_mut().take() {
         id.remove();
@@ -1097,9 +1149,8 @@ pub(crate) fn schedule_relayout(ui: &Rc<Ui>) {
 }
 
 /// Rebuild the tiles of the day sections currently on screen, at the current
-/// width, zoom and set of known aspect ratios. Sections that are *not* realised
-/// need no work: they justify themselves against the current state when the
-/// ListView binds them.
+/// width and zoom. Sections that are *not* realised need no work: they lay
+/// themselves out against the current state when the ListView binds them.
 pub(crate) fn relayout_gallery(ui: &Rc<Ui>) {
     let bound: Vec<(u32, gtk4::Box)> = ui
         .gallery
@@ -1120,12 +1171,12 @@ pub(crate) fn relayout_gallery(ui: &Rc<Ui>) {
     }
 }
 
-/// Step the row height by `delta` px and re-justify, clamped to the zoom range.
+/// Step the tile size by `delta` px and re-flow, clamped to the zoom range.
 pub(crate) fn zoom_gallery(ui: &Rc<Ui>, delta: i32) {
     set_gallery_tile(ui, ui.gallery.tile.get() + delta);
 }
 
-/// Set the row height (clamped) and re-justify the visible sections at it.
+/// Set the tile size (clamped) and re-flow the visible sections at it.
 pub(crate) fn set_gallery_tile(ui: &Rc<Ui>, tile: i32) {
     let tile = tile.clamp(TILE_MIN, TILE_MAX);
     if tile == ui.gallery.tile.get() {
@@ -1175,17 +1226,35 @@ pub(crate) fn repaint_gallery(ui: &Rc<Ui>) {
         store.splice(len, store.n_items() - len, &[] as &[BoxedAnyObject]);
     }
 
-    let count = ui.gallery.model.n_items();
-    ui.gallery.subtitle.set_visible(count > 0);
+    let loaded = ui.gallery.model.n_items() as usize;
+    ui.gallery.subtitle.set_visible(loaded > 0);
+    // An album counts what the server says it holds, not how much of it has been
+    // paged in — the subtitle would otherwise climb as the user scrolls.
+    if ui.gallery.album.borrow().is_some() {
+        return;
+    }
     // The noun tracks the active filter, so a Videos tab doesn't count "photos".
-    let (one, many) = match ui.gallery.kind.get() {
+    let kind = ui.gallery.kind.get();
+    let (one, many) = match kind {
         Some(PhotoKind::Video) => ("video", "videos"),
         Some(PhotoKind::Raw) => ("raw photo", "raw photos"),
         _ => ("photo", "photos"),
     };
-    ui.gallery.subtitle.set_label(&match count {
+    // The whole library for this filter, not the page count — the subtitle sits
+    // next to tabs carrying the same totals, and the two disagreeing reads as a
+    // bug. A date jump is the exception: there the window is the subject.
+    let total = match (ui.gallery.range.get(), ui.gallery.counts.get()) {
+        (None, Some((photos, videos, raw))) => match kind {
+            Some(PhotoKind::Photo) => photos,
+            Some(PhotoKind::Video) => videos,
+            Some(PhotoKind::Raw) => raw,
+            None => photos + videos + raw,
+        },
+        _ => loaded,
+    };
+    ui.gallery.subtitle.set_label(&match total {
         1 => format!("1 {one}"),
-        n => format!("{n} {many}"),
+        n => format!("{} {many}", thousands(n)),
     });
 }
 
@@ -1272,6 +1341,9 @@ pub(crate) fn load_gallery(ui: &Rc<Ui>, append: bool) {
     if ui.gallery.loading.get() {
         return;
     }
+    // An open album pages itself instead of the timeline; everything downstream —
+    // the model, the sections, the thumbnails, the lightbox — is the same.
+    let album = ui.gallery.album.borrow().as_ref().map(|a| a.uid.clone());
     if !append {
         // Fresh load: clear the timeline and show Loading until the first page lands.
         ui.gallery.model.remove_all();
@@ -1284,8 +1356,9 @@ pub(crate) fn load_gallery(ui: &Rc<Ui>, append: bool) {
         );
         // Rebuild the date jump for the current kind, but only for a full-span
         // load — a jump *to* a month sets a range and reloads, and refreshing the
-        // dropdown then would fight the selection the user just made.
-        if ui.gallery.range.get().is_none() {
+        // dropdown then would fight the selection the user just made. An album
+        // has no date jump at all.
+        if album.is_none() && ui.gallery.range.get().is_none() {
             refresh_photo_months(ui);
         }
     }
@@ -1294,15 +1367,20 @@ pub(crate) fn load_gallery(ui: &Rc<Ui>, append: bool) {
     ui.gallery.more.set_sensitive(false);
 
     ui.busy_begin();
-    let rx = spawn_request(
-        ui.dirs.control_socket(),
-        Request::PhotosTimeline {
+    let request = match album {
+        Some(uid) => Request::AlbumPhotos {
+            uid,
+            offset,
+            limit: PHOTOS_PAGE,
+        },
+        None => Request::PhotosTimeline {
             offset,
             limit: PHOTOS_PAGE,
             kind: ui.gallery.kind.get(),
             range: ui.gallery.range.get(),
         },
-    );
+    };
+    let rx = spawn_request(ui.dirs.control_socket(), request);
     let ui = ui.clone();
     glib::spawn_future_local(async move {
         let result = rx.recv().await;
@@ -1329,20 +1407,13 @@ pub(crate) fn load_gallery(ui: &Rc<Ui>, append: bool) {
                 if let Some(counts) = counts {
                     update_gallery_tabs(&ui, counts);
                 }
-                // Take the daemon's word on ratios and thumbnail verdicts before
-                // anything is laid out: it persists both, so the very first frame
-                // justifies its rows correctly instead of guessing RATIO_UNKNOWN
-                // and reflowing as the images land.
+                // Take the daemon's word on which photos can never have a
+                // thumbnail, so their tiles show a placeholder from the first
+                // frame instead of queueing a request that can only fail.
                 {
-                    let mut ratios = ui.gallery.photo_ratio.borrow_mut();
                     let mut nothumb = ui.gallery.photo_nothumb.borrow_mut();
-                    for item in &items {
-                        if let Some(ratio) = item.ratio {
-                            ratios.insert(item.uid.clone(), ratio);
-                        }
-                        if item.no_thumb {
-                            nothumb.insert(item.uid.clone());
-                        }
+                    for item in items.iter().filter(|item| item.no_thumb) {
+                        nothumb.insert(item.uid.clone());
                     }
                 }
                 for item in &items {
@@ -1350,13 +1421,15 @@ pub(crate) fn load_gallery(ui: &Rc<Ui>, append: bool) {
                 }
                 repaint_gallery(&ui);
                 if ui.gallery.model.n_items() == 0 {
-                    gallery_status(
-                        &ui,
-                        "image-x-generic-symbolic",
-                        "No photos yet",
-                        "Photos you upload to Proton Drive appear here.",
-                        false,
-                    );
+                    let (title, description) = if ui.gallery.album.borrow().is_some() {
+                        ("Empty album", "This album has no photos in it.")
+                    } else {
+                        (
+                            "No photos yet",
+                            "Photos you upload to Proton Drive appear here.",
+                        )
+                    };
+                    gallery_status(&ui, "image-x-generic-symbolic", title, description, false);
                     return;
                 }
                 ui.gallery.content.set_visible_child_name("timeline");

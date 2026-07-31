@@ -4,6 +4,7 @@ pub(crate) mod pages;
 pub(crate) mod widgets;
 
 use pages::activity::*;
+use pages::albums::*;
 use pages::browser::*;
 use pages::devices::*;
 use pages::locations::*;
@@ -43,8 +44,8 @@ use pdfs_core::auth;
 use pdfs_core::config::AppDirs;
 
 use pdfs_core::control::{
-    ActivityEntry, ActivityKind, BookmarkInfo, DeviceInfo, DirEntry, ErrorKind, InvitationInfo,
-    JobItem, PhotoItem, PhotoKind, PublicLinkInfo, RefreshScope, Request, Response,
+    ActivityEntry, ActivityKind, AlbumInfo, BookmarkInfo, DeviceInfo, DirEntry, ErrorKind,
+    InvitationInfo, JobItem, PhotoItem, PhotoKind, PublicLinkInfo, RefreshScope, Request, Response,
     RestorableFolder, RestoreItem, SearchHit, ShareEntry, ShareEntryKind, SharedItem,
     SyncFolderInfo, SyncPhase, SyncProgress, TransferDirection, TransferItem, pending_summary,
     send,
@@ -138,23 +139,10 @@ impl Ui {
         }
     }
 
-    /// The aspect ratio (w/h) to lay `uid`'s tile out at: the real one once its
-    /// thumbnail has been seen, otherwise [`RATIO_UNKNOWN`].
-    fn ratio(&self, uid: &str) -> f64 {
-        self.gallery
-            .photo_ratio
-            .borrow()
-            .get(uid)
-            .copied()
-            .unwrap_or(RATIO_UNKNOWN)
-    }
-
-    /// Remember a decoded thumbnail and the aspect ratio it revealed. Returns
-    /// true when the ratio is *new information* — the caller re-justifies the
-    /// affected rows, since they were laid out against a guess.
-    fn store_texture(&self, uid: &str, texture: gtk4::gdk::Texture) -> bool {
-        let (w, h) = (texture.width(), texture.height());
-
+    /// Remember a decoded thumbnail, evicting the oldest once the cache is full.
+    /// Scrolling back over a day then repaints from memory rather than decoding
+    /// the same JPEGs off disk again.
+    fn store_texture(&self, uid: &str, texture: gtk4::gdk::Texture) {
         let mut cache = self.gallery.photo_tex.borrow_mut();
         let mut order = self.gallery.photo_tex_order.borrow_mut();
         if cache.insert(uid.to_string(), texture).is_none() {
@@ -164,58 +152,6 @@ impl Ui {
             if let Some(old) = order.pop_front() {
                 cache.remove(&old);
             }
-        }
-        drop((cache, order));
-
-        if h <= 0 {
-            return false;
-        }
-        let ratio = f64::from(w) / f64::from(h);
-        let mut ratios = self.gallery.photo_ratio.borrow_mut();
-        match ratios.insert(uid.to_string(), ratio) {
-            // Only a *changed* ratio invalidates a layout; re-decoding a photo we
-            // already sized correctly must not trigger another pass.
-            Some(prev) if (prev - ratio).abs() < f64::EPSILON => false,
-            _ => {
-                self.gallery.photo_ratio_dirty.set(true);
-                true
-            }
-        }
-    }
-
-    /// Where the learned aspect ratios are persisted between runs.
-    fn ratio_path(&self) -> PathBuf {
-        self.dirs.cache_dir().join("photo-ratios.json")
-    }
-
-    /// Load the persisted aspect ratios. A missing or corrupt file just means the
-    /// first paint uses [`RATIO_UNKNOWN`] and re-justifies as thumbnails land.
-    fn load_ratios(&self) {
-        let path = self.ratio_path();
-        let Ok(text) = std::fs::read_to_string(&path) else {
-            return;
-        };
-        match serde_json::from_str::<HashMap<String, f64>>(&text) {
-            Ok(map) => *self.gallery.photo_ratio.borrow_mut() = map,
-            Err(e) => tracing::debug!("ignoring {}: {e}", path.display()),
-        }
-    }
-
-    /// Persist the learned aspect ratios, if any were learned since the last save.
-    fn save_ratios(&self) {
-        if !self.gallery.photo_ratio_dirty.replace(false) {
-            return;
-        }
-        let path = self.ratio_path();
-        let ratios = self.gallery.photo_ratio.borrow();
-        let write = serde_json::to_vec(&*ratios)
-            .map_err(std::io::Error::other)
-            .and_then(|bytes| {
-                std::fs::create_dir_all(path.parent().unwrap_or(Path::new("/")))?;
-                std::fs::write(&path, bytes)
-            });
-        if let Err(e) = write {
-            tracing::debug!("cannot save {}: {e}", path.display());
         }
     }
 }
@@ -287,15 +223,23 @@ fn load_proton_theme() {
          .viewer-spinner {{ color: white; }}\n\
          .viewer-status {{ color: white; font-size: 1rem; background-color: rgba(0, 0, 0, 0.75); padding: 12px 24px; border-radius: 12px; }}\n\
          .viewer-info-panel {{ background-color: @window_bg_color; border-left: 1px solid alpha(currentColor, 0.12); }}\n\
-         .gallery-day {{ font-size: 1.05rem; font-weight: 700; padding: 2px 2px 6px 2px; }}\n\
-         .photo-tile {{ padding: 0; margin: 0; min-height: 0; min-width: 0; border-radius: 10px; background: alpha(currentColor, 0.06); box-shadow: none; transition: filter 160ms ease, box-shadow 160ms ease; }}\n\
-         .photo-tile:hover {{ filter: brightness(1.06); box-shadow: 0 4px 14px rgba(0, 0, 0, 0.35); }}\n\
+         .gallery-day {{ font-size: 0.82rem; font-weight: 700; letter-spacing: 0.04em; text-transform: uppercase; color: alpha(currentColor, 0.65); padding: 4px 2px 8px 2px; }}\n\
+         .photo-tile {{ padding: 0; margin: 0; min-height: 0; min-width: 0; border-radius: 14px; background: alpha(currentColor, 0.06); box-shadow: none; transition: box-shadow 180ms ease, background 180ms ease; }}\n\
+         .photo-tile:hover {{ box-shadow: 0 8px 22px rgba(0, 0, 0, 0.45); }}\n\
          .photo-tile:focus {{ outline: 2px solid {PROTON_PURPLE}; outline-offset: -2px; }}\n\
+         .photo-thumb {{ transition: transform 220ms ease; }}\n\
+         .photo-tile:hover .photo-thumb {{ transform: scale(1.06); }}\n\
          .photo-placeholder {{ color: alpha(currentColor, 0.35); background: alpha(currentColor, 0.07); }}\n\
-         .photo-caption {{ font-size: 0.78rem; color: white; text-shadow: 0 1px 3px rgba(0, 0, 0, 0.9); padding: 22px 10px 6px 10px; opacity: 0; transition: opacity 160ms ease; }}\n\
+         .photo-caption {{ font-size: 0.78rem; color: white; text-shadow: 0 1px 3px rgba(0, 0, 0, 0.9); padding: 22px 10px 6px 10px; opacity: 0; transition: opacity 180ms ease; }}\n\
          .photo-video-badge {{ color: white; background: rgba(0, 0, 0, 0.45); border-radius: 999px; padding: 8px; min-width: 20px; min-height: 20px; box-shadow: 0 2px 8px rgba(0, 0, 0, 0.5); transition: background 160ms ease; }}\n\
          .photo-tile:hover .photo-video-badge {{ background: alpha({PROTON_PURPLE}, 0.85); }}\n\
          .photo-tile:hover .photo-caption {{ opacity: 1; background: linear-gradient(to top, rgba(0, 0, 0, 0.55), rgba(0, 0, 0, 0)); }}\n\
+         .album-card {{ padding: 0; border-radius: 16px; transition: background 180ms ease; }}\n\
+         .album-card:hover {{ background: alpha(currentColor, 0.07); }}\n\
+         .album-cover {{ border-radius: 16px; background: alpha(currentColor, 0.06); box-shadow: 0 4px 16px rgba(0, 0, 0, 0.32); transition: box-shadow 180ms ease; }}\n\
+         .album-card:hover .album-cover {{ box-shadow: 0 10px 26px rgba(0, 0, 0, 0.5); }}\n\
+         .album-card:hover .photo-thumb {{ transform: scale(1.05); }}\n\
+         .view-switch button {{ padding-left: 18px; padding-right: 18px; }}\n\
          .card {{ border-radius: 8px; transition: transform 0.2s ease, filter 0.2s ease; margin: 4px; }}\n\
          .card:hover {{ transform: scale(1.02); filter: brightness(0.9); }}\n\
          .navigation-sidebar row {{ border-radius: 8px; margin: 2px 6px; }}\n\
@@ -462,9 +406,21 @@ fn build_window(app: &adw::Application) {
             retry: gallery_widgets.retry.clone(),
             more: gallery_widgets.more.clone(),
             upload: gallery_widgets.upload.clone(),
+            title: gallery_widgets.title.clone(),
             subtitle: gallery_widgets.subtitle.clone(),
+            albums: gallery_widgets.albums.clone(),
+            albums_stack: gallery_widgets.albums_stack.clone(),
+            albums_status: gallery_widgets.albums_status.clone(),
+            photos_btn: gallery_widgets.photos_btn.clone(),
+            albums_btn: gallery_widgets.albums_btn.clone(),
+            view_switch: gallery_widgets.view_switch.clone(),
+            albums_loading: Cell::new(false),
+            album: RefCell::new(None),
+            back: gallery_widgets.back.clone(),
+            filters: gallery_widgets.filters.clone(),
             kind: Cell::new(None),
             tabs: gallery_widgets.tabs.clone(),
+            counts: Cell::new(None),
             dates: gallery_widgets.dates.clone(),
             date_ranges: RefCell::new(vec![None]),
             range: Cell::new(None),
@@ -473,8 +429,6 @@ fn build_window(app: &adw::Application) {
             width: Cell::new(0),
             photo_tex: RefCell::new(HashMap::new()),
             photo_tex_order: RefCell::new(VecDeque::new()),
-            photo_ratio: RefCell::new(HashMap::new()),
-            photo_ratio_dirty: Cell::new(false),
             photo_nothumb: RefCell::new(HashSet::new()),
             thumb_wanted: RefCell::new(HashMap::new()),
             thumb_queue: RefCell::new(VecDeque::new()),
@@ -538,8 +492,6 @@ fn build_window(app: &adw::Application) {
             key: RefCell::new(None),
         },
     });
-    ui.load_ratios();
-
     wire_login(&ui);
     wire_logout(&ui, &main_widgets.logout_button);
     wire_settings(
@@ -558,6 +510,7 @@ fn build_window(app: &adw::Application) {
     wire_details(&ui);
     wire_search(&ui);
     wire_gallery(&ui, &gallery_widgets.list, &gallery_widgets.scroll);
+    wire_albums(&ui);
     wire_trash(&ui, &trash_widgets.list, &trash_widgets.empty);
     wire_shared(&ui, &shared_widgets.retry, &shared_widgets.add_bookmark);
     wire_shared_by_me(&ui, &shared_by_me_widgets.retry);
@@ -626,12 +579,10 @@ fn build_window(app: &adw::Application) {
         glib::ControlFlow::Continue
     });
     let cell = RefCell::new(Some(source));
-    let ui_close = ui.clone();
     window.connect_close_request(move |_| {
         if let Some(id) = cell.borrow_mut().take() {
             id.remove();
         }
-        ui_close.save_ratios();
         glib::Propagation::Proceed
     });
 
@@ -646,7 +597,7 @@ const DESTINATIONS: [(&str, &str, &str); 9] = [
     ("shared", "Shared with me", "system-users-symbolic"),
     ("locations", "Locations", "drive-harddisk-symbolic"),
     ("devices", "Computers", "computer-symbolic"),
-    ("gallery", "Photos", "image-x-generic-symbolic"),
+    ("gallery", "Gallery", "image-x-generic-symbolic"),
     ("activity", "Activity", "document-open-recent-symbolic"),
     ("trash", "Trash", "user-trash-symbolic"),
     ("main", "Settings", "emblem-system-symbolic"),
@@ -749,7 +700,15 @@ fn reload_current_page(ui: &Rc<Ui>) {
             let path = ui.browser.path.borrow().clone();
             refresh_then(ui, RefreshScope::Dir { path }, load_browser);
         }
-        Some("gallery") => refresh_then(ui, RefreshScope::Photos, |ui| load_gallery(ui, false)),
+        // One scope covers the whole photos view, so Refresh reloads whichever of
+        // the two — album grid or timeline/album — is actually on screen.
+        Some("gallery") => refresh_then(ui, RefreshScope::Photos, |ui| {
+            if ui.gallery.content.visible_child_name().as_deref() == Some("albums") {
+                load_albums(ui);
+            } else {
+                load_gallery(ui, false);
+            }
+        }),
         Some("trash") => refresh_then(ui, RefreshScope::Trash, load_trash),
         Some("shared") => {
             ui.shared.loaded_at.set(None);
@@ -1064,81 +1023,54 @@ fn human_bytes(bytes: u64) -> String {
 mod tests {
     use super::*;
 
-    /// A justified row must fill the content width exactly: tile widths plus the
-    /// gaps between them add up to the width, with nothing left ragged.
-    fn row_width(row: &[(i32, i32)]) -> i32 {
-        let gaps = TILE_GAP * (row.len().saturating_sub(1)) as i32;
-        row.iter().map(|(width, _)| *width).sum::<i32>() + gaps
+    /// The full width one row of `columns` tiles occupies, gaps included.
+    fn row_width(columns: usize, edge: i32) -> i32 {
+        edge * columns as i32 + TILE_GAP * (columns as i32 - 1)
     }
 
     #[test]
-    fn justified_rows_fill_the_width_exactly() {
-        let ratios = [
-            1.5, 0.75, 1.5, 1.33, 0.66, 1.5, 1.0, 2.2, 1.5, 0.8, 1.5, 1.6,
-        ];
-        let rows = plan_rows(&ratios, 180.0, 1000.0);
-
-        assert!(
-            rows.len() > 1,
-            "12 photos at 180px should need several rows"
-        );
-        // Every row but the trailing one is justified.
-        for row in &rows[..rows.len() - 1] {
-            assert_eq!(row_width(row), 1000);
+    fn the_grid_spans_the_content_width() {
+        // Whatever the width, the columns plus their gaps land on it (bar the
+        // few px integer division cannot divide), so no ragged right margin.
+        for width in [640, 900, 1000, 1440, 1920, 2560] {
+            let (columns, edge) = plan_grid(TILE_DEFAULT, width);
+            let used = row_width(columns, edge);
+            assert!(
+                used <= width && width - used < columns as i32,
+                "{columns} x {edge}px = {used}px does not span {width}px"
+            );
         }
     }
 
     #[test]
-    fn every_photo_lands_in_exactly_one_row() {
-        let ratios: Vec<f64> = (0..37).map(|i| 0.5 + f64::from(i % 5) * 0.4).collect();
-        let rows = plan_rows(&ratios, 180.0, 1000.0);
-        let tiles: usize = rows.iter().map(Vec::len).sum();
-        assert_eq!(tiles, ratios.len());
-    }
-
-    #[test]
-    fn tiles_keep_their_aspect_ratio() {
-        let rows = plan_rows(&[1.5, 1.5, 1.5, 1.5, 1.5, 1.5, 1.5, 1.5], 180.0, 1000.0);
-        // All but the last tile of a justified row are sized straight from the
-        // ratio, so w/h is the photo's own — no cropping needed to place it.
-        for row in &rows {
-            for (width, height) in &row[..row.len() - 1] {
-                let ratio = f64::from(*width) / f64::from(*height);
-                assert!((ratio - 1.5).abs() < 0.02, "{width}x{height} is not 3:2");
-            }
-        }
-    }
-
-    #[test]
-    fn trailing_row_is_not_stretched() {
-        // Two photos can't fill a 1000px row at 180px tall, so they must keep the
-        // target height rather than being blown up to a screen-wide row.
-        let rows = plan_rows(&[1.5, 1.5], 180.0, 1000.0);
-        assert_eq!(rows.len(), 1);
-        assert!(rows[0].iter().all(|(_, height)| *height == 180));
-        assert!(row_width(&rows[0]) < 1000);
-    }
-
-    #[test]
-    fn an_extreme_panorama_cannot_squash_its_row() {
-        // Unclamped, a 20:1 panorama would drag its whole row down to ~40px tall.
-        // Clamped at RATIO_MAX it stays a wide tile in a row of normal height.
-        let rows = plan_rows(&[20.0, 1.5, 1.5], 180.0, 1000.0);
-        let (width, height) = rows[0][0];
-        assert!(height > 120, "row squashed to {height}px");
-        assert!(width <= 1000, "tile overflows the row at {width}px");
-        assert_eq!(row_width(&rows[0]), 1000);
-    }
-
-    #[test]
-    fn narrow_widths_and_no_photos_are_survivable() {
-        assert!(plan_rows(&[], 180.0, 1000.0).is_empty());
-        // Width below the floor is clamped rather than producing zero-px tiles.
-        let rows = plan_rows(&[1.5, 1.5], 180.0, 0.0);
+    fn tiles_stay_near_the_target_size() {
+        // The column count rounds and the edge absorbs the remainder, so a tile
+        // is never more than one gap-and-a-bit away from what was asked for.
+        let (columns, edge) = plan_grid(TILE_DEFAULT, 1920);
+        assert!(columns >= 7, "1920px should hold several 220px tiles");
         assert!(
-            rows.iter()
-                .flatten()
-                .all(|(width, height)| *width > 0 && *height > 0)
+            (edge - TILE_DEFAULT).abs() < TILE_DEFAULT / 3,
+            "{edge}px is not near the {TILE_DEFAULT}px target"
         );
+    }
+
+    #[test]
+    fn zooming_in_widens_the_tiles_and_drops_columns() {
+        let (wide_columns, small_edge) = plan_grid(TILE_MIN, 1200);
+        let (few_columns, big_edge) = plan_grid(TILE_MAX, 1200);
+        assert!(wide_columns > few_columns);
+        assert!(big_edge > small_edge);
+    }
+
+    #[test]
+    fn a_window_narrower_than_one_tile_still_gets_a_column() {
+        // A single column at whatever fits, rather than zero columns (which would
+        // divide by zero) or a zero-px tile.
+        let (columns, edge) = plan_grid(TILE_DEFAULT, 40);
+        assert_eq!(columns, 1);
+        assert!(edge > 0);
+        let (columns, edge) = plan_grid(TILE_DEFAULT, 0);
+        assert_eq!(columns, 1);
+        assert!(edge > 0);
     }
 }

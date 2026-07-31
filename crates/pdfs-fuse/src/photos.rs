@@ -5,7 +5,7 @@
 //! user. Thumbnails the server has none for (anything a camera wrote rather than
 //! a phone) are generated locally and stored as if the server had served them.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use pdfs_core::control::{PhotoItem, PhotoKind, PhotoThumb};
@@ -154,7 +154,20 @@ impl Core {
     pub(crate) fn photo_thumbs(&self, uids: &[NodeUid]) -> Vec<PhotoThumb> {
         let ttype = ThumbnailType::Thumbnail.as_i32();
         let keys: Vec<String> = uids.iter().map(|u| u.to_string()).collect();
-        let stored = self.db.photos_by_uid(&keys).unwrap_or_default();
+        let mut stored = self.db.photos_by_uid(&keys).unwrap_or_default();
+        // Album covers and the contents of an album shared with us are not in our
+        // own timeline, so their capture time — the cache's validity tag — only
+        // exists on the album rows. Fill in whatever the timeline didn't cover.
+        {
+            let have: HashSet<String> = stored.iter().map(|p| p.uid.clone()).collect();
+            let missing: Vec<String> = keys
+                .iter()
+                .filter(|k| !have.contains(*k))
+                .cloned()
+                .collect();
+            stored.extend(self.db.album_photos_by_uid(&missing).unwrap_or_default());
+        }
+        let stored = stored;
         let tags: HashMap<String, i64> = stored
             .iter()
             .map(|p| (p.uid.clone(), p.capture_time))
@@ -329,10 +342,16 @@ impl Core {
         }
     }
 
-    /// Persist what a thumbnail attempt learned about a photo.
+    /// Persist what a thumbnail attempt learned about a photo, against the
+    /// timeline and against every album the photo sits in — one attempt, one
+    /// verdict, wherever the photo is painted.
     pub(crate) fn record_thumb(&self, uid: &NodeUid, state: i64, ratio: Option<f64>) {
-        if let Err(e) = self.db.photo_set_thumb(&uid.to_string(), state, ratio) {
+        let key = uid.to_string();
+        if let Err(e) = self.db.photo_set_thumb(&key, state, ratio) {
             warn!(%uid, error = %e, "recording thumbnail state failed");
+        }
+        if let Err(e) = self.db.album_photo_set_thumb(&key, state, ratio) {
+            warn!(%uid, error = %e, "recording album thumbnail state failed");
         }
     }
 
