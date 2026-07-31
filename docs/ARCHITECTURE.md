@@ -76,6 +76,31 @@ sequenceDiagram
     FUSE-->>User: returns child inode metadata (attributes, TTL)
 ```
 
+### Access Classification and Enforcement
+
+Every `Entry` carries an `Access` (`Owner | Editor | Viewer | Unknown`), inherited from its parent at intern time rather than resolved per node — a child is always interned from its parent's listing, so one edge lookup answers it. A known share root takes its access from the persisted `share_access` table instead, which is also what makes the classification correct offline.
+
+Two rules decide the cases inheritance cannot:
+
+* **Not under a share, no role → `Owner` (fail open).** My Files and device folders are owned content; regressing this denies ordinary writes.
+* **Under a share with no usable role → `Viewer` (fail closed).** An unrecognised permission mask is never degraded into a guess.
+
+A node whose parent is not resident is the awkward case: a device folder's parent is the device root, which is never persisted as a node, so the whole subtree hydrates parentless. It resolves the way the persisted authority (`Db::effective_node_access`) does — a recorded share row above it wins, otherwise fail open on the mount's own volume and closed on a foreign one (`docs/BUGS.md` B79).
+
+Enforcement is three layers, and only the third closes B34:
+
+1. **Mode bits.** `attr()` returns `0o555`/`0o444` for a non-writable entry, and both mount paths set `MountOption::DefaultPermissions`, so the *kernel* refuses `open(O_WRONLY)`, `access(W_OK)` and namespace operations for any non-root process.
+2. **Handler gates.** `EACCES` in `create`/`mkdir`/`unlink`/`rmdir`/`rename` (parent-writable; both parents for a rename) and in `open`-for-write/`write`/`setattr`/`fallocate`. Covers root and stale attribute TTLs.
+3. **Queue guards.** `Core::require_uid_writable` admits a mutation only when the persisted authority *and* every live inode space agree the uid is writable. Nothing reaches `pending_op` otherwise, so the perpetual failing drain that B34 describes cannot occur even if a handler check is missed. The intersection is across mounts because a uid may be resident in more than one inode space.
+
+`EACCES`, not `EROFS`, for a read-only subtree inside a read-write mount: `EROFS` means "read-only filesystem" and misleads the heuristics in `cp`, `rsync` and `git`.
+
+### Local Locations
+
+`mount` is a presentation table: one row per local place this client occupies — the primary My Files session, and each device folder in mirror or on-demand mode. `sync_folder` remains the sync engine's own table (`sync_entry` is FK'd to it) and `MountKind::Device { sync_folder_id }` is the join. `Request::ListLocations` serves the table to `pdfs locations` and the GUI's Locations page.
+
+A mirror folder is a plain local directory with no FUSE session, so a row can legitimately describe a location that is not mounted — which is why the page is called *Locations* rather than *Mounts*. The primary mountpoint stays in `AppConfig`, with its `mount` row written at daemon start as a projection of it, so there are not two sources of truth for that path.
+
 ---
 
 ## 3. Read Path & Block Caching Pipeline

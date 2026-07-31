@@ -236,19 +236,18 @@ pub(crate) fn repaint_shared_by_me(ui: &Rc<Ui>, items: &[SharedItem]) {
             row.add_suffix(&open);
         }
 
-        // Manage opens the per-node Share dialog — only when the node's path is
-        // known (it has been browsed to this session); the dialog is path-keyed.
-        if !item.path.is_empty() {
-            let manage = gtk4::Button::builder()
-                .label("Manage")
-                .valign(gtk4::Align::Center)
-                .build();
-            manage.add_css_class("flat");
-            let ui_manage = ui.clone();
-            let entry = shared_item_as_entry(item);
-            manage.connect_clicked(move |_| open_share_dialog(&ui_manage, &entry));
-            row.add_suffix(&manage);
-        }
+        // Manage opens the per-node Share dialog. It used to be offered only for
+        // an item whose path the daemon could resolve; the dialog now addresses a
+        // pathless node by uid, so every shared item can be managed from here.
+        let manage = gtk4::Button::builder()
+            .label("Manage")
+            .valign(gtk4::Align::Center)
+            .build();
+        manage.add_css_class("flat");
+        let ui_manage = ui.clone();
+        let entry = shared_item_as_entry(item);
+        manage.connect_clicked(move |_| open_share_dialog(&ui_manage, &entry));
+        row.add_suffix(&manage);
 
         ui.shared_by_me.group.add(&row);
         rows.push(row.upcast());
@@ -295,5 +294,7 @@ pub(crate) fn shared_item_as_entry(item: &SharedItem) -> DirEntry {
         cached: false,
         uid: item.uid.clone(),
         path: item.path.clone(),
+        // Shared *by* me: I own it, so there is no role of mine to report.
+        role: String::new(),
     }
 }

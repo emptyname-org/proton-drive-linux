@@ -1442,6 +1442,7 @@ pub(crate) fn repaint_search(ui: &Rc<Ui>, hits: &[SearchHit]) {
             cached: false,
             uid: h.uid.clone(),
             path: h.path.clone(),
+            role: String::new(),
         })
         .collect();
     entries.sort_by(|a, b| {

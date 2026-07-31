@@ -21,13 +21,117 @@ pub(crate) fn role_wire_to_index(role: &str) -> u32 {
     }
 }
 
+/// How an open Share dialog addresses its node.
+///
+/// A node the browser is showing has a mountpoint-relative path. A node reached
+/// from Shared or Shared-with-me may not: it can live under a device folder's
+/// own inode space, or on someone else's volume, neither of which the primary
+/// mount's path space can name. Those carry a uid instead, and the daemon
+/// resolves it with `Core::resolve_anywhere` (mount-architecture.md P4).
+///
+/// The two are separate request variants rather than one request with an
+/// optional field on purpose: an older daemon that ignored `uid` would resolve
+/// the empty path to the *mount root* and act on the wrong node.
+pub(crate) enum ShareTarget {
+    Path(String),
+    Uid(String),
+}
+
+impl ShareTarget {
+    fn list(&self) -> Request {
+        match self {
+            ShareTarget::Path(path) => Request::ListShare { path: path.clone() },
+            ShareTarget::Uid(uid) => Request::ListShareByUid { uid: uid.clone() },
+        }
+    }
+
+    fn invite(&self, emails: Vec<String>, role: String, message: Option<String>) -> Request {
+        match self {
+            ShareTarget::Path(path) => Request::ShareNode {
+                path: path.clone(),
+                emails,
+                role,
+                message,
+            },
+            ShareTarget::Uid(uid) => Request::ShareNodeByUid {
+                uid: uid.clone(),
+                emails,
+                role,
+                message,
+            },
+        }
+    }
+
+    fn update_role(&self, id: String, kind: ShareEntryKind, role: String) -> Request {
+        match self {
+            ShareTarget::Path(path) => Request::UpdateShareRole {
+                path: path.clone(),
+                id,
+                kind,
+                role,
+            },
+            ShareTarget::Uid(uid) => Request::UpdateShareRoleByUid {
+                uid: uid.clone(),
+                id,
+                kind,
+                role,
+            },
+        }
+    }
+
+    fn remove_entry(&self, id: String, kind: ShareEntryKind) -> Request {
+        match self {
+            ShareTarget::Path(path) => Request::RemoveShareEntry {
+                path: path.clone(),
+                id,
+                kind,
+            },
+            ShareTarget::Uid(uid) => Request::RemoveShareEntryByUid {
+                uid: uid.clone(),
+                id,
+                kind,
+            },
+        }
+    }
+
+    fn create_link(&self, role: String, password: Option<String>) -> Request {
+        match self {
+            ShareTarget::Path(path) => Request::CreatePublicLink {
+                path: path.clone(),
+                role,
+                password,
+                expires: None,
+            },
+            ShareTarget::Uid(uid) => Request::CreatePublicLinkByUid {
+                uid: uid.clone(),
+                role,
+                password,
+                expires: None,
+            },
+        }
+    }
+
+    fn remove_link(&self, id: String) -> Request {
+        match self {
+            ShareTarget::Path(path) => Request::RemovePublicLink {
+                path: path.clone(),
+                id,
+            },
+            ShareTarget::Uid(uid) => Request::RemovePublicLinkByUid {
+                uid: uid.clone(),
+                id,
+            },
+        }
+    }
+}
+
 /// The mutable state behind an open Share dialog, so the invite/role/link
 /// handlers can rebuild the people and link sections after each change without
 /// tearing the whole dialog down.
 pub(crate) struct ShareDialog {
     pub(crate) ui: Rc<Ui>,
-    /// The node's mountpoint-relative path — how every request addresses it.
-    pub(crate) rel: String,
+    /// How every request from this dialog addresses the node.
+    pub(crate) target: ShareTarget,
     pub(crate) people: adw::PreferencesGroup,
     pub(crate) link_group: adw::PreferencesGroup,
     pub(crate) people_rows: RefCell<Vec<gtk4::Widget>>,
@@ -41,7 +145,13 @@ pub(crate) fn open_share_dialog(ui: &Rc<Ui>, entry: &DirEntry) {
         toast_error(ui, "Can't share", "Proton Drive isn't connected.");
         return;
     }
-    let rel = entry_rel(ui, entry);
+    // A node with no path is not a bug here: Shared and Shared-with-me list
+    // nodes that the primary mount never interned. Address those by uid.
+    let target = if entry.path.is_empty() {
+        ShareTarget::Uid(entry.uid.clone())
+    } else {
+        ShareTarget::Path(entry_rel(ui, entry))
+    };
 
     let toolbar = adw::ToolbarView::new();
     let header = adw::HeaderBar::new();
@@ -110,7 +220,7 @@ pub(crate) fn open_share_dialog(ui: &Rc<Ui>, entry: &DirEntry) {
 
     let state = Rc::new(ShareDialog {
         ui: ui.clone(),
-        rel,
+        target,
         people,
         link_group,
         people_rows: RefCell::new(Vec::new()),
@@ -144,12 +254,7 @@ pub(crate) fn open_share_dialog(ui: &Rc<Ui>, entry: &DirEntry) {
         let msg_clear = message_row.clone();
         share_dialog_op(
             &state_inv,
-            Request::ShareNode {
-                path: state_inv.rel.clone(),
-                emails,
-                role,
-                message,
-            },
+            state_inv.target.invite(emails, role, message),
             "Invitations sent",
             "Couldn't send invitations",
             Some(Box::new(move || {
@@ -165,12 +270,7 @@ pub(crate) fn open_share_dialog(ui: &Rc<Ui>, entry: &DirEntry) {
 
 /// Re-fetch the node's share and rebuild the people + public-link sections.
 pub(crate) fn share_dialog_reload(state: &Rc<ShareDialog>) {
-    let rx = spawn_request(
-        state.ui.dirs.control_socket(),
-        Request::ListShare {
-            path: state.rel.clone(),
-        },
-    );
+    let rx = spawn_request(state.ui.dirs.control_socket(), state.target.list());
     let state = state.clone();
     glib::spawn_future_local(async move {
         match rx.recv().await {
@@ -232,12 +332,11 @@ pub(crate) fn repaint_share_people(state: &Rc<ShareDialog>, entries: &[ShareEntr
             drop.connect_selected_notify(move |d| {
                 share_dialog_op(
                     &state_role,
-                    Request::UpdateShareRole {
-                        path: state_role.rel.clone(),
-                        id: id.clone(),
+                    state_role.target.update_role(
+                        id.clone(),
                         kind,
-                        role: role_index_to_wire(d.selected()).to_string(),
-                    },
+                        role_index_to_wire(d.selected()).to_string(),
+                    ),
                     "Role updated",
                     "Couldn't update the role",
                     None,
@@ -265,11 +364,7 @@ pub(crate) fn repaint_share_people(state: &Rc<ShareDialog>, entries: &[ShareEntr
         remove.connect_clicked(move |_| {
             share_dialog_op(
                 &state_rm,
-                Request::RemoveShareEntry {
-                    path: state_rm.rel.clone(),
-                    id: id.clone(),
-                    kind,
-                },
+                state_rm.target.remove_entry(id.clone(), kind),
                 "Access removed",
                 "Couldn't remove access",
                 None,
@@ -332,10 +427,7 @@ pub(crate) fn repaint_share_link(state: &Rc<ShareDialog>, link: Option<&PublicLi
             remove.connect_clicked(move |_| {
                 share_dialog_op(
                     &state_rm,
-                    Request::RemovePublicLink {
-                        path: state_rm.rel.clone(),
-                        id: id.clone(),
-                    },
+                    state_rm.target.remove_link(id.clone()),
                     "Public link removed",
                     "Couldn't remove the link",
                     None,
@@ -407,12 +499,7 @@ pub(crate) fn share_dialog_create_link(
 ) {
     let rx = spawn_request(
         state.ui.dirs.control_socket(),
-        Request::CreatePublicLink {
-            path: state.rel.clone(),
-            role,
-            password,
-            expires: None,
-        },
+        state.target.create_link(role, password),
     );
     let state = state.clone();
     glib::spawn_future_local(async move {

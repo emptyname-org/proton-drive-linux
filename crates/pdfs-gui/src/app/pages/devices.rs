@@ -9,6 +9,8 @@ pub(crate) struct DevicesState {
     pub(crate) group: adw::PreferencesGroup,
     pub(crate) rows: RefCell<Vec<gtk4::Widget>>,
     pub(crate) sync_group: adw::PreferencesGroup,
+    /// The single "This computer" summary row. The per-folder rows moved to the
+    /// Locations page, which owns every local path.
     pub(crate) sync_rows: RefCell<Vec<gtk4::Widget>>,
     /// "Rename" action in the "This computer" header. Insensitive until the
     /// device list identifies this machine's own device.
@@ -25,7 +27,8 @@ pub(crate) struct DevicesState {
 pub(crate) struct DevicesWidgets {
     pub(crate) content: gtk4::Stack,
     pub(crate) status: adw::StatusPage,
-    /// "This computer" — the local folders synced to this machine's device.
+    /// "This computer" — this machine's device identity and a pointer to its
+    /// folders on the Locations page.
     pub(crate) sync_group: adw::PreferencesGroup,
     /// "Rename" in the "This computer" header — renames this machine's device.
     pub(crate) rename_this: gtk4::Button,
@@ -33,7 +36,6 @@ pub(crate) struct DevicesWidgets {
     /// machine's own device is deliberately not among them; see
     /// [`repaint_devices`].
     pub(crate) group: adw::PreferencesGroup,
-    pub(crate) add_folder: gtk4::Button,
     /// "Restore Folders" — re-attach this device's remote folders to local
     /// directories after adopting it on a new machine.
     pub(crate) restore: gtk4::Button,
@@ -54,11 +56,6 @@ pub(crate) fn build_devices_page() -> (gtk4::Widget, DevicesWidgets) {
     titles.set_hexpand(true);
     titles.append(&title);
 
-    let add_folder = gtk4::Button::builder()
-        .label("Add Folder")
-        .valign(gtk4::Align::Center)
-        .build();
-    add_folder.add_css_class("flat");
     let restore = gtk4::Button::builder()
         .label("Restore Folders")
         .tooltip_text("Sync this computer's Drive folders back to local directories")
@@ -71,18 +68,14 @@ pub(crate) fn build_devices_page() -> (gtk4::Widget, DevicesWidgets) {
     header.append(&titles);
     header.append(&refresh);
     header.append(&restore);
-    header.append(&add_folder);
 
-    // The description spells out what the per-row On-demand switch does to the
-    // local copy, because the switch itself can't: turning it on *deletes* the
-    // files from this disk, which is not something to discover afterwards.
+    // This page is about device *identity* — which computer this is, which other
+    // computers back up to the account, and how to adopt one. The folders
+    // themselves are local paths, so they live on the Locations page; keeping a
+    // second copy of that list here would be two places to change the same mode.
     let sync_group = adw::PreferencesGroup::builder()
         .title("This computer")
-        .description(
-            "Local folders backed up to this device. Synced folders keep a full copy on \
-             this disk; on-demand folders keep the files in Proton Drive only and fetch \
-             them as you open them.",
-        )
+        .description("The device this machine backs up to.")
         .build();
     // Rename control for *this* machine's device, in the section header. The
     // current device is filtered out of "Other computers", so this is the only
@@ -145,7 +138,6 @@ pub(crate) fn build_devices_page() -> (gtk4::Widget, DevicesWidgets) {
             sync_group,
             rename_this,
             group,
-            add_folder,
             restore,
             retry,
             refresh,
@@ -153,20 +145,13 @@ pub(crate) fn build_devices_page() -> (gtk4::Widget, DevicesWidgets) {
     )
 }
 
-/// Install the Devices page's retry button and the "Add Folder" action.
-pub(crate) fn wire_devices(
-    ui: &Rc<Ui>,
-    retry: &gtk4::Button,
-    add_folder: &gtk4::Button,
-    restore: &gtk4::Button,
-) {
+/// Install the Devices page's retry button and the "Restore Folders" action.
+pub(crate) fn wire_devices(ui: &Rc<Ui>, retry: &gtk4::Button, restore: &gtk4::Button) {
     let ui_retry = ui.clone();
     retry.connect_clicked(move |_| {
         service::restart();
         load_devices(&ui_retry);
     });
-    let ui_add = ui.clone();
-    add_folder.connect_clicked(move |_| prompt_add_sync_folder(&ui_add));
     let ui_restore = ui.clone();
     restore.connect_clicked(move |_| prompt_restore_folders(&ui_restore));
     let ui_ren = ui.clone();
@@ -224,9 +209,9 @@ pub(crate) fn load_devices(ui: &Rc<Ui>) {
                 return;
             }
         };
-        // Daemon reachable: show the list and paint the synced-folders section.
+        // Daemon reachable: show the list and paint the "This computer" section.
         ui.devices.content.set_visible_child_name("list");
-        repaint_sync_folders(&ui, &folders);
+        repaint_this_computer(&ui, &folders);
 
         let devices = match devices_reply {
             Ok(Ok(Response::Devices { items })) => items,
@@ -236,35 +221,6 @@ pub(crate) fn load_devices(ui: &Rc<Ui>) {
         ui.devices.inflight.set(false);
         repaint_devices(&ui, &devices);
         ui.devices.loaded_at.set(Some(Instant::now()));
-    });
-}
-
-/// Refresh just the synced-folders section, with no status flash, no spinner and
-/// no devices round-trip. Driven by the periodic tick while the Devices page is
-/// on screen: a folder's sync progress is only live if something re-reads it.
-///
-/// A hiccup leaves the page as it is — the next tick tries again, and a real
-/// outage is reported by [`load_devices`] on the next visit.
-pub(crate) fn refresh_sync_folders(ui: &Rc<Ui>) {
-    if ui.devices.inflight.get() {
-        return;
-    }
-    ui.devices.inflight.set(true);
-    let rx = spawn_request(ui.dirs.control_socket(), Request::ListSyncFolders);
-    let ui = ui.clone();
-    glib::spawn_future_local(async move {
-        let result = rx.recv().await;
-        ui.devices.inflight.set(false);
-        let Ok(Ok(Response::SyncFolders { items })) = result else {
-            return;
-        };
-        // The page may have been navigated away from, or collapsed to a status
-        // view, while the request was in flight.
-        if ui.stack.visible_child_name().as_deref() == Some("devices")
-            && ui.devices.content.visible_child_name().as_deref() == Some("list")
-        {
-            repaint_sync_folders(&ui, &items);
-        }
     });
 }
 
@@ -398,137 +354,53 @@ pub(crate) fn device_subtitle(dev: &DeviceInfo) -> String {
     }
 }
 
-/// Rebuild the "This computer" section from a fresh synced-folders listing.
-pub(crate) fn repaint_sync_folders(ui: &Rc<Ui>, folders: &[SyncFolderInfo]) {
+/// Rebuild the "This computer" section: one row naming the device this machine
+/// backs up to, and how many folders it carries.
+///
+/// The per-folder rows (mode switch, sync now, remove) live on the Locations
+/// page. They are local paths, and Locations is the one page that owns those;
+/// two lists of the same folders would be two places to flip the same switch.
+pub(crate) fn repaint_this_computer(ui: &Rc<Ui>, folders: &[SyncFolderInfo]) {
     for row in ui.devices.sync_rows.borrow_mut().drain(..) {
         ui.devices.sync_group.remove(&row);
     }
+    let row = adw::ActionRow::builder()
+        .title("This computer")
+        .subtitle(this_computer_subtitle(folders))
+        .build();
+    row.add_prefix(&gtk4::Image::from_icon_name("computer-symbolic"));
+    let manage = gtk4::Button::builder()
+        .label("Locations")
+        .tooltip_text("Manage this computer's folders and mountpoint")
+        .valign(gtk4::Align::Center)
+        .build();
+    manage.add_css_class("flat");
+    let ui_go = ui.clone();
+    manage.connect_clicked(move |_| ui_go.stack.set_visible_child_name("locations"));
+    row.add_suffix(&manage);
+    ui.devices.sync_group.add(&row);
+    *ui.devices.sync_rows.borrow_mut() = vec![row.upcast()];
+}
+
+/// How many folders this machine backs up, and whether any of them needs
+/// attention — the one fact worth surfacing away from the folder list itself.
+pub(crate) fn this_computer_subtitle(folders: &[SyncFolderInfo]) -> String {
     if folders.is_empty() {
-        let row = adw::ActionRow::builder()
-            .title("No synced folders")
-            .subtitle("Add a folder to back it up to this device.")
-            .build();
-        row.add_prefix(&gtk4::Image::from_icon_name("folder-symbolic"));
-        ui.devices.sync_group.add(&row);
-        *ui.devices.sync_rows.borrow_mut() = vec![row.upcast()];
-        return;
+        return "No folders backed up yet — add one under Locations.".to_string();
     }
-    let mut rows: Vec<gtk4::Widget> = Vec::new();
-    for f in folders {
-        // A running pass describes itself ("Uploading photo.jpg — 12 of 40");
-        // otherwise fall back to the folder's resting state.
-        let status = match &f.progress {
-            Some(p) => sync_progress_label(p),
-            None => sync_state_label(&f.state).to_string(),
-        };
-        // A queued switch is where the folder is *going*, which is what the user
-        // just asked for and is waiting to see happen — so it leads the subtitle
-        // instead of the mode the folder is still technically in.
-        let subtitle = match (f.pending_mode.as_deref(), f.mode.as_str()) {
-            (Some("ondemand"), _) => format!("Going on-demand · {status}"),
-            (Some(_), _) => format!("Switching to synced · {status}"),
-            (None, "ondemand") => format!("On-demand · {status}"),
-            (None, _) => format!("Synced · {status}"),
-        };
-        let row = adw::ActionRow::builder()
-            .title(&f.local_path)
-            .subtitle(&subtitle)
-            .build();
-        row.add_prefix(&gtk4::Image::from_icon_name("folder-symbolic"));
-        let id = f.id;
-
-        // A pass that knows how far it has got shows it: the subtitle alone
-        // ("syncing photo.jpg — 12 of 40") never conveys that the end is near. This
-        // holds for scanning as much as applying — a big folder spends minutes there
-        // — but a folder syncing for the first time has no estimate to draw against
-        // (`total == 0`), and this row is repainted on the 2s tick, too slow for a
-        // pulse to read as motion. So it stays text-only until real counts exist.
-        if let Some(p) = &f.progress
-            && p.total > 0
-        {
-            let bar = gtk4::ProgressBar::builder()
-                .fraction((p.done as f64 / p.total.max(p.done) as f64).min(1.0))
-                .valign(gtk4::Align::Center)
-                .width_request(120)
-                .build();
-            row.add_suffix(&bar);
-        }
-
-        // Sync now — only meaningful for mirror folders (on-demand has no local
-        // copy to reconcile). The engine also syncs on file changes and on a
-        // 120s poll; this is the "don't wait" button.
-        if f.mode != "ondemand" {
-            let sync_now = gtk4::Button::builder()
-                .icon_name("view-refresh-symbolic")
-                .tooltip_text("Sync this folder now")
-                .valign(gtk4::Align::Center)
-                .build();
-            sync_now.add_css_class("flat");
-            let ui_sync = ui.clone();
-            sync_now.connect_clicked(move |_| {
-                let rx = spawn_request(
-                    ui_sync.dirs.control_socket(),
-                    Request::SyncNow { id: Some(id) },
-                );
-                let ui_sync = ui_sync.clone();
-                glib::spawn_future_local(async move {
-                    match rx.recv().await {
-                        Ok(Ok(Response::Ok { .. })) => toast(&ui_sync, "Syncing folder…"),
-                        Ok(Ok(Response::Error { message, kind })) => {
-                            toast_failure(&ui_sync, "Couldn't sync", &message, kind)
-                        }
-                        _ => toast_error(
-                            &ui_sync,
-                            "Couldn't sync",
-                            "The mount service didn't respond.",
-                        ),
-                    }
-                });
-            });
-            row.add_suffix(&sync_now);
-        }
-
-        // On-demand toggle: off = full local copy (mirror), on = FUSE mount that
-        // frees the disk. Set the state before wiring the handler so painting the
-        // current mode doesn't fire a spurious request.
-        //
-        // A queued switch paints as already flipped: the daemon accepted the
-        // request and will act on it, so snapping the switch back to the current
-        // mode would read as "it didn't take" and invite the user to toggle again.
-        let target = f.pending_mode.as_deref().unwrap_or(&f.mode);
-        let ondemand = gtk4::Switch::builder()
-            .tooltip_text(
-                "On-demand: free this disk by keeping the files in Proton Drive only, \
-                 fetching each as you open it. Turn off to download them back and keep a \
-                 full local copy.",
-            )
-            .valign(gtk4::Align::Center)
-            .active(target == "ondemand")
-            .build();
-        let ui_mode = ui.clone();
-        ondemand.connect_state_set(move |_, on| {
-            set_sync_folder_mode(&ui_mode, id, if on { "ondemand" } else { "mirror" });
-            glib::Propagation::Proceed
-        });
-        row.add_suffix(&ondemand);
-
-        let remove = gtk4::Button::builder()
-            .icon_name("user-trash-symbolic")
-            .tooltip_text("Stop syncing this folder")
-            .valign(gtk4::Align::Center)
-            .build();
-        remove.add_css_class("flat");
-        let ui_rm = ui.clone();
-        let path = f.local_path.clone();
-        // The folder's *current* mode, not a queued one: a switch that hasn't
-        // landed yet has not moved the files anywhere.
-        let ondemand = f.mode == "ondemand";
-        remove.connect_clicked(move |_| prompt_remove_sync_folder(&ui_rm, id, &path, ondemand));
-        row.add_suffix(&remove);
-        ui.devices.sync_group.add(&row);
-        rows.push(row.upcast());
+    let count = match folders.len() {
+        1 => "1 folder backed up".to_string(),
+        n => format!("{n} folders backed up"),
+    };
+    let attention = folders
+        .iter()
+        .filter(|f| f.state == "error" || f.state == "conflict")
+        .count();
+    match attention {
+        0 => format!("{count} · manage them under Locations"),
+        1 => format!("{count} · 1 needs attention"),
+        n => format!("{count} · {n} need attention"),
     }
-    *ui.devices.sync_rows.borrow_mut() = rows;
 }
 
 /// Human label for a synced folder's `state` column.
@@ -592,7 +464,7 @@ pub(crate) fn prompt_add_sync_folder(ui: &Rc<Ui>) {
                     // device and creating the remote folder is off-socket network
                     // work. A fixed delay here either fires too early (empty list)
                     // or too late (row flashes in). Instead let the periodic
-                    // `refresh_sync_folders` tick pick the row up whenever it
+                    // `refresh_locations` tick pick the row up whenever it
                     // actually lands, which is what keeps a running pass live too.
                     toast(&ui, "Syncing folder…");
                 }
@@ -941,4 +813,48 @@ pub(crate) fn run_devices_mutation(
             _ => toast_error(&ui, failed, "The mount service didn't respond."),
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn folder(state: &str) -> SyncFolderInfo {
+        SyncFolderInfo {
+            id: 1,
+            local_path: "/home/u/Documents".into(),
+            remote_uid: "vol~link".into(),
+            mode: "mirror".into(),
+            state: state.into(),
+            last_sync: 0,
+            pending_mode: None,
+            progress: None,
+        }
+    }
+
+    #[test]
+    fn a_machine_with_no_folders_is_told_where_to_add_one() {
+        assert_eq!(
+            this_computer_subtitle(&[]),
+            "No folders backed up yet — add one under Locations."
+        );
+    }
+
+    #[test]
+    fn folders_needing_attention_are_counted_not_hidden() {
+        // The per-folder rows moved to Locations, so this row is the only place
+        // the Computers page can surface that something is wrong.
+        assert_eq!(
+            this_computer_subtitle(&[folder("idle"), folder("idle")]),
+            "2 folders backed up · manage them under Locations"
+        );
+        assert_eq!(
+            this_computer_subtitle(&[folder("idle"), folder("error")]),
+            "2 folders backed up · 1 needs attention"
+        );
+        assert_eq!(
+            this_computer_subtitle(&[folder("conflict"), folder("error")]),
+            "2 folders backed up · 2 need attention"
+        );
+    }
 }

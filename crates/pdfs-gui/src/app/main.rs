@@ -6,6 +6,7 @@ pub(crate) mod widgets;
 use pages::activity::*;
 use pages::browser::*;
 use pages::devices::*;
+use pages::locations::*;
 use pages::login::*;
 use pages::photo_viewer::*;
 use pages::photos::*;
@@ -48,6 +49,8 @@ use pdfs_core::control::{
     SyncFolderInfo, SyncPhase, SyncProgress, TransferDirection, TransferItem, pending_summary,
     send,
 };
+
+use pdfs_core::mounts::{MountAccess, MountKind, MountMode, MountSpec};
 
 use pdfs_core::service;
 
@@ -113,6 +116,7 @@ struct Ui {
     pub(crate) shared: SharedState,
     pub(crate) shared_by_me: SharedByMeState,
     pub(crate) devices: DevicesState,
+    pub(crate) locations: LocationsState,
     pub(crate) activity: ActivityState,
 }
 
@@ -333,6 +337,7 @@ fn build_window(app: &adw::Application) {
     let (shared_page, shared_widgets) = build_shared_page();
     let (shared_by_me_page, shared_by_me_widgets) = build_shared_by_me_page();
     let (devices_page, devices_widgets) = build_devices_page();
+    let (locations_page, locations_widgets) = build_locations_page();
     let (activity_page, activity_widgets) = build_activity_page();
     let (trash_page, trash_widgets) = build_trash_page();
     stack.add_named(&login_page, Some("login"));
@@ -342,6 +347,7 @@ fn build_window(app: &adw::Application) {
     stack.add_named(&shared_by_me_page, Some("sharedbyme"));
     stack.add_named(&shared_page, Some("shared"));
     stack.add_named(&devices_page, Some("devices"));
+    stack.add_named(&locations_page, Some("locations"));
     stack.add_named(&activity_page, Some("activity"));
     stack.add_named(&trash_page, Some("trash"));
 
@@ -513,6 +519,15 @@ fn build_window(app: &adw::Application) {
             inflight: Cell::new(false),
             loaded_at: Cell::new(None),
         },
+        locations: LocationsState {
+            content: locations_widgets.content.clone(),
+            status: locations_widgets.status.clone(),
+            retry: locations_widgets.retry.clone(),
+            group: locations_widgets.group.clone(),
+            rows: RefCell::new(Vec::new()),
+            inflight: Cell::new(false),
+            loaded_at: Cell::new(None),
+        },
         activity: ActivityState {
             content: activity_widgets.content.clone(),
             status: activity_widgets.status.clone(),
@@ -546,12 +561,8 @@ fn build_window(app: &adw::Application) {
     wire_trash(&ui, &trash_widgets.list, &trash_widgets.empty);
     wire_shared(&ui, &shared_widgets.retry, &shared_widgets.add_bookmark);
     wire_shared_by_me(&ui, &shared_by_me_widgets.retry);
-    wire_devices(
-        &ui,
-        &devices_widgets.retry,
-        &devices_widgets.add_folder,
-        &devices_widgets.restore,
-    );
+    wire_devices(&ui, &devices_widgets.retry, &devices_widgets.restore);
+    wire_locations(&ui, &locations_widgets.retry, &locations_widgets.add_folder);
     wire_activity(&ui, &activity_widgets.retry);
     wire_refresh(
         &ui,
@@ -562,6 +573,7 @@ fn build_window(app: &adw::Application) {
             &shared_widgets.refresh,
             &shared_by_me_widgets.refresh,
             &devices_widgets.refresh,
+            &locations_widgets.refresh,
             &activity_widgets.refresh,
         ],
     );
@@ -584,6 +596,8 @@ fn build_window(app: &adw::Application) {
             Some("shared") => load_shared(&ui_nav),
             Some("devices") if page_fresh(&ui_nav.devices.loaded_at) => {}
             Some("devices") => load_devices(&ui_nav),
+            Some("locations") if page_fresh(&ui_nav.locations.loaded_at) => {}
+            Some("locations") => load_locations(&ui_nav),
             // Activity is intentionally not TTL-cached: it changes out from under
             // the page as background uploads and edits complete, so it reloads on
             // every visit to stay live.
@@ -626,10 +640,11 @@ fn build_window(app: &adw::Application) {
 
 /// The sidebar destinations, in order: the row index is the index into this table,
 /// and each entry is `(stack page name, label, icon)`.
-const DESTINATIONS: [(&str, &str, &str); 8] = [
+const DESTINATIONS: [(&str, &str, &str); 9] = [
     ("browser", "My files", "folder-symbolic"),
     ("sharedbyme", "Shared", "emblem-shared-symbolic"),
     ("shared", "Shared with me", "system-users-symbolic"),
+    ("locations", "Locations", "drive-harddisk-symbolic"),
     ("devices", "Computers", "computer-symbolic"),
     ("gallery", "Photos", "image-x-generic-symbolic"),
     ("activity", "Activity", "document-open-recent-symbolic"),
@@ -747,6 +762,10 @@ fn reload_current_page(ui: &Rc<Ui>) {
         Some("devices") => {
             ui.devices.loaded_at.set(None);
             load_devices(ui);
+        }
+        Some("locations") => {
+            ui.locations.loaded_at.set(None);
+            load_locations(ui);
         }
         Some("activity") => load_activity(ui),
         _ => {}

@@ -58,7 +58,9 @@ Derived from: [`BUGS.md`](BUGS.md)
 * **B56–B60 — fail-closed state and IPC fixes**: Future schemas, event cursor advancement, socket limits, private-directory validation, and atomic config saves are implemented. Malformed-schema, database-full, connection-flood, wrong-owner, and concurrent/faulted-save verification remains.
 * **B61 — credential rotation persistence**: Surface and retry keyring persistence failures so a rotated single-use refresh token cannot be lost on restart.
 * **B62–B65 — release assurance**: Clean-install package verification, complete version/protocol identity, recovery sign-off, advisory/license policy, SBOM, provenance, checksums, and signatures remain.
-* **B66–B68 — lifecycle and recovery**: Add queue flush/shutdown protection, explicit device adoption during fresh-state restore, and move profile backup below a writable remote folder.
+* **B66–B67 — lifecycle and recovery**: Add queue flush/shutdown protection and explicit device adoption during fresh-state restore.
+* **B68/B78 — profile backup**: the destination is fixed and verified live — `profile.json` now lives in `.proton-drive-linux/` under the device root, since the API refuses file creation at the root itself. What remains from B68 is making backup *health* visible (today a failure is a `WARN` in the log and nothing in the UI) and re-running the replacement-machine restore end to end.
+* **B79 — cross-mount permission classification**: fixed and verified live; the standing guard is the `regression B79` acceptance case. The second-account cases it neighbours (`regression B34`) still cannot run — see below.
 
 ---
 
@@ -76,6 +78,7 @@ Derived from: [`TESTING.md`](TESTING.md) and [`RECOVERY.md`](RECOVERY.md)
   3. Wipe the local state directory and SQLite cache.
   4. Restart the daemon.
   5. Run `pdfs sync restore` and assert the recovered filesystem matches the source byte-for-byte.
+* **Second-account sharing run (mount-architecture.md P7)**: The only outstanding verification for the mount/sharing work. One account covers `context_share_id`, the shared-with-me listing, sharing from device folders and the Locations page — all confirmed. A **second account** is required for the shared-tree rendering under a foreign volume, `accept_invitation`, `update_member_role`, the `regression B34` viewer cases (which skip cleanly today), and above all an **editor-role write into a foreign share**, the only thing that validates `membership_address_for`.
 * **Managed live mode matrix**: Before release, run `scripts/fuse-acceptance.sh --managed-live <empty-a> <empty-b>` with `PDFS_ACCEPTANCE_ONLY` unset. It validates on-demand/on-demand, on-demand/mirror, mirror/on-demand, and mirror/mirror transitions.
 * **Crash-consistency matrix**: Inject failure after scratch/sidecar sync, each staging rename, directory sync, pending-op insert/commit, and source deletion; prove that a complete discoverable copy and either the old or new queue record always survives.
 

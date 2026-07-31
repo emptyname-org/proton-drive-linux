@@ -83,6 +83,31 @@ guard, and it was found by exactly this mechanism: the B70 case failed, and
 narrowing it produced a smaller reproduction that has its own case now. Expect a
 red run against a real mount until it is fixed.
 
+**B79** (an on-demand device folder accepts writes) discovers its target from
+`pdfs locations --json` and skips when this machine has no mounted on-demand
+folder. It is the cheap standing guard against a *cross-mount* permission
+regression: the primary mount holds device-folder nodes too, and the queue guard
+intersects what every live inode space says about a uid, so a fail-closed
+classification in one mount denies writes in another.
+
+**B34** (a viewer-role share is read-only) and **B34b** (an editor-role share
+still writes) locate their subject through `pdfs shared-with-me --json`, which
+now carries `role` and a mount-relative `path`. Both skip when the account has no
+accepted share at that role — B34 needs a **second account** to have shared a
+folder read-only, which is the one part of the sharing suite that cannot be
+self-served. B34b degrades gracefully in the other direction: a shared *file*
+gets its mode bits and `W_OK` checked but is never written to, because it is
+someone else's document.
+
+B34's fourth assertion is the load-bearing one: `pending_uploads` and
+`pending_changes` must be **unchanged** across the refused writes. Mode bits
+alone would pass a fix that still admitted the write into `pending_op`, which is
+the actual harm — a background drain failing 403 forever.
+
+**Synthetic `Shared with me/` directory contract** asserts the virtual directory
+enumerates, reports `0555`, and refuses `mkdir`/`rmdir`/`rename`. It skips when
+the directory is absent (an account with no accepted shares).
+
 A regression case asserts against the *remote* outcome, so it must wait for the
 queue to drain before reading. Reading straight back through the mount proves
 nothing: the local attribute and content caches will happily return the bytes
@@ -148,6 +173,10 @@ interrupts a running daemon; `PDFS_ACCEPTANCE_UNIT` selects a different unit.
 During development, `PDFS_ACCEPTANCE_ONLY` runs tests whose descriptive name
 contains the supplied text (for example `PDFS_ACCEPTANCE_ONLY=namespace`). A
 release acceptance run must leave it unset so the complete contract executes.
+
+A filter naming a live-only case (every `regression B<n>` is one) selects nothing
+in the account-free reference run, which is not an error — that target simply has
+nothing to do. Only a filter matching *no case at all* fails, as the typo it is.
 
 Passing more paths runs the same filesystem suite independently against each.
 The first path must be the FUSE mount under test; later paths may be another

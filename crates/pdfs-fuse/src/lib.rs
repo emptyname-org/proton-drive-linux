@@ -2956,6 +2956,9 @@ impl Core {
                 // Listing entries live in the requested dir; the caller derives
                 // the path from its name. Left empty.
                 path: String::new(),
+                // My own tree: a role only means something under a share, and
+                // this listing never crosses into one.
+                role: String::new(),
             })
             .collect())
     }
@@ -3415,6 +3418,7 @@ impl Core {
                 cached: false,
                 uid: item.uid,
                 path: String::new(),
+                role: String::new(),
             })
             .collect())
     }

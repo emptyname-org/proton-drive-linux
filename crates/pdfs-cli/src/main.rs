@@ -905,7 +905,15 @@ fn cmd_shared_with_me(uid: Option<String>) -> Result<()> {
         CtlResponse::Entries { entries } => {
             for e in entries {
                 let kind = if e.is_dir { "d" } else { "-" };
-                println!("{kind} {:>12}  {}  [{}]", e.size, e.name, e.uid);
+                // My role decides whether this is writable at all, so it is
+                // printed whenever the API reported one; an empty role prints
+                // nothing rather than a guess.
+                let role = if e.role.is_empty() {
+                    String::new()
+                } else {
+                    format!("  ({})", e.role)
+                };
+                println!("{kind} {:>12}  {}{role}  [{}]", e.size, e.name, e.uid);
             }
         }
         CtlResponse::Error { message, kind } => bail!("{}", cli_error(kind, &message)),

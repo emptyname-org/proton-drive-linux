@@ -298,8 +298,15 @@ fn shared_entry_row(ui: &Rc<Ui>, entry: &DirEntry) -> adw::ActionRow {
         .title(&entry.name)
         .activatable(true)
         .build();
-    if !entry.is_dir {
-        row.set_subtitle(&human_bytes(entry.size));
+    let subtitle = shared_row_subtitle(entry);
+    if !subtitle.is_empty() {
+        row.set_subtitle(&subtitle);
+    }
+    // What I am allowed to do with someone else's file is the thing this page
+    // cannot leave implicit: a viewer share is browsable and unwritable, and
+    // that is only visible if it is said.
+    if let Some(badge) = role_badge(&entry.role) {
+        row.add_suffix(&badge);
     }
     row.add_prefix(&gtk4::Image::from_icon_name(if entry.is_dir {
         "folder-symbolic"
@@ -323,6 +330,43 @@ fn shared_entry_row(ui: &Rc<Ui>, entry: &DirEntry) -> adw::ActionRow {
         }
     });
     row
+}
+
+/// A shared row's subtitle: its size (files only), and where it can be reached
+/// in the local mount once the synthetic `Shared with me/` directory has interned
+/// it. An unlisted share has no local path yet, and says nothing rather than
+/// pointing at a directory that is not there.
+pub(crate) fn shared_row_subtitle(entry: &DirEntry) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if !entry.is_dir {
+        parts.push(human_bytes(entry.size));
+    }
+    if !entry.path.is_empty() {
+        parts.push(format!("in {}", entry.path));
+    }
+    parts.join(" · ")
+}
+
+/// The display name for a wire role, or `None` when there is nothing to show:
+/// owned content carries no role, and a role the API did not report is not
+/// guessed at (the SDK's `from_permissions_exact` returns `None` for an
+/// unrecognised mask rather than degrading it to viewer).
+pub(crate) fn role_label(role: &str) -> Option<&'static str> {
+    match role {
+        "viewer" => Some("Viewer"),
+        "editor" => Some("Editor"),
+        "admin" => Some("Admin"),
+        _ => None,
+    }
+}
+
+/// A dim role pill for a share I did not create.
+pub(crate) fn role_badge(role: &str) -> Option<gtk4::Label> {
+    let badge = gtk4::Label::new(Some(role_label(role)?));
+    badge.add_css_class("dim-label");
+    badge.add_css_class("caption");
+    badge.set_valign(gtk4::Align::Center);
+    Some(badge)
 }
 
 /// Download a file shared with me into the daemon's cache and hand it to the
@@ -662,4 +706,53 @@ pub(crate) fn run_shared_mutation(
             _ => toast_error(&ui, failed, "The mount service didn't respond."),
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(is_dir: bool, path: &str, role: &str) -> DirEntry {
+        DirEntry {
+            name: "Budget.ods".into(),
+            is_dir,
+            size: 2048,
+            modified: 0,
+            pinned: false,
+            cached: false,
+            uid: "vol~link".into(),
+            path: path.into(),
+            role: role.into(),
+        }
+    }
+
+    #[test]
+    fn a_share_with_no_local_path_says_nothing_about_one() {
+        // Before the synthetic directory has been listed, the daemon cannot
+        // resolve a path — pointing at one that isn't there would be worse than
+        // silence.
+        assert_eq!(shared_row_subtitle(&entry(true, "", "viewer")), "");
+        assert_eq!(
+            shared_row_subtitle(&entry(false, "", "viewer")),
+            human_bytes(2048)
+        );
+    }
+
+    #[test]
+    fn a_resident_share_reports_where_it_can_be_reached() {
+        let subtitle = shared_row_subtitle(&entry(true, "Shared with me/Team Budget", "editor"));
+        assert_eq!(subtitle, "in Shared with me/Team Budget");
+    }
+
+    #[test]
+    fn only_a_known_role_becomes_a_badge() {
+        // "" is owned content (no role applies) and an unrecognised mask is
+        // deliberately not guessed at — `from_permissions_exact` returns None
+        // rather than degrading to viewer, and this must not undo that.
+        for role in ["viewer", "editor", "admin"] {
+            assert!(role_label(role).is_some(), "{role} should have a label");
+        }
+        assert!(role_label("").is_none());
+        assert!(role_label("inherited").is_none());
+    }
 }

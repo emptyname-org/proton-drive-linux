@@ -706,6 +706,12 @@ pub struct DirEntry {
     /// browser.
     #[serde(default)]
     pub path: String,
+    /// My role on this node when it is reached through a share I accepted —
+    /// `"viewer"`, `"editor"`, `"admin"`, or empty for content I own (where the
+    /// question does not arise) and for a share whose role the API did not
+    /// report. Defaulted for wire-compat with clients/daemons predating it.
+    #[serde(default)]
+    pub role: String,
 }
 
 /// One hit in a [`Request::Search`] result. Like [`DirEntry`] but carries the

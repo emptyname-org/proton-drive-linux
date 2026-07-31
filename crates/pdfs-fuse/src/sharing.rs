@@ -19,10 +19,15 @@ use proton_drive_rs::Node;
 
 use super::{Core, ROOT_INO, node_size, parse_uid, public_link_info, role_from_str, role_to_str};
 
-/// A node from a *shared* listing as a [`DirEntry`]. Shared nodes live outside
-/// the mount, so the entry is uid-addressed: `path` is empty, and the local-state
-/// flags (`pinned`, `cached`) are false — they describe my own tree, not this one.
-fn shared_entry(n: Node) -> DirEntry {
+/// A node from a *shared* listing as a [`DirEntry`].
+///
+/// Still uid-addressed — that is the only handle a foreign-volume node is
+/// guaranteed to have — but `path` is filled in when the node is resident under
+/// the synthetic `Shared with me/` directory, which is what lets a front-end
+/// offer path-keyed actions on it. The local-state flags (`pinned`, `cached`)
+/// stay false: they describe content this account owns a local copy policy for,
+/// which a share on someone else's volume is not.
+fn shared_entry_of(core: &Core, n: Node) -> DirEntry {
     let is_dir = n.is_folder();
     let size = match &n.kind {
         NodeKind::File {
@@ -32,6 +37,13 @@ fn shared_entry(n: Node) -> DirEntry {
         } => claimed_size.unwrap_or(*total_size_on_storage).max(0) as u64,
         NodeKind::Folder => 0,
     };
+    let role = n
+        .membership
+        .as_ref()
+        .and_then(|m| m.role_exact())
+        .map(role_to_str)
+        .unwrap_or_default()
+        .to_string();
     DirEntry {
         name: n.name,
         is_dir,
@@ -39,8 +51,9 @@ fn shared_entry(n: Node) -> DirEntry {
         modified: n.modification_time,
         pinned: false,
         cached: false,
+        path: core.rel_path_for_uid(&n.uid).unwrap_or_default(),
         uid: n.uid.to_string(),
-        path: String::new(),
+        role,
     }
 }
 
@@ -371,7 +384,10 @@ impl Core {
             .rt
             .block_on(self.client.enumerate_nodes(&uids))
             .map_err(|e| CoreError::from_api(&e, "enumerate nodes"))?;
-        Ok(nodes.into_iter().map(shared_entry).collect())
+        Ok(nodes
+            .into_iter()
+            .map(|node| shared_entry_of(self, node))
+            .collect())
     }
 
     /// List the children of a folder shared with me, addressed by uid.
@@ -393,7 +409,10 @@ impl Core {
             .rt
             .block_on(self.client.enumerate_nodes(&child_uids))
             .map_err(|e| CoreError::from_api(&e, "enumerate nodes"))?;
-        Ok(nodes.into_iter().map(shared_entry).collect())
+        Ok(nodes
+            .into_iter()
+            .map(|node| shared_entry_of(self, node))
+            .collect())
     }
 
     /// Download a file shared with me into the content cache, returning its

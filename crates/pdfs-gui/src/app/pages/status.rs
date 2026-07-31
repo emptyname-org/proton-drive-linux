@@ -31,8 +31,8 @@ pub(crate) struct StatusState {
     /// Cache-budget editor (GiB). Populated once from config; user edits drive a
     /// `SetCacheBudget` round-trip. Guarded by [`Self::settings_suppress`].
     pub(crate) budget_row: adw::SpinRow,
-    /// Shows the active mountpoint in its subtitle; updated when the user picks a
-    /// new folder.
+    /// Shows where the primary mount lives; the folder itself is managed on the
+    /// Locations page, which owns every local path.
     pub(crate) mountpoint_row: adw::ActionRow,
     /// Set while a settings widget is being populated programmatically, so its
     /// change handler skips the IPC/systemd side effect.
@@ -100,7 +100,8 @@ pub(crate) struct MainWidgets {
     pub(crate) budget_row: adw::SpinRow,
     /// Purges all unpinned cached content.
     pub(crate) purge_button: gtk4::Button,
-    /// Shows the active mountpoint; its suffix button opens a folder chooser.
+    /// Shows the active mountpoint; its suffix button opens the Locations page,
+    /// which is where the folder is changed.
     pub(crate) mountpoint_row: adw::ActionRow,
     pub(crate) mountpoint_button: gtk4::Button,
 }
@@ -215,12 +216,17 @@ pub(crate) fn build_main_page() -> (gtk4::Widget, MainWidgets) {
         .subtitle("Mount Proton Drive automatically when you log in.")
         .build();
     system_group.add(&autostart_row);
+    // The mountpoint is a *location*, and every other local path this client
+    // owns is managed on the Locations page. Keeping a second chooser here would
+    // be a second source of truth for the same setting, so this row reports the
+    // path and hands the change over.
     let mountpoint_row = adw::ActionRow::builder()
         .title("Mountpoint")
         .subtitle("—")
         .build();
     let mountpoint_button = gtk4::Button::builder()
-        .label("Change")
+        .label("Locations")
+        .tooltip_text("Manage this computer's Proton Drive locations")
         .valign(gtk4::Align::Center)
         .build();
     mountpoint_button.add_css_class("flat");
@@ -372,10 +378,10 @@ pub(crate) fn wire_settings(
         }
     });
 
-    // Mountpoint: pick a folder, persist it, and offer to restart the mount so
-    // the change takes effect (the daemon reads the path on mount).
+    // Mountpoint: the chooser lives on the Locations page, next to every other
+    // local path; this button is the way there.
     let ui_mp = ui.clone();
-    mountpoint_button.connect_clicked(move |_| prompt_mountpoint(&ui_mp));
+    mountpoint_button.connect_clicked(move |_| ui_mp.stack.set_visible_child_name("locations"));
 }
 
 /// Run a settings control-socket round-trip (budget / purge) on a worker thread,
@@ -423,6 +429,12 @@ pub(crate) fn prompt_mountpoint(ui: &Rc<Ui>) {
             return;
         }
         ui.status.mountpoint_row.set_subtitle(&path_str);
+        // The Locations page shows the same path as a row title; its cached rows
+        // are now stale whether or not it is the visible page.
+        ui.locations.loaded_at.set(None);
+        if ui.stack.visible_child_name().as_deref() == Some("locations") {
+            load_locations(&ui);
+        }
 
         // The daemon only reads the mountpoint at mount time, so offer a restart.
         let confirm = adw::AlertDialog::builder()
@@ -503,7 +515,7 @@ pub(crate) fn refresh(ui: &Rc<Ui>) {
     // they are on screen. Every other page loads on navigation only.
     match ui.stack.visible_child_name().as_deref() {
         Some("main") => refresh_quota(ui),
-        Some("devices") => refresh_sync_folders(ui),
+        Some("locations") => refresh_locations(ui),
         Some("activity") => refresh_activity(ui),
         _ => {}
     }

@@ -66,7 +66,10 @@ device-folder tree to `Viewer` in memory.
 **Tests:** `state::tests::own_volume_nodes_without_a_resident_parent_stay_owned`,
 `foreign_volume_nodes_without_a_resident_parent_fail_closed`,
 `persisted_authority_outranks_the_own_volume_fail_open`. The first fails on the
-pre-fix branch with `left: Unknown, right: Owner`.
+pre-fix branch with `left: Unknown, right: Owner`. The standing live guard is the
+`regression B79` acceptance case, which finds a mounted on-demand device folder
+through `pdfs locations --json` and writes into it (skipping when this machine
+has none).
 
 **Verified live (2026-07-31):** the packaged 1.2.1 daemon denies
 `touch ~/Documents/pdfs-b79-test`, `mkdir`, and `>` redirect while

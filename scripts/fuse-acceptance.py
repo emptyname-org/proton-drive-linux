@@ -1075,6 +1075,208 @@ def test_regression_b74_rename_after_close(ctx: Context) -> None:
     ctx.record("digest", hashlib.sha256(read(final)).hexdigest())
 
 
+SHARED_DIR_NAME = "Shared with me"
+
+
+def _locations(daemon: Daemon) -> list[dict]:
+    """Every local Proton Drive location the daemon reports."""
+    return json.loads(daemon.command("locations", json_output=True)).get("items", [])
+
+
+def _shared_with_me(daemon: Daemon) -> list[dict]:
+    return json.loads(daemon.command("shared-with-me", json_output=True)).get("entries", [])
+
+
+def _shared_root(daemon: Daemon, mount: Path, role: str) -> Path:
+    """The local path of an accepted share held at `role`.
+
+    Skips rather than fails when the account has no such share: the role cases
+    need a *second* account to have shared something at that role, which most
+    runs will not have (mount-architecture.md §7).
+    """
+    entries = [e for e in _shared_with_me(daemon) if e.get("role") == role]
+    if not entries:
+        raise Skip(f"no accepted {role}-role share on this account")
+    for entry in entries:
+        # `path` is mount-relative and filled in only once the synthetic
+        # directory has interned the node, so list it first.
+        with contextlib.suppress(OSError):
+            os.listdir(mount / SHARED_DIR_NAME)
+        relative = entry.get("path") or ""
+        if relative:
+            candidate = mount / relative
+            if candidate.exists():
+                return candidate
+    raise Skip(f"{role}-role share is not resident under {SHARED_DIR_NAME}/")
+
+
+def test_regression_b34_viewer_share_is_read_only(ctx: Context) -> None:
+    """A viewer-role share must be read-only *and* queue nothing (B34).
+
+    The harm B34 names is not the mode bits: it is that a local write into a
+    read-only share was accepted, entered `pending_op`, and then failed 403 in
+    the drain forever. So step 4 — the queue depth being unchanged across the
+    attempts — is the assertion that distinguishes the fix from cosmetics.
+    """
+    daemon = ctx.require_daemon()
+    mount = daemon.enclosing_mount(ctx.root)
+    root = _shared_root(daemon, mount, "viewer")
+
+    before = daemon.status().get("mount") or {}
+    mode = stat.S_IMODE(os.stat(root).st_mode)
+    check(mode == 0o555, f"viewer share is {mode:o}, expected 555")
+    check(not os.access(root, os.W_OK), "viewer share reports itself writable")
+
+    target = root / "b34-should-not-exist"
+    expect_errno({errno.EACCES}, lambda: os.mkdir(target), "mkdir in a viewer share")
+    expect_errno(
+        {errno.EACCES},
+        lambda: os.open(target, os.O_CREAT | os.O_WRONLY, 0o600),
+        "create in a viewer share",
+    )
+    for child in sorted(root.iterdir())[:1]:
+        child_mode = stat.S_IMODE(os.stat(child).st_mode)
+        expected = 0o555 if child.is_dir() else 0o444
+        check(child_mode == expected, f"{child.name} is {child_mode:o}, expected {expected:o}")
+        expect_errno(
+            {errno.EACCES},
+            lambda: os.open(child, os.O_WRONLY),
+            "open-for-write in a viewer share",
+        )
+        expect_errno(
+            {errno.EACCES},
+            lambda: os.rename(child, child.with_name("b34-renamed")),
+            "rename in a viewer share",
+        )
+        expect_errno(
+            {errno.EACCES},
+            lambda: (os.rmdir(child) if child.is_dir() else os.unlink(child)),
+            "remove from a viewer share",
+        )
+
+    after = daemon.status().get("mount") or {}
+    for key in ("pending_uploads", "pending_changes"):
+        check(
+            before.get(key, 0) == after.get(key, 0),
+            f"a refused write changed {key}: {before.get(key)} -> {after.get(key)}",
+        )
+    ctx.record("viewer.mode", f"{mode:o}")
+    ctx.record("viewer.queue_unchanged", True)
+
+
+def test_regression_b34b_editor_share_still_writes(ctx: Context) -> None:
+    """The fail-open half of B34: an editor share stays writable.
+
+    A permission model that denies everything would pass the viewer case and
+    break the feature, so this is the guard that the enforcement is scoped.
+    """
+    daemon = ctx.require_daemon()
+    mount = daemon.enclosing_mount(ctx.root)
+    root = _shared_root(daemon, mount, "editor")
+
+    is_dir = root.is_dir()
+    mode = stat.S_IMODE(os.stat(root).st_mode)
+    expected = 0o755 if is_dir else 0o644
+    check(mode == expected, f"editor share is {mode:o}, expected {expected:o}")
+    check(os.access(root, os.W_OK), "editor share reports itself unwritable")
+    ctx.record("editor.mode", f"{mode:o}")
+
+    # A shared *file* is someone else's document: proving the mode bits and the
+    # kernel's own W_OK answer is as far as this case goes. Only a shared folder
+    # gets a real write, and only into a file this suite created.
+    if not is_dir:
+        ctx.note("editor.write", "skipped: the editor share is a file")
+        return
+
+    payload = b"b34b-editor-write\n" * 64
+    target = root / "b34b-editor-write.bin"
+    write_durable(target, payload)
+    daemon.wait_for_queue()
+    try:
+        check_bytes(read(target), payload, "editor-share write did not read back")
+    finally:
+        with contextlib.suppress(OSError):
+            os.unlink(target)
+        daemon.wait_for_queue()
+
+
+def test_shared_directory_contract(ctx: Context) -> None:
+    """The synthetic `Shared with me/` directory behaves like a real directory.
+
+    It is a real `Node` on a reserved volume rather than a FUSE special case, so
+    it must enumerate, stat and refuse mutation like any other read-only folder —
+    and must not be creatable or removable by the user.
+    """
+    daemon = ctx.require_daemon()
+    mount = daemon.enclosing_mount(ctx.root)
+    shared = mount / SHARED_DIR_NAME
+    if not shared.is_dir():
+        raise Skip(f"{SHARED_DIR_NAME}/ is not present in this mount")
+
+    mode = stat.S_IMODE(os.stat(shared).st_mode)
+    check(mode == 0o555, f"{SHARED_DIR_NAME}/ is {mode:o}, expected 555")
+    # Enumerating must not raise: it is the operation the whole feature exists for.
+    names = sorted(os.listdir(shared))
+    expect_errno(
+        {errno.EACCES},
+        lambda: os.mkdir(shared / "b34-synthetic-child"),
+        f"mkdir inside {SHARED_DIR_NAME}/",
+    )
+    expect_errno(
+        {errno.EACCES, errno.ENOTEMPTY, errno.EBUSY},
+        lambda: os.rmdir(shared),
+        f"rmdir {SHARED_DIR_NAME}/",
+    )
+    expect_errno(
+        {errno.EACCES, errno.EEXIST},
+        lambda: os.rename(shared, mount / "b34-renamed-shared"),
+        f"rename {SHARED_DIR_NAME}/",
+    )
+    ctx.record("shared.mode", f"{mode:o}")
+    ctx.note("shared.entries", len(names))
+
+
+def test_regression_b79_ondemand_location_accepts_writes(ctx: Context) -> None:
+    """An on-demand device folder must accept writes (B79).
+
+    Every mount holds its own inode space, and the queue guard intersects the
+    access each one reports. The primary mount hydrates the device folder's
+    nodes parentless (their device root is never a persisted node), so a
+    fail-closed classification there denied every write in the *secondary*
+    mount while its own state said Owner. The symptom is EACCES on a plain
+    `touch` in `~/Documents` while `~/ProtonDrive` accepts one.
+    """
+    daemon = ctx.require_daemon()
+    locations = [
+        location
+        for location in _locations(daemon)
+        if location.get("kind", {}).get("kind") == "device"
+        and location.get("mode") == "ondemand"
+        and location.get("mounted")
+        and location.get("access") == "rw"
+    ]
+    if not locations:
+        raise Skip("no mounted on-demand device folder on this machine")
+
+    root = Path(locations[0]["local_path"])
+    payload = b"b79-ondemand-write\n" * 128
+    directory = root / "pdfs-b79-acceptance"
+    target = directory / "write.bin"
+    try:
+        os.mkdir(directory)
+        write_durable(target, payload)
+        daemon.wait_for_queue()
+        check_bytes(read(target), payload, "on-demand write did not read back")
+    finally:
+        with contextlib.suppress(OSError):
+            os.unlink(target)
+        with contextlib.suppress(OSError):
+            os.rmdir(directory)
+        with contextlib.suppress(Exception):
+            daemon.wait_for_queue()
+    ctx.record("b79.location", str(root))
+
+
 def _conflict_copies(root: Path) -> list[str]:
     return sorted(name for name in os.listdir(root) if "(sync-conflict" in name)
 
@@ -1132,6 +1334,10 @@ TESTS = [
     Case("regression B69: identical rewrite makes no conflict", test_regression_b69_identical_rewrite, (LIVE,)),
     Case("regression B70: transient download name is not sealed", test_regression_b70_transient_download_name, (LIVE,)),
     Case("regression B74: rename after close keeps its content", test_regression_b74_rename_after_close, (LIVE,)),
+    Case("regression B34: a viewer share is read-only and queues nothing", test_regression_b34_viewer_share_is_read_only, (LIVE,)),
+    Case("regression B34b: an editor share still writes", test_regression_b34b_editor_share_still_writes, (LIVE,)),
+    Case("synthetic Shared-with-me directory contract", test_shared_directory_contract, (LIVE,)),
+    Case("regression B79: an on-demand device folder accepts writes", test_regression_b79_ondemand_location_accepts_writes, (LIVE,)),
     Case("durability across a daemon restart", test_durability_across_restart, (LIVE,)),
 ]
 
@@ -1181,10 +1387,18 @@ REPORT: list[Run] = []
 def select_cases(kind: str) -> list[Case]:
     selected = os.environ.get("PDFS_ACCEPTANCE_ONLY")
     cases = [case for case in TESTS if kind in case.kinds]
-    if selected:
-        cases = [case for case in cases if selected.lower() in case.name.lower()]
-        check(bool(cases), f"PDFS_ACCEPTANCE_ONLY={selected!r} matched no tests for {kind}")
-    return cases
+    if not selected:
+        return cases
+    needle = selected.lower()
+    # A filter that names a live-only case (every regression case is one) matches
+    # nothing in the reference run, which is not an error — the reference target
+    # simply has nothing to do. Only a filter that matches *no case at all* is a
+    # typo worth failing on.
+    check(
+        any(needle in case.name.lower() for case in TESTS),
+        f"PDFS_ACCEPTANCE_ONLY={selected!r} matched no tests",
+    )
+    return [case for case in cases if needle in case.name.lower()]
 
 
 def reap_stale_roots(parent: Path, max_age: int) -> None:
