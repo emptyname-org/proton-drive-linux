@@ -460,7 +460,10 @@ mod tests {
             save.contains("ensure_profile_dir(&root_uid)"),
             "save_profile resolves the profile folder"
         );
-        for upload in ["upload_new_revision_from", "upload_file_replacing_draft_from"] {
+        for upload in [
+            "upload_new_revision_from",
+            "upload_file_replacing_draft_from",
+        ] {
             let call = save.find(upload).expect("upload call exists");
             let args = &save[call..];
             let root = args.find("&root_uid").unwrap_or(usize::MAX);

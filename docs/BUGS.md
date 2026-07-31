@@ -14,8 +14,8 @@ Conventions:
 
 ## B79 — Every write in an on-demand device-folder mount fails EACCES
 
-**Status:** Fixed (verified live 2026-07-31 — packaged 1.2.1 is still affected
-until the next build ships)
+**Status:** Fixed (verified live 2026-07-31, running in a locally rebuilt 1.2.1
+package since)
 **Found:** 2026-07-31, user on packaged 1.2.1: `touch ~/Documents/test` →
 `Permission denied`, while the same operation under `~/ProtonDrive` succeeds.
 **Where:** `crates/pdfs-fuse/src/state.rs`, `State::hydrate_access`
@@ -87,16 +87,52 @@ Empty the directory and restart the unit.
 
 ## B78 — Profile backup fails: Cannot create file at the root of a device
 
-**Status:** Open
+**Status:** Fixed (verified live 2026-07-31). Same defect as **B68**, which was
+found first on the managed-live matrix; B68's second half — making backup health
+visible — is still open.
 **Found:** 2026-07-29, user reported `upload profile: proton api error NotEnoughPermissions (http 422): Cannot create file at the root of a device`
 
 The background task that backs up the machine's profile (sync folder mappings, pins, cache budget) currently attempts to write `profile.json` directly to the device root node (`device.root_uid`) on the Drive backend. The Proton Drive API has started enforcing a restriction that files cannot be created directly at the root of a device; they must be placed inside a folder.
 
 **Consequence:** The upload is rejected with HTTP 422. The daemon retries when changes happen but the profile is never successfully backed up. Local changes (pinning, adding a sync folder) still take effect locally, but they will not be restorable on a new machine.
 
-**Planned Fix:** Match the original `RECOVERY.md` spec by putting it in a `.proton-drive-linux` folder within the device root.
-- `pdfs-fuse/src/profile.rs:save_profile`: Look up (or create) the `.proton-drive-linux` folder under the device root, and upload `profile.json` there instead.
-- `pdfs-fuse/src/profile.rs:load_profile`: Check for `PROFILE_FILE_NAME` inside `.proton-drive-linux` first, falling back to the device root to allow older, existing profiles to be restored until they are overwritten.
+**Fix applied (matches the original `RECOVERY.md` spec):** the profile now lives
+in a `.proton-drive-linux` folder inside the device root.
+
+- `pdfs_core::profile::PROFILE_DIR_NAME` — the new constant, next to
+  `PROFILE_FILE_NAME`.
+- `profile.rs:ensure_profile_dir` — reuses the folder by name via the existing
+  `find_device_child_folder`, creating it on the first save. Reuse-by-identity
+  matters: a second folder of the same name would split the record in two with
+  nothing to say which is current.
+- `profile.rs:save_profile` — both upload branches (new file, new revision) now
+  address the folder, never the device root.
+- `profile.rs:load_profile` — reads the folder first, then falls back to a
+  device-root `profile.json` written by an older client. The fallback is
+  read-only and the legacy document is **not** trashed: another machine may
+  still be running a pre-fix client that reads it.
+- `profile.rs:list_restorable_folders` — filters `.proton-drive-linux` out, or
+  the restore picker would offer to sync the bookkeeping back onto the machine
+  it describes.
+- `devices.rs:add_sync_folder` — refuses a local folder named
+  `.proton-drive-linux`, which would otherwise be reused as the remote profile
+  folder by name and then reconciled (i.e. overwritten) by the sync engine.
+
+**Verified live (2026-07-31)** against the real account: first save logged
+`created device profile folder name=".proton-drive-linux"` then
+`profile backed up folders=6` with no 422; a second trigger reused the folder
+(no second create) and uploaded a revision; `pdfs sync restore --json` lists
+exactly the six device folders and not the profile folder.
+
+**Tests:** `profile::tests::the_profile_is_never_uploaded_to_the_device_root`,
+`loading_falls_back_to_a_legacy_device_root_profile`,
+`the_profile_folder_is_not_offered_as_user_data` — source-level guards in the
+style of `lib.rs`'s queue-guard ordering tests, because both upload branches are
+pure network calls with nothing to assert offline.
+
+**Not covered by this fix:** B68 also asks for backup *health* to be visible
+(currently a `WARN` in the log and nothing in the UI), and for the
+replacement-machine / fresh-state restore to be re-run end to end.
 
 ---
 
@@ -2193,7 +2229,9 @@ duplicates, renamed folders, multiple devices, and byte-identical restoration.
 
 ## B68 — Profile Backup Cannot Be Written to the Device Root
 
-**Status:** Open — live-reproduced 2026-07-22
+**Status:** Partly fixed — the destination is fixed and verified live
+(2026-07-31, see **B78**); backup health is still invisible in the UI and the
+replacement-machine restore has not been re-run
 **Found:** complete managed-live mode matrix against the 1.0.0 release binary
 **Where:** `crates/pdfs-fuse/src/profile.rs`, profile backup destination
 
