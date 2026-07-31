@@ -247,6 +247,17 @@ impl State {
         self.access_changes.drain().collect()
     }
 
+    /// Whether `uid` lives on the volume this mount is rooted in.
+    ///
+    /// Used to decide how a node with no resolvable parent is classified:
+    /// our own volume fails open (it is owned content), a foreign volume
+    /// fails closed (it can only be there because of a share).
+    pub(crate) fn is_own_volume(&self, uid: &NodeUid) -> bool {
+        self.entries
+            .get(&crate::ROOT_INO)
+            .is_some_and(|root| root.uid.volume_id == uid.volume_id)
+    }
+
     fn stored_share_access(&self, uid: &NodeUid) -> Option<Access> {
         self.share_access.get(uid).copied()
     }
@@ -506,12 +517,28 @@ impl State {
             } else if let Some(stored) = stored {
                 stored
             } else if !state.entries.contains_key(&entry.parent) {
+                // The parent is not resident, so there is nothing to inherit
+                // from. This is the normal shape of a device-folder root: its
+                // parent is the device root, which is never persisted as a
+                // node, so every on-demand folder hydrates parentless here.
+                // Answer the way the persisted authority (`effective_node_access`)
+                // does — a recorded share row above it if we have one, otherwise
+                // fail open on our own volume and closed on a foreign one.
+                // Failing closed on our own volume denies every write in every
+                // secondary mount, because `require_uid_writable` intersects
+                // this state with the mount that actually owns the node.
                 entry
                     .node
                     .parent_uid
                     .as_ref()
                     .and_then(|parent_uid| state.share_access.get(parent_uid).copied())
-                    .unwrap_or(Access::Unknown)
+                    .unwrap_or_else(|| {
+                        if state.is_own_volume(&entry.uid) {
+                            Access::Owner
+                        } else {
+                            Access::Unknown
+                        }
+                    })
             } else {
                 let parent_access = resolve(state, entry.parent, memo, visiting);
                 if entry.node.membership.is_none() || parent_access != Access::Owner {
@@ -1259,6 +1286,128 @@ mod tests {
         assert_eq!(st.require_writable(child).unwrap_err().code(), libc::EACCES);
         assert_eq!(st.require_writable(leaf).unwrap_err().code(), libc::EACCES);
         assert!(st.require_writable(owned_root).is_ok());
+    }
+
+    /// Materialize `nodes` the way `Core::hydrate` does: allocate every inode
+    /// first, then insert entries with `Access::Unknown`, resolving each parent
+    /// by uid and parking a node whose parent never made it to disk at
+    /// `ORPHAN_INO`. `nodes[0]` becomes the mount root.
+    fn hydrate_from(st: &mut State, nodes: &[Node]) -> Vec<u64> {
+        for node in nodes {
+            st.db.upsert_node(node).unwrap();
+        }
+        let inos: Vec<u64> = nodes
+            .iter()
+            .enumerate()
+            .map(|(i, node)| {
+                let ino = crate::ROOT_INO + i as u64;
+                st.by_uid.insert(node.uid.clone(), ino);
+                ino
+            })
+            .collect();
+        st.next_ino = crate::ROOT_INO + nodes.len() as u64;
+        // Reverse order so entries are inserted before their parents, matching
+        // the hydration path's non-topological materialization.
+        for (i, node) in nodes.iter().enumerate().rev() {
+            let ino = inos[i];
+            let parent = if ino == crate::ROOT_INO {
+                crate::ROOT_INO
+            } else {
+                node.parent_uid
+                    .as_ref()
+                    .and_then(|p| st.by_uid.get(p).copied())
+                    .unwrap_or(crate::ORPHAN_INO)
+            };
+            st.entries.insert(
+                ino,
+                Entry {
+                    uid: node.uid.clone(),
+                    parent,
+                    node: node.clone(),
+                    access: Access::Unknown,
+                    lookup_count: 1,
+                    open_count: 0,
+                    unlinked: false,
+                },
+            );
+        }
+        st.hydrate_access();
+        inos
+    }
+
+    /// A device folder's parent is the device root, which is never persisted as
+    /// a node, so the folder hydrates with no resident parent. Classifying that
+    /// as `Unknown` denied every write in every on-demand mount: the mount's own
+    /// fork says `Owner`, but `require_uid_writable` intersects it with this
+    /// state, and the intersection is what reaches the queue guards.
+    #[test]
+    fn own_volume_nodes_without_a_resident_parent_stay_owned() {
+        let (mut st, _dir) = state();
+        let nodes = [
+            node("root", "none", "My Files", true),
+            // `device-root` is deliberately absent from `nodes`.
+            node("documents", "device-root", "Documents", true),
+            node("folder", "documents", "folder", true),
+            node("leaf", "folder", "leaf.txt", false),
+        ];
+        let inos = hydrate_from(&mut st, &nodes);
+
+        for ino in inos {
+            assert_eq!(st.entries[&ino].access, Access::Owner);
+            assert!(st.require_writable(ino).is_ok());
+        }
+    }
+
+    /// The same shape on a foreign volume can only be there because of a share,
+    /// so it keeps failing closed.
+    #[test]
+    fn foreign_volume_nodes_without_a_resident_parent_fail_closed() {
+        let (mut st, _dir) = state();
+        let foreign = |link: &str, parent: &str, name: &str, is_dir: bool| {
+            let mut node = node(link, parent, name, is_dir);
+            node.uid = NodeUid::new(VolumeId::from("other-vol"), LinkId::from(link));
+            node.parent_uid = Some(NodeUid::new(
+                VolumeId::from("other-vol"),
+                LinkId::from(parent),
+            ));
+            node
+        };
+        let nodes = [
+            node("root", "none", "My Files", true),
+            // `their-share` is absent, so the subtree has no resident parent.
+            foreign("their-folder", "their-share", "Team Budget", true),
+            foreign("their-leaf", "their-folder", "budget.ods", false),
+        ];
+        let inos = hydrate_from(&mut st, &nodes);
+
+        assert_eq!(st.entries[&inos[0]].access, Access::Owner);
+        for ino in &inos[1..] {
+            assert_eq!(st.entries[ino].access, Access::Unknown);
+            assert_eq!(st.require_writable(*ino).unwrap_err().code(), libc::EACCES);
+        }
+    }
+
+    /// Fail-open is only for the absence of a recorded authority: a share row on
+    /// the missing parent still governs the subtree below it.
+    #[test]
+    fn persisted_authority_outranks_the_own_volume_fail_open() {
+        let (mut st, _dir) = state();
+        st.db
+            .set_share_access(&uid("device-root"), Access::Viewer)
+            .unwrap();
+        st.share_access = st.db.all_share_access().unwrap();
+        let nodes = [
+            node("root", "none", "My Files", true),
+            node("documents", "device-root", "Documents", true),
+            node("leaf", "documents", "leaf.txt", false),
+        ];
+        let inos = hydrate_from(&mut st, &nodes);
+
+        assert_eq!(st.entries[&inos[0]].access, Access::Owner);
+        for ino in &inos[1..] {
+            assert_eq!(st.entries[ino].access, Access::Viewer);
+            assert_eq!(st.require_writable(*ino).unwrap_err().code(), libc::EACCES);
+        }
     }
 
     #[test]

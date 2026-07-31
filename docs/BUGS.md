@@ -12,6 +12,79 @@ Conventions:
 
 ---
 
+## B79 — Every write in an on-demand device-folder mount fails EACCES
+
+**Status:** Fixed (verified live 2026-07-31 — packaged 1.2.1 is still affected
+until the next build ships)
+**Found:** 2026-07-31, user on packaged 1.2.1: `touch ~/Documents/test` →
+`Permission denied`, while the same operation under `~/ProtonDrive` succeeds.
+**Where:** `crates/pdfs-fuse/src/state.rs`, `State::hydrate_access`
+
+Not a mode-bit problem — the mount root reads `drwxr-xr-x` and the kernel's
+`default_permissions` check passes. The denial comes from the queue guard:
+`serve_create` → `Core::require_uid_writable`, which **intersects the access
+every live inode space reports for that uid** (`lib.rs:721`) before anything
+reaches `pending_op`.
+
+The on-demand fork itself says `Owner`. The **primary** state says `Unknown`:
+
+- `Core::hydrate` (`lib.rs:1012`) loads *every* `nodes` row into the primary
+  state, including the subtrees that belong to on-demand device folders — they
+  are on the same volume, in the same table.
+- A device folder's `parent_uid` is the **device root**, which is never
+  persisted as a node. In this account's DB all six device-folder roots
+  (`Downloads`, `Pictures`, `Music`, `Documents`, `Videos`, `narl`) have
+  `parent_uid = <device root>` with no matching row, so pass 2 parks them at
+  `ORPHAN_INO`.
+- `hydrate_access` then hit its "parent is not resident" branch, which had no
+  answer and fell back to `Access::Unknown` — fail closed.
+- `Unknown` is not writable, so the intersection denies every create, mkdir,
+  write, rename, setattr and trash in every on-demand mount, permanently: those
+  entries are never re-interned in the primary state, so nothing recomputes them.
+
+`~/ProtonDrive` was unaffected because its nodes descend from `ROOT_INO`, which
+`ProtonFs::new` hardcodes to `Owner`.
+
+Two facts make this a *classification* bug rather than a policy one: the
+persisted authority `Db::effective_node_access` already answers `Owner` for
+exactly these uids (no `share_access` row covers them — the table holds only
+`virtual~sharedwithme` and one accepted share), and the design table in
+`mount-architecture.md` §2.2 says *not under a share, no role → Owner, fail
+open*. The in-memory path disagreed with both.
+
+**Fix:** the non-resident-parent branch now mirrors the persisted authority — a
+recorded `share_access` row above the node still wins, otherwise fail **open**
+to `Owner` on the mount's own volume and fail **closed** to `Unknown` on a
+foreign one (`State::is_own_volume`). Foreign-volume shared content keeps its
+fail-closed behavior, which is what B34 needs.
+
+**Second-order effect, also fixed by the same change:** `downgrade_known_shared_access`
+selects roots with `entry.access != Access::Owner`, so a `ScopeAccessLost` /
+`SharedWithMeUpdated` event would additionally have force-downgraded every
+device-folder tree to `Viewer` in memory.
+
+**Tests:** `state::tests::own_volume_nodes_without_a_resident_parent_stay_owned`,
+`foreign_volume_nodes_without_a_resident_parent_fail_closed`,
+`persisted_authority_outranks_the_own_volume_fail_open`. The first fails on the
+pre-fix branch with `left: Unknown, right: Owner`.
+
+**Verified live (2026-07-31):** the packaged 1.2.1 daemon denies
+`touch ~/Documents/pdfs-b79-test`, `mkdir`, and `>` redirect while
+`~/ProtonDrive` accepts them; a local `--release` build of this fix accepts all
+three on the same account and DB, the write drains (`pending_op` back to 0, the
+new nodes carry real `G88km…` remote uids rather than local ones), and the
+daemon log has no `403`/EACCES. `~/ProtonDrive/Shared with me/` stayed
+`dr-xr-xr-x`, and the accepted editor-role share under it stayed writable — the
+foreign-volume fail-closed path is unchanged.
+
+**Side note for whoever runs this next:** stopping the daemon and touching a
+file in an on-demand *mountpoint* while it is unmounted leaves that file in the
+local directory, and `restore_ondemand_mounts` then refuses to mount over the
+non-empty dir (`WARN … local dir is not empty; refusing to mount over it`).
+Empty the directory and restart the unit.
+
+---
+
 ## B78 — Profile backup fails: Cannot create file at the root of a device
 
 **Status:** Open
