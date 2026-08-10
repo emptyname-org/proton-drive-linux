@@ -10,8 +10,8 @@ authors = ["Nils Pukropp <contact@narl.io>"]
 rust-version = "1.96"
 
 [workspace.dependencies]
-proton-sdk = { version = "0.3.2" }
-proton-drive-rs = { version = "0.3.2" }
+proton-sdk = { version = "0.5.1" }
+proton-drive-rs = { version = "0.5.1" }
 
 # Internal crates.
 pdfs-core = { path = "crates/pdfs-core" }
@@ -40,5 +40,7 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 keyring = { version = "3", features = ["sync-secret-service", "crypto-rust"] }
 clap = { version = "4", features = ["derive"] }
 rpassword = "7"
+async-trait = "0.1"
+futures = "0.3"
 fuser = "0.17"
 libc = "0.2"

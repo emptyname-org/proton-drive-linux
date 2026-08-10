@@ -63,6 +63,10 @@ pub(crate) struct GalleryState {
     /// The capture-time window the timeline is currently filtered to, or `None`
     /// for the whole span. Read by [`load_gallery`], set by the date dropdown.
     pub(crate) range: Cell<Option<(i64, i64)>>,
+    /// The favourites toggle, and whether it is on. When on, the timeline is
+    /// restricted to photos carrying Proton's `Favorite` tag.
+    pub(crate) favorites_btn: gtk4::ToggleButton,
+    pub(crate) favorites: Cell<bool>,
     /// Set while the date dropdown is being repopulated, so resetting its model
     /// doesn't fire the selection handler and kick off a spurious reload.
     pub(crate) date_suppress: Cell<bool>,
@@ -188,6 +192,7 @@ pub(crate) struct GalleryWidgets {
     /// The All / Photos / Videos / Raw filter toggles, in that order (index maps
     /// to [`kind_for_tab`]).
     pub(crate) tabs: [gtk4::ToggleButton; 4],
+    pub(crate) favorites_btn: gtk4::ToggleButton,
     /// The date-jump dropdown, populated with the timeline's months.
     pub(crate) dates: gtk4::DropDown,
 }
@@ -314,6 +319,15 @@ pub(crate) fn build_gallery_page() -> (gtk4::Widget, GalleryWidgets) {
         tab_group.append(btn);
     }
 
+    // Favourites: a filter, not a tab — it cuts across Photos / Videos / Raw, so
+    // it stays outside the segmented control rather than becoming a fifth option
+    // that would silently drop the kind the user picked.
+    let favorites_btn = gtk4::ToggleButton::builder()
+        .icon_name("starred-symbolic")
+        .tooltip_text("Show only favourites")
+        .build();
+    favorites_btn.add_css_class("pill");
+
     // Date jump: "All dates" plus a row per month, filled in once the timeline's
     // months are known (see [`refresh_photo_months`]). Pushed to the far end of
     // the filter row, opposite the kind toggles.
@@ -326,6 +340,7 @@ pub(crate) fn build_gallery_page() -> (gtk4::Widget, GalleryWidgets) {
     let filters = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
     filters.set_hexpand(true);
     filters.append(&tab_group);
+    filters.append(&favorites_btn);
     let spacer = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
     spacer.set_hexpand(true);
     filters.append(&spacer);
@@ -415,6 +430,7 @@ pub(crate) fn build_gallery_page() -> (gtk4::Widget, GalleryWidgets) {
             upload,
             refresh,
             tabs,
+            favorites_btn,
             dates,
             albums,
             albums_stack,
@@ -678,6 +694,19 @@ pub(crate) fn wire_gallery(ui: &Rc<Ui>, list: &gtk4::ListView, scroll: &gtk4::Sc
             load_gallery(&ui_tab, false);
         });
     }
+
+    // Favourites: reload the timeline restricted to favourites (or back to all).
+    // Independent of the kind tabs and the date jump, both of which keep their
+    // current value across the toggle.
+    let ui_fav = ui.clone();
+    ui.gallery.favorites_btn.connect_toggled(move |btn| {
+        let on = btn.is_active();
+        if ui_fav.gallery.favorites.get() == on {
+            return;
+        }
+        ui_fav.gallery.favorites.set(on);
+        load_gallery(&ui_fav, false);
+    });
 
     // Date jump: selecting a month loads that window; "All dates" (row 0) clears
     // it. Skipped while the model is being repopulated (see `gallery_date_suppress`).
@@ -1378,6 +1407,7 @@ pub(crate) fn load_gallery(ui: &Rc<Ui>, append: bool) {
             limit: PHOTOS_PAGE,
             kind: ui.gallery.kind.get(),
             range: ui.gallery.range.get(),
+            favorites: ui.gallery.favorites.get(),
         },
     };
     let rx = spawn_request(ui.dirs.control_socket(), request);

@@ -3535,6 +3535,7 @@ dependencies = [
 name = "pdfs-core"
 version = "1.3.0"
 dependencies = [
+ "async-trait",
  "directories",
  "ignore",
  "keyring",
@@ -3556,6 +3557,7 @@ name = "pdfs-fuse"
 version = "1.3.0"
 dependencies = [
  "fuser",
+ "futures",
  "image",
  "libc",
  "notify",
@@ -3830,9 +3832,9 @@ dependencies = [
 
 [[package]]
 name = "proton-drive-rs"
-version = "0.3.2"
+version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "06f6b2b3aaaf90cd3eab823e3c13a4ff784693f183f7fde97f865378c4d3e0bd"
+checksum = "3abae5e90e6889b120208159eb2c60b332612e5b708fdf3c14287307ce01715d"
 dependencies = [
  "async-trait",
  "base64",
@@ -3857,9 +3859,9 @@ dependencies = [
 
 [[package]]
 name = "proton-sdk"
-version = "0.3.2"
+version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1037a17f8951cf3ade40a8d2a8230720caf6136383eecc7d61e89636e229793e"
+checksum = "3fa729310c1a66e12bb41b9f5f036c86b9857e76536556052203ffecdb0b44c3"
 dependencies = [
  "aes-gcm 0.11.0",
  "async-trait",

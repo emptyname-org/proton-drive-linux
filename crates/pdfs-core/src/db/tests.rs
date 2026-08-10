@@ -113,9 +113,9 @@ fn node_from(parent: serde_json::Value, link: &str, name: &str, kind: serde_json
 fn photos_replace_keeps_what_was_learned_and_drops_what_left() {
     let db = Db::open_in_memory().unwrap();
     db.photos_replace(&[
-        ("p1".into(), 300, None, Some("video/mp4".into())),
-        ("p2".into(), 200, None, None),
-        ("p3".into(), 100, None, None),
+        ("p1".into(), 300, None, Some("video/mp4".into()), Some(true)),
+        ("p2".into(), 200, None, None, None),
+        ("p3".into(), 100, None, None, None),
     ])
     .unwrap();
 
@@ -126,13 +126,13 @@ fn photos_replace_keeps_what_was_learned_and_drops_what_left() {
     // The next refresh brings a new photo, keeps p1 and p2, and loses p3.
     // p1's media type arrives as `None` this time and must not be forgotten.
     db.photos_replace(&[
-        ("p0".into(), 400, Some("new.jpg".into()), None),
-        ("p1".into(), 300, None, None),
-        ("p2".into(), 200, None, None),
+        ("p0".into(), 400, Some("new.jpg".into()), None, Some(false)),
+        ("p1".into(), 300, None, None, None),
+        ("p2".into(), 200, None, None, None),
     ])
     .unwrap();
 
-    let page = db.photos_page(0, 10, None, None).unwrap();
+    let page = db.photos_page(0, 10, None, None, false).unwrap();
     assert_eq!(
         page.iter().map(|p| p.uid.as_str()).collect::<Vec<_>>(),
         ["p0", "p1", "p2"],
@@ -155,7 +155,7 @@ fn photos_replace_keeps_what_was_learned_and_drops_what_left() {
     // The counts break down by tab, and a filtered page returns only its tab.
     assert_eq!(db.photos_counts().unwrap(), (2, 1, 0));
     let videos = db
-        .photos_page(0, 10, Some(crate::control::PhotoKind::Video), None)
+        .photos_page(0, 10, Some(crate::control::PhotoKind::Video), None, false)
         .unwrap();
     assert_eq!(
         videos.iter().map(|p| p.uid.as_str()).collect::<Vec<_>>(),
@@ -167,7 +167,9 @@ fn photos_replace_keeps_what_was_learned_and_drops_what_left() {
 
     // A date-range page keeps only the window's photos: [150, 350) is p1+p2,
     // not p0 at 400. Combined with a kind filter both conditions apply.
-    let ranged = db.photos_page(0, 10, None, Some((150, 350))).unwrap();
+    let ranged = db
+        .photos_page(0, 10, None, Some((150, 350)), false)
+        .unwrap();
     assert_eq!(
         ranged.iter().map(|p| p.uid.as_str()).collect::<Vec<_>>(),
         ["p1", "p2"]
@@ -178,6 +180,7 @@ fn photos_replace_keeps_what_was_learned_and_drops_what_left() {
             10,
             Some(crate::control::PhotoKind::Video),
             Some((150, 350)),
+            false,
         )
         .unwrap();
     assert_eq!(
@@ -194,19 +197,51 @@ fn photos_replace_keeps_what_was_learned_and_drops_what_left() {
 }
 
 #[test]
+fn favorites_are_remembered_across_refreshes_and_filter_a_page() {
+    let db = Db::open_in_memory().unwrap();
+    db.photos_replace(&[
+        ("p1".into(), 300, None, None, Some(true)),
+        ("p2".into(), 200, None, None, Some(false)),
+    ])
+    .unwrap();
+    let favorites = db.photos_page(0, 10, None, None, true).unwrap();
+    assert_eq!(
+        favorites.iter().map(|p| p.uid.as_str()).collect::<Vec<_>>(),
+        ["p1"],
+        "only the favourited photo is in a favourites page"
+    );
+
+    // A local toggle survives a refresh that could not resolve the photo's node
+    // (`None`), and loses to one that could.
+    db.photos_set_favorite("p2", true).unwrap();
+    db.photos_replace(&[
+        ("p1".into(), 300, None, None, Some(false)),
+        ("p2".into(), 200, None, None, None),
+    ])
+    .unwrap();
+    let favorites = db.photos_page(0, 10, None, None, true).unwrap();
+    assert_eq!(
+        favorites.iter().map(|p| p.uid.as_str()).collect::<Vec<_>>(),
+        ["p2"],
+        "the server's answer wins where it has one; the local flag holds where it doesn't"
+    );
+    assert!(db.photos_by_uid(&["p2".into()]).unwrap()[0].favorite);
+}
+
+#[test]
 fn photos_page_slices_the_timeline_in_order() {
     let db = Db::open_in_memory().unwrap();
     let items: Vec<_> = (0..5)
-        .map(|i| (format!("p{i}"), 500 - i as i64, None, None::<String>))
+        .map(|i| (format!("p{i}"), 500 - i as i64, None, None::<String>, None))
         .collect();
     db.photos_replace(&items).unwrap();
 
-    let page = db.photos_page(2, 2, None, None).unwrap();
+    let page = db.photos_page(2, 2, None, None, false).unwrap();
     assert_eq!(
         page.iter().map(|p| p.uid.as_str()).collect::<Vec<_>>(),
         ["p2", "p3"]
     );
-    assert!(db.photos_page(9, 2, None, None).unwrap().is_empty());
+    assert!(db.photos_page(9, 2, None, None, false).unwrap().is_empty());
 }
 
 #[test]
@@ -1336,6 +1371,8 @@ fn migration_v17_adds_share_access_to_a_v16_fixture() {
              DROP TABLE share_access;
              DROP TABLE album_photos;
              DROP TABLE albums;
+             DROP INDEX idx_photos_favorite;
+             ALTER TABLE photos DROP COLUMN favorite;
              UPDATE sync_state SET value = '16' WHERE key = 'schema_version';",
         )
         .unwrap();
@@ -1402,6 +1439,18 @@ fn migration_v18_projects_v17_sync_folders_and_cascades_deletes() {
              VALUES
                (41, '/home/me/Existing', 'vol~existing', 'share-existing',
                 'ondemand', 'syncing', 123);
+             -- The timeline as V17 held it: later migrations add columns to it,
+             -- so a fixture without it isn't a database any release produced.
+             CREATE TABLE photos (
+               uid          TEXT PRIMARY KEY,
+               capture_time INTEGER NOT NULL,
+               name         TEXT,
+               ratio        REAL,
+               thumb_state  INTEGER NOT NULL DEFAULT 0,
+               seq          INTEGER NOT NULL,
+               media_type   TEXT,
+               kind         INTEGER NOT NULL DEFAULT 0
+             );
              CREATE TABLE share_access (
                root_uid TEXT PRIMARY KEY,
                access   TEXT NOT NULL

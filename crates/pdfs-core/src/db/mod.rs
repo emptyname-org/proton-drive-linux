@@ -49,7 +49,7 @@ pub use ops::{
     AttachedBlob, LOCAL_VOLUME, OP_CREATE, OP_MKDIR, OP_RENAME, OP_REVISION, OP_TRASH, PARK_UNTIL,
     PendingCounts, PendingOp, RenameMeta, op_supersedes,
 };
-pub use photos::{StoredPhoto, THUMB_HAVE, THUMB_NONE, THUMB_UNKNOWN};
+pub use photos::{StoredPhoto, THUMB_HAVE, THUMB_NONE, THUMB_UNKNOWN, TimelineRow};
 pub use sync::{StoredSyncEntry, StoredSyncFolder};
 pub use trash::StoredTrash;
 

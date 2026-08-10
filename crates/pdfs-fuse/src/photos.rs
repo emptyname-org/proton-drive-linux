@@ -14,7 +14,7 @@ use pdfs_core::{CoreError, CoreResult};
 use std::sync::atomic::Ordering;
 
 use proton_drive_rs::proton_sdk::ids::NodeUid;
-use proton_drive_rs::{NodeKind, ThumbnailType};
+use proton_drive_rs::{NodeKind, PhotoTag, PhotoTagsUpdate, ThumbnailType};
 use tracing::{info, warn};
 
 use super::{
@@ -97,6 +97,7 @@ impl Core {
         limit: usize,
         kind: Option<PhotoKind>,
         range: Option<(i64, i64)>,
+        favorites: bool,
     ) -> CoreResult<Option<Vec<PhotoItem>>> {
         let count = self.db.photos_count().map_err(CoreError::from)?;
         if count == 0 {
@@ -116,7 +117,7 @@ impl Core {
 
         let page = self
             .db
-            .photos_page(offset, limit, kind, range)
+            .photos_page(offset, limit, kind, range, favorites)
             .map_err(CoreError::from)?;
         Ok(Some(page.into_iter().map(|p| self.photo_item(p)).collect()))
     }
@@ -139,7 +140,40 @@ impl Core {
             ratio: photo.ratio,
             no_thumb: photo.thumb_state == db::THUMB_NONE,
             kind: photo.kind,
+            favorite: photo.favorite,
         }
+    }
+
+    /// Add or remove Proton's `Favorite` tag on a photo, then record the change
+    /// locally so the gallery reflects it without waiting for a timeline refresh.
+    ///
+    /// The SDK reports one outcome per photo rather than failing the call, so the
+    /// single outcome is unwrapped back into this request's result.
+    pub(crate) fn set_photo_favorite(&self, uid: &NodeUid, favorite: bool) -> CoreResult<()> {
+        let photos = self.photos();
+        let update = PhotoTagsUpdate {
+            node_uid: uid.clone(),
+            tags_to_add: if favorite {
+                vec![PhotoTag::Favorite]
+            } else {
+                Vec::new()
+            },
+            tags_to_remove: if favorite {
+                Vec::new()
+            } else {
+                vec![PhotoTag::Favorite]
+            },
+        };
+        let outcomes = self
+            .rt
+            .block_on(photos.update_photos(std::slice::from_ref(&update)))
+            .map_err(|e| CoreError::from_api(&e, "update photo tags"))?;
+        pdfs_core::batch::into_unit(outcomes)
+            .map_err(|e| CoreError::from_api(&e, "update photo tags"))?;
+        self.db
+            .photos_set_favorite(&uid.to_string(), favorite)
+            .map_err(CoreError::from)?;
+        Ok(())
     }
 
     /// Thumbnails for `uids`, served from the cache, fetched from the server for
@@ -381,7 +415,7 @@ impl Core {
         // learned before (or classifies from nothing, i.e. a still photo), so a
         // partial resolve never blanks the timeline.
         let uids: Vec<NodeUid> = items.iter().map(|it| it.uid.clone()).collect();
-        let mut meta: HashMap<String, (Option<String>, Option<String>)> = HashMap::new();
+        let mut meta: HashMap<String, (Option<String>, Option<String>, bool)> = HashMap::new();
         for chunk in uids.chunks(TIMELINE_ENRICH_CHUNK) {
             match photos.enumerate_nodes(chunk).await {
                 Ok(nodes) => {
@@ -390,19 +424,35 @@ impl Core {
                             NodeKind::File { media_type, .. } => Some(media_type.clone()),
                             NodeKind::Folder => None,
                         };
-                        meta.insert(node.uid.to_string(), (Some(node.name), media_type));
+                        // The favourite state is a tag on the photo node, so it
+                        // rides along with the metadata resolve rather than
+                        // costing a listing of its own.
+                        let favorite = node
+                            .photo
+                            .as_ref()
+                            .is_some_and(|p| p.tags.contains(&PhotoTag::Favorite));
+                        meta.insert(
+                            node.uid.to_string(),
+                            (Some(node.name), media_type, favorite),
+                        );
                     }
                 }
                 Err(e) => warn!(error = %e, "resolving photo metadata for a timeline chunk failed"),
             }
         }
 
-        let rows: Vec<(String, i64, Option<String>, Option<String>)> = items
+        let rows: Vec<db::TimelineRow> = items
             .iter()
             .map(|it| {
                 let key = it.uid.to_string();
-                let (name, media_type) = meta.get(&key).cloned().unwrap_or((None, None));
-                (key, it.capture_time, name, media_type)
+                // An unresolved photo keeps whatever was learned before, for the
+                // favourite flag as much as for the name and media type.
+                match meta.get(&key).cloned() {
+                    Some((name, media_type, favorite)) => {
+                        (key, it.capture_time, name, media_type, Some(favorite))
+                    }
+                    None => (key, it.capture_time, None, None, None),
+                }
             })
             .collect();
         self.db.photos_replace(&rows).map_err(CoreError::from)?;

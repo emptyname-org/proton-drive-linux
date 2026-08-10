@@ -21,6 +21,7 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
+use pdfs_core::batch;
 use pdfs_core::config::SweepMode;
 use pdfs_core::control::ActivityKind;
 use proton_drive_rs::proton_sdk::ids::NodeUid;
@@ -149,6 +150,7 @@ impl Core {
         match self
             .rt
             .block_on(self.client.trash_nodes(std::slice::from_ref(uid)))
+            .and_then(batch::into_unit)
         {
             Ok(()) => {}
             Err(e) if super::is_gone(&e) => {}

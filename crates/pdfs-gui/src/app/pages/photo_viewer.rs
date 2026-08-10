@@ -19,6 +19,11 @@ pub(crate) struct Viewer {
     pub(crate) info_map: gtk4::Button,
     /// Coordinates behind `info_map`, once a photo with GPS tags is shown.
     pub(crate) coords: RefCell<Option<(f64, f64)>>,
+    /// The favourite toggle in the top bar, and whether it is being set from
+    /// the model rather than by the user — the same suppression the details pane
+    /// uses for its pin switch, so painting a photo doesn't fire a round-trip.
+    pub(crate) favorite: gtk4::ToggleButton,
+    pub(crate) favorite_suppress: Cell<bool>,
     /// uid of the photo currently on screen.
     pub(crate) uid: RefCell<String>,
     /// On-disk path of the full-size photo, once it has been downloaded.
@@ -41,6 +46,38 @@ pub(crate) struct ExifInfo {
     pub(crate) coords: Option<(f64, f64)>,
 }
 
+/// Paint the favourite toggle without firing its handler.
+pub(crate) fn show_favorite(viewer: &Rc<Viewer>, favorite: bool) {
+    viewer.favorite_suppress.set(true);
+    viewer.favorite.set_active(favorite);
+    set_favorite_icon(&viewer.favorite, favorite);
+    viewer.favorite_suppress.set(false);
+}
+
+/// Filled star for a favourite, outline for the rest.
+fn set_favorite_icon(button: &gtk4::ToggleButton, favorite: bool) {
+    button.set_icon_name(if favorite {
+        "starred-symbolic"
+    } else {
+        "non-starred-symbolic"
+    });
+}
+
+/// Write a favourite change back into the loaded gallery page, so returning to
+/// the grid (or reopening the photo) shows what was just set without a reload.
+fn set_gallery_favorite(ui: &Rc<Ui>, uid: &str, favorite: bool) {
+    let Some(idx) = find_photo_index(&ui.gallery.model, uid) else {
+        return;
+    };
+    let Some(boxed) = ui.gallery.model.item(idx).and_downcast::<BoxedAnyObject>() else {
+        return;
+    };
+    let mut item = boxed.borrow::<PhotoItem>().clone();
+    item.favorite = favorite;
+    ui.gallery.model.remove(idx);
+    ui.gallery.model.insert(idx, &BoxedAnyObject::new(item));
+}
+
 /// Show the photo behind `uid`: paint its (already cached) thumbnail immediately
 /// so the lightbox never opens on a blank screen, ask the daemon for the
 /// full-size file, and swap it in — plus its EXIF — when it lands.
@@ -51,6 +88,14 @@ pub(crate) fn load_photo(ui: &Rc<Ui>, viewer: &Rc<Viewer>, uid: String) {
     viewer.loading.set(true);
     *viewer.path.borrow_mut() = None;
     clear_info(viewer);
+
+    // The favourite state comes from the timeline page the gallery already has,
+    // so the button is right on the first frame instead of after a round-trip.
+    let favorite = find_photo_index(&ui.gallery.model, &uid)
+        .and_then(|idx| ui.gallery.model.item(idx))
+        .and_downcast::<BoxedAnyObject>()
+        .is_some_and(|boxed| boxed.borrow::<PhotoItem>().favorite);
+    show_favorite(viewer, favorite);
 
     // The thumbnail the gallery already decoded stands in for the full photo
     // while it downloads: blurry for a moment beats black for a second.
@@ -450,6 +495,14 @@ pub(crate) fn open_photo_viewer(ui: &Rc<Ui>, initial_uid: String) {
     info_toggle.add_css_class("flat");
     info_toggle.add_css_class("viewer-action-btn");
 
+    let favorite_btn = gtk4::ToggleButton::builder()
+        .icon_name("non-starred-symbolic")
+        .tooltip_text("Favourite")
+        .valign(gtk4::Align::Center)
+        .build();
+    favorite_btn.add_css_class("flat");
+    favorite_btn.add_css_class("viewer-action-btn");
+
     let download_btn = action("document-save-symbolic", "Save a copy…");
     let open_ext_btn = action("document-open-symbolic", "Open with another app");
     let close_btn = action("window-close-symbolic", "Close (Esc)");
@@ -460,6 +513,7 @@ pub(crate) fn open_photo_viewer(ui: &Rc<Ui>, initial_uid: String) {
     top_bar.set_valign(gtk4::Align::Start);
     top_bar.set_hexpand(true);
     top_bar.append(&titles);
+    top_bar.append(&favorite_btn);
     top_bar.append(&info_toggle);
     top_bar.append(&download_btn);
     top_bar.append(&open_ext_btn);
@@ -558,6 +612,8 @@ pub(crate) fn open_photo_viewer(ui: &Rc<Ui>, initial_uid: String) {
         info_revealer: info_revealer.clone(),
         info_rows,
         info_map: info_map.clone(),
+        favorite: favorite_btn.clone(),
+        favorite_suppress: Cell::new(false),
         coords: RefCell::new(None),
         uid: RefCell::new(initial_uid.clone()),
         path: RefCell::new(None),
@@ -599,6 +655,44 @@ pub(crate) fn open_photo_viewer(ui: &Rc<Ui>, initial_uid: String) {
                 "https://www.openstreetmap.org/?mlat={lat:.6}&mlon={lon:.6}#map=16/{lat:.6}/{lon:.6}"
             ));
         }
+    });
+
+    let ui_fav = ui.clone();
+    let viewer_fav = viewer.clone();
+    favorite_btn.connect_toggled(move |btn| {
+        if viewer_fav.favorite_suppress.get() {
+            return;
+        }
+        let favorite = btn.is_active();
+        set_favorite_icon(btn, favorite);
+        let uid = viewer_fav.uid.borrow().clone();
+        let rx = spawn_request(
+            ui_fav.dirs.control_socket(),
+            Request::SetPhotoFavorite {
+                uid: uid.clone(),
+                favorite,
+            },
+        );
+        let ui_result = ui_fav.clone();
+        let viewer_result = viewer_fav.clone();
+        glib::spawn_future_local(async move {
+            let failed = match rx.recv().await {
+                Ok(Ok(Response::Ok { .. })) => {
+                    set_gallery_favorite(&ui_result, &uid, favorite);
+                    None
+                }
+                Ok(Ok(Response::Error { message, .. })) => Some(message),
+                _ => Some("The mount service didn't respond.".to_string()),
+            };
+            if let Some(detail) = failed {
+                toast_error(&ui_result, "Couldn't change the favourite", &detail);
+                // The server refused, so the button must go back to describing
+                // what is actually stored — without firing this handler again.
+                if *viewer_result.uid.borrow() == uid {
+                    show_favorite(&viewer_result, !favorite);
+                }
+            }
+        });
     });
 
     let w_download = window.clone();

@@ -53,6 +53,8 @@ use fuser::{
     ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyIoctl, ReplyLseek, ReplyOpen, ReplyWrite, Request,
     Session, TimeOrNow, WriteFlags,
 };
+use futures::StreamExt as _;
+use pdfs_core::batch;
 use pdfs_core::cache::{BLOCK_SIZE, Baseline, ContentCache, StagedWrite};
 use pdfs_core::config::{AppDirs, SweepMode};
 use pdfs_core::control::{
@@ -88,6 +90,7 @@ mod mount;
 mod photos;
 mod profile;
 mod reads;
+mod revisions;
 mod sharing;
 mod state;
 mod sweep;
@@ -3287,6 +3290,7 @@ impl Core {
         .map_err(|error| self.errno_error(error, "trash access"))?;
         self.rt
             .block_on(self.client.trash_nodes(std::slice::from_ref(&uid)))
+            .and_then(batch::into_unit)
             .map_err(|e| CoreError::from_api(&e, "trash"))?;
         let name = self
             .state
@@ -3325,6 +3329,7 @@ impl Core {
         if let Err(e) = self
             .rt
             .block_on(self.client.trash_nodes(std::slice::from_ref(uid)))
+            .and_then(batch::into_unit)
         {
             error!(%uid, name, error = %e, "trashing the node a rename replaces failed");
             self.log_activity(ActivityKind::Trash, name, e.to_string(), false);
@@ -3372,6 +3377,7 @@ impl Core {
         match self
             .rt
             .block_on(self.client.restore_nodes(std::slice::from_ref(uid)))
+            .and_then(batch::into_unit)
         {
             Ok(()) => {
                 self.invalidate_trash();
@@ -3586,14 +3592,37 @@ impl Core {
             .into_iter()
             .filter_map(|n| n.parent_uid)
             .collect();
+        // Streamed per-node outcomes: a uid the server refuses (already restored,
+        // gone) leaves the rest of the batch restored, and each node is unhidden
+        // as *its* batch lands rather than after the last one — a daemon killed
+        // half way through a large restore leaves local state describing what the
+        // server actually did. Only a batch that restored nothing is an error the
+        // caller can act on.
+        let mut restored: Vec<NodeUid> = Vec::with_capacity(parsed.len());
+        let mut first_error: Option<ProtonError> = None;
         self.rt
-            .block_on(self.client.restore_nodes(&parsed))
+            .block_on(async {
+                let mut outcomes = std::pin::pin!(self.client.restore_nodes_streaming(&parsed));
+                while let Some(item) = outcomes.next().await {
+                    let (uid, outcome) = item?;
+                    match outcome {
+                        Ok(()) => {
+                            self.hidden.lock().remove(&uid);
+                            restored.push(uid);
+                        }
+                        Err(e) => {
+                            warn!(%uid, error = %e, "restore failed for a node");
+                            first_error.get_or_insert(e);
+                        }
+                    }
+                }
+                Ok::<(), ProtonError>(())
+            })
             .map_err(|e| CoreError::from_api(&e, "restore"))?;
+        if restored.is_empty()
+            && let Some(error) = first_error
         {
-            let mut hidden = self.hidden.lock();
-            for uid in &parsed {
-                hidden.remove(uid);
-            }
+            return Err(CoreError::from_api(&error, "restore"));
         }
         // Keyed by uid, so it applies to every mount: a restored node reappears
         // in whichever inode spaces show its parent, not only the primary one.
@@ -3605,19 +3634,45 @@ impl Core {
             }
         });
         self.invalidate_trash();
-        Ok(parsed.len())
+        Ok(restored.len())
     }
 
     /// Permanently delete trashed nodes. Irreversible on the server; locally it
     /// drops any metadata and cached content the node still owns.
     fn delete_forever(&self, uids: &[String]) -> CoreResult<usize> {
         let parsed = Self::parse_uids(uids)?;
+        // Streamed, and each node's local state is dropped as its batch lands.
+        // A permanent delete is irreversible, so the useful property is that a
+        // daemon interrupted mid-batch has already forgotten exactly the nodes
+        // the server destroyed — never more, never fewer.
+        let mut deleted = 0usize;
+        let mut first_error: Option<ProtonError> = None;
         self.rt
-            .block_on(self.client.delete_nodes(&parsed))
+            .block_on(async {
+                let mut outcomes = std::pin::pin!(self.client.delete_nodes_streaming(&parsed));
+                while let Some(item) = outcomes.next().await {
+                    let (uid, outcome) = item?;
+                    match outcome {
+                        Ok(()) => {
+                            self.drop_local(std::slice::from_ref(&uid));
+                            deleted += 1;
+                        }
+                        Err(e) => {
+                            warn!(%uid, error = %e, "permanent delete failed for a node");
+                            first_error.get_or_insert(e);
+                        }
+                    }
+                }
+                Ok::<(), ProtonError>(())
+            })
             .map_err(|e| CoreError::from_api(&e, "delete"))?;
-        self.drop_local(&parsed);
+        if deleted == 0
+            && let Some(error) = first_error
+        {
+            return Err(CoreError::from_api(&error, "delete"));
+        }
         self.invalidate_trash();
-        Ok(parsed.len())
+        Ok(deleted)
     }
 
     /// Permanently delete everything in the trash. The uids are listed first so

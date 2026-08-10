@@ -63,6 +63,10 @@ pub enum Request {
         /// timeline. Like `kind`, the offset is relative to the filtered set.
         #[serde(default)]
         range: Option<(i64, i64)>,
+        /// Restrict the page to favourited photos. Older front-ends omit it and
+        /// get the whole timeline, as before.
+        #[serde(default)]
+        favorites: bool,
     },
     /// The months the timeline spans (newest first, with per-month counts) so a
     /// front-end can build a date scrubber without paging the whole library.
@@ -91,6 +95,14 @@ pub enum Request {
     PhotoThumbs { uids: Vec<String> },
     /// Download a photo's full content into the cache; replies with its path.
     OpenPhoto { uid: String },
+    /// Add or remove Proton's `Favorite` tag on a photo. Replies with
+    /// [`Response::Ok`].
+    ///
+    /// Favouriting a photo that is *not* on this account's own photos volume —
+    /// one shared with us, or one that lives only in an album — needs it
+    /// re-encrypted for our timeline, which the SDK does not implement yet; the
+    /// daemon reports that as an error rather than silently doing nothing.
+    SetPhotoFavorite { uid: String, favorite: bool },
     /// Upload the photo at `source_path` under the given name and media type.
     ///
     /// A path, not the bytes: this protocol is line-delimited JSON, and
@@ -324,6 +336,39 @@ pub enum Request {
     RemovePublicLink { path: String, id: String },
     /// The by-uid twin of [`Request::RemovePublicLink`].
     RemovePublicLinkByUid { uid: String, id: String },
+
+    // ---- revisions --------------------------------------------------------
+    /// List the version history of the file at mountpoint-relative `path`,
+    /// newest first. Replies with [`Response::Revisions`].
+    ListRevisions { path: String },
+    /// The by-uid twin of [`Request::ListRevisions`].
+    ListRevisionsByUid { uid: String },
+    /// Make revision `revision_id` of the file at `path` current again. The
+    /// server applies this asynchronously, so the restored content may take a
+    /// moment to appear. Replies with [`Response::Ok`].
+    RestoreRevision { path: String, revision_id: String },
+    /// The by-uid twin of [`Request::RestoreRevision`].
+    RestoreRevisionByUid { uid: String, revision_id: String },
+    /// Permanently delete revision `revision_id` of the file at `path`. The
+    /// content is unrecoverable, and the server refuses to delete the revision
+    /// that is currently active. Replies with [`Response::Ok`].
+    DeleteRevision { path: String, revision_id: String },
+    /// The by-uid twin of [`Request::DeleteRevision`].
+    DeleteRevisionByUid { uid: String, revision_id: String },
+    /// Write revision `revision_id` of the file at `path` to the absolute local
+    /// path `dest`, leaving the file's current content untouched. Replies with
+    /// [`Response::Ok`].
+    SaveRevisionAs {
+        path: String,
+        revision_id: String,
+        dest: String,
+    },
+    /// The by-uid twin of [`Request::SaveRevisionAs`].
+    SaveRevisionAsByUid {
+        uid: String,
+        revision_id: String,
+        dest: String,
+    },
 
     // ---- shared by me -----------------------------------------------------
     /// List the nodes I have shared with others — collaborative shares that still
@@ -606,6 +651,36 @@ pub struct SharedItem {
     pub invite_count: usize,
     /// The node's public link, if it has one.
     pub link: Option<PublicLinkInfo>,
+}
+
+/// One entry of a file's version history (in [`Response::Revisions`]).
+///
+/// The size and modification time are the ones the *uploader* claimed in the
+/// revision's extended attributes, so an old client that wrote none leaves them
+/// `None`; `size_on_storage` is always known but counts ciphertext, which is
+/// larger than the file. A front-end shows the claimed size when it has one and
+/// falls back to the storage size.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct RevisionInfo {
+    /// Server-assigned id — the handle for [`Request::RestoreRevision`],
+    /// [`Request::DeleteRevision`] and [`Request::SaveRevisionAs`].
+    pub id: String,
+    /// True for the revision that is the file's current content. It cannot be
+    /// deleted, and restoring it is a no-op.
+    pub is_active: bool,
+    /// When the revision was created, epoch seconds.
+    pub created: i64,
+    /// Encrypted size on Proton's storage, in bytes.
+    pub size_on_storage: i64,
+    /// Plaintext size as claimed by the uploader, when it wrote one.
+    pub claimed_size: Option<i64>,
+    /// Modification time as claimed by the uploader (ISO-8601, verbatim).
+    pub claimed_modified: Option<String>,
+    /// The address that signed the revision, when it was not signed anonymously
+    /// by the node key.
+    pub signed_by: Option<String>,
+    /// Whether the revision carries thumbnails.
+    pub has_thumbnails: bool,
 }
 
 /// What happened, in an [`ActivityEntry`]. Kept coarse: a front-end maps each to
@@ -1014,6 +1089,11 @@ pub struct PhotoItem {
     /// the split omit it; a front-end then treats everything as a still photo.
     #[serde(default = "default_photo_kind")]
     pub kind: PhotoKind,
+    /// Whether the photo is favourited. Older daemons omit it, which a front-end
+    /// reads as "not favourited" — the same thing it would show for a photo whose
+    /// tags it has not learned yet.
+    #[serde(default)]
+    pub favorite: bool,
 }
 
 /// A daemon too old to classify a timeline entry is assumed to have served a
@@ -1209,6 +1289,9 @@ pub enum Response {
     AccountQuota { max_space: i64, used_space: i64 },
     /// Nodes I have shared with others (reply to [`Request::ListSharedByMe`]).
     SharedByMe { items: Vec<SharedItem> },
+    /// A file's version history, newest first (reply to
+    /// [`Request::ListRevisions`]).
+    Revisions { items: Vec<RevisionInfo> },
     /// The daemon's recent activity, newest first (reply to
     /// [`Request::ListActivity`]).
     Activity { items: Vec<ActivityEntry> },
@@ -1855,6 +1938,101 @@ mod tests {
         assert!(
             serde_json::from_str::<LegacyLocationRequest>(&wire).is_err(),
             "an old daemon must reject ListLocations instead of interpreting another request"
+        );
+    }
+
+    /// The revision requests come in path and by-uid pairs like the share ones,
+    /// and carry a revision id that must survive the round-trip verbatim: acting
+    /// on the wrong revision deletes content the user meant to keep.
+    #[test]
+    fn revision_requests_roundtrip_in_both_addressing_forms() {
+        let cases = [
+            (
+                Request::ListRevisions { path: "a/b".into() },
+                r#"{"ListRevisions":{"path":"a/b"}}"#,
+            ),
+            (
+                Request::ListRevisionsByUid {
+                    uid: "vol~link".into(),
+                },
+                r#"{"ListRevisionsByUid":{"uid":"vol~link"}}"#,
+            ),
+            (
+                Request::RestoreRevision {
+                    path: "a/b".into(),
+                    revision_id: "rev-1".into(),
+                },
+                r#"{"RestoreRevision":{"path":"a/b","revision_id":"rev-1"}}"#,
+            ),
+            (
+                Request::RestoreRevisionByUid {
+                    uid: "vol~link".into(),
+                    revision_id: "rev-1".into(),
+                },
+                r#"{"RestoreRevisionByUid":{"uid":"vol~link","revision_id":"rev-1"}}"#,
+            ),
+            (
+                Request::DeleteRevision {
+                    path: "a/b".into(),
+                    revision_id: "rev-2".into(),
+                },
+                r#"{"DeleteRevision":{"path":"a/b","revision_id":"rev-2"}}"#,
+            ),
+            (
+                Request::DeleteRevisionByUid {
+                    uid: "vol~link".into(),
+                    revision_id: "rev-2".into(),
+                },
+                r#"{"DeleteRevisionByUid":{"uid":"vol~link","revision_id":"rev-2"}}"#,
+            ),
+            (
+                Request::SaveRevisionAs {
+                    path: "a/b".into(),
+                    revision_id: "rev-3".into(),
+                    dest: "/tmp/out.bin".into(),
+                },
+                r#"{"SaveRevisionAs":{"path":"a/b","revision_id":"rev-3","dest":"/tmp/out.bin"}}"#,
+            ),
+            (
+                Request::SaveRevisionAsByUid {
+                    uid: "vol~link".into(),
+                    revision_id: "rev-3".into(),
+                    dest: "/tmp/out.bin".into(),
+                },
+                r#"{"SaveRevisionAsByUid":{"uid":"vol~link","revision_id":"rev-3","dest":"/tmp/out.bin"}}"#,
+            ),
+        ];
+        for (request, wire) in cases {
+            assert_eq!(serde_json::to_string(&request).unwrap(), wire);
+            let decoded: Request = serde_json::from_str(wire).unwrap();
+            assert_eq!(serde_json::to_string(&decoded).unwrap(), wire);
+        }
+    }
+
+    /// A front-end that predates the favourites filter sends no `favorites`
+    /// field, and must keep getting the whole timeline rather than an empty page.
+    #[test]
+    fn timeline_requests_without_the_favorites_filter_still_decode() {
+        let decoded: Request =
+            serde_json::from_str(r#"{"PhotosTimeline":{"offset":0,"limit":50}}"#).unwrap();
+        assert!(matches!(
+            decoded,
+            Request::PhotosTimeline {
+                favorites: false,
+                kind: None,
+                range: None,
+                ..
+            }
+        ));
+
+        let wire = serde_json::to_string(&Request::SetPhotoFavorite {
+            uid: "vol~link".into(),
+            favorite: true,
+        })
+        .unwrap();
+        assert_eq!(
+            wire,
+            r#"{"SetPhotoFavorite":{"uid":"vol~link","favorite":true}}"#
         );
     }
 

@@ -358,6 +358,14 @@ pub(super) async fn run_event_sync(
         // started offline (offline.md Phase 1) — so retry rather than giving up,
         // which used to disable live sync for the life of the daemon.
         Ok(None) => {
+            // Nothing says what changed before this cursor, so a persisted SDK
+            // entity cache from an earlier run cannot be trusted: drop it rather
+            // than serve metadata no event will ever invalidate.
+            if let Some(cache) = pdfs_core::sdkcache::SdkCache::opened()
+                && let Err(e) = cache.clear_now()
+            {
+                warn!(error = %e, "clearing the persisted SDK entity cache failed");
+            }
             let mut delay = ONLINE_PROBE_MIN;
             loop {
                 match client.enumerate_events(&scope, None).await {

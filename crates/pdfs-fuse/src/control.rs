@@ -203,7 +203,8 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
             limit,
             kind,
             range,
-        }) => match core.photos_timeline(offset, limit, kind, range) {
+            favorites,
+        }) => match core.photos_timeline(offset, limit, kind, range, favorites) {
             Ok(Some(items)) => CtlResponse::Photos {
                 available: true,
                 items,
@@ -215,6 +216,19 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
                 counts: None,
             },
             Err(e) => CtlResponse::error(e),
+        },
+        Ok(CtlRequest::SetPhotoFavorite { uid, favorite }) => match parse_uid(&uid) {
+            Some(node_uid) => match core.set_photo_favorite(&node_uid, favorite) {
+                Ok(()) => CtlResponse::Ok {
+                    message: if favorite {
+                        "added to favourites".to_string()
+                    } else {
+                        "removed from favourites".to_string()
+                    },
+                },
+                Err(e) => CtlResponse::error(e),
+            },
+            None => CtlResponse::error(CoreError::invalid(format!("invalid uid: {uid}"))),
         },
         Ok(CtlRequest::PhotoAlbums) => match core.albums() {
             Ok(Some(items)) => CtlResponse::Albums {
@@ -863,6 +877,78 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
                 Err(e) => CtlResponse::error(e),
             }
         }
+        Ok(CtlRequest::ListRevisions { path }) => match rel_to_mount(mountpoint, &path) {
+            Ok(rel) => match core.list_revisions(&rel) {
+                Ok(items) => CtlResponse::Revisions { items },
+                Err(e) => CtlResponse::error(e),
+            },
+            Err(e) => CtlResponse::error(e),
+        },
+        Ok(CtlRequest::ListRevisionsByUid { uid }) => match core.list_revisions_by_uid(&uid) {
+            Ok(items) => CtlResponse::Revisions { items },
+            Err(e) => CtlResponse::error(e),
+        },
+        Ok(CtlRequest::RestoreRevision { path, revision_id }) => {
+            match rel_to_mount(mountpoint, &path) {
+                Ok(rel) => match core.restore_revision(&rel, &revision_id) {
+                    Ok(()) => CtlResponse::Ok {
+                        message: format!("restoring version {revision_id} of {path}"),
+                    },
+                    Err(e) => CtlResponse::error(e),
+                },
+                Err(e) => CtlResponse::error(e),
+            }
+        }
+        Ok(CtlRequest::RestoreRevisionByUid { uid, revision_id }) => {
+            match core.restore_revision_by_uid(&uid, &revision_id) {
+                Ok(()) => CtlResponse::Ok {
+                    message: format!("restoring version {revision_id}"),
+                },
+                Err(e) => CtlResponse::error(e),
+            }
+        }
+        Ok(CtlRequest::DeleteRevision { path, revision_id }) => {
+            match rel_to_mount(mountpoint, &path) {
+                Ok(rel) => match core.delete_revision(&rel, &revision_id) {
+                    Ok(()) => CtlResponse::Ok {
+                        message: format!("deleted version {revision_id} of {path}"),
+                    },
+                    Err(e) => CtlResponse::error(e),
+                },
+                Err(e) => CtlResponse::error(e),
+            }
+        }
+        Ok(CtlRequest::DeleteRevisionByUid { uid, revision_id }) => {
+            match core.delete_revision_by_uid(&uid, &revision_id) {
+                Ok(()) => CtlResponse::Ok {
+                    message: format!("deleted version {revision_id}"),
+                },
+                Err(e) => CtlResponse::error(e),
+            }
+        }
+        Ok(CtlRequest::SaveRevisionAs {
+            path,
+            revision_id,
+            dest,
+        }) => match rel_to_mount(mountpoint, &path) {
+            Ok(rel) => match core.save_revision_as(&rel, &revision_id, Path::new(&dest)) {
+                Ok(written) => CtlResponse::Ok {
+                    message: format!("wrote {} to {dest}", human_bytes(written)),
+                },
+                Err(e) => CtlResponse::error(e),
+            },
+            Err(e) => CtlResponse::error(e),
+        },
+        Ok(CtlRequest::SaveRevisionAsByUid {
+            uid,
+            revision_id,
+            dest,
+        }) => match core.save_revision_as_by_uid(&uid, &revision_id, Path::new(&dest)) {
+            Ok(written) => CtlResponse::Ok {
+                message: format!("wrote {} to {dest}", human_bytes(written)),
+            },
+            Err(e) => CtlResponse::error(e),
+        },
         Ok(CtlRequest::ListSharedWithMe) => match core.list_shared_with_me() {
             Ok(entries) => CtlResponse::Entries { entries },
             Err(e) => CtlResponse::error(e),

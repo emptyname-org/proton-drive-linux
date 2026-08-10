@@ -32,13 +32,21 @@ pub struct StoredPhoto {
     /// Which Photos-page tab this entry belongs to, derived from its name and
     /// media type when the timeline was last replaced.
     pub kind: crate::control::PhotoKind,
+    /// Whether the photo carries Proton's `Favorite` tag.
+    pub favorite: bool,
 }
 
+/// One row of a timeline replacement: `(uid, capture_time, name, media_type,
+/// favorite)`. The two trailing options are "what this refresh learned" — a
+/// `None` keeps whatever is already stored rather than clearing it.
+pub type TimelineRow = (String, i64, Option<String>, Option<String>, Option<bool>);
+
 impl Db {
-    pub fn photos_replace(
-        &self,
-        items: &[(String, i64, Option<String>, Option<String>)],
-    ) -> Result<()> {
+    /// Replace the timeline wholesale. Each item is
+    /// `(uid, capture_time, name, media_type, favorite)`; `favorite` is `None`
+    /// when the refresh could not resolve that photo's node, in which case the
+    /// flag already stored is kept rather than silently cleared.
+    pub fn photos_replace(&self, items: &[TimelineRow]) -> Result<()> {
         let mut conn = self.conn.lock();
         let tx = conn.transaction()?;
         // `media_type` is learned-and-kept like the ratio and thumb verdict: the
@@ -46,10 +54,14 @@ impl Db {
         // not know a photo's media type yet when it replaces the timeline. Keep
         // any previously learned value so the Photos/Videos/Raw split survives a
         // refresh instead of collapsing back to name-extension guesses.
-        let learned: HashMap<String, (Option<f64>, i64, Option<String>)> = {
-            let mut stmt = tx.prepare("SELECT uid, ratio, thumb_state, media_type FROM photos")?;
+        let learned: HashMap<String, (Option<f64>, i64, Option<String>, bool)> = {
+            let mut stmt =
+                tx.prepare("SELECT uid, ratio, thumb_state, media_type, favorite FROM photos")?;
             let rows = stmt.query_map([], |r| {
-                Ok((r.get::<_, String>(0)?, (r.get(1)?, r.get(2)?, r.get(3)?)))
+                Ok((
+                    r.get::<_, String>(0)?,
+                    (r.get(1)?, r.get(2)?, r.get(3)?, r.get::<_, i64>(4)? != 0),
+                ))
             })?;
             rows.collect::<rusqlite::Result<_>>()?
         };
@@ -58,16 +70,16 @@ impl Db {
         {
             let mut stmt = tx.prepare(
                 "INSERT INTO photos
-                   (uid, capture_time, name, ratio, thumb_state, seq, media_type, kind)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                   (uid, capture_time, name, ratio, thumb_state, seq, media_type, kind, favorite)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             )?;
-            for (seq, (uid, capture_time, name, media_type)) in items.iter().enumerate() {
-                let (ratio, thumb_state, learned_media) =
-                    learned
-                        .get(uid)
-                        .cloned()
-                        .unwrap_or((None, THUMB_UNKNOWN, None));
+            for (seq, (uid, capture_time, name, media_type, favorite)) in items.iter().enumerate() {
+                let (ratio, thumb_state, learned_media, learned_favorite) = learned
+                    .get(uid)
+                    .cloned()
+                    .unwrap_or((None, THUMB_UNKNOWN, None, false));
                 let media_type = media_type.clone().or(learned_media);
+                let favorite = favorite.unwrap_or(learned_favorite);
                 // The tab this photo lands in is derived here, once, so a page or
                 // count query is a plain indexed `WHERE kind = ?` rather than a
                 // reclassification of every row.
@@ -82,6 +94,7 @@ impl Db {
                     seq as i64,
                     media_type,
                     kind.as_i64(),
+                    favorite as i64,
                 ])?;
             }
         }
@@ -93,18 +106,21 @@ impl Db {
     /// restricts the page to one tab (Photos / Videos / Raw); `range`, when set,
     /// restricts it to a `[from, to)` capture-time window (epoch seconds) — the
     /// date scrubber's jump. `offset` is relative to whatever the filters leave.
+    /// `favorites` restricts the page to favourited photos.
     pub fn photos_page(
         &self,
         offset: usize,
         limit: usize,
         kind: Option<crate::control::PhotoKind>,
         range: Option<(i64, i64)>,
+        favorites: bool,
     ) -> Result<Vec<StoredPhoto>> {
         let conn = self.conn.lock();
         // Built up so any combination of the optional filters is one indexed
         // query rather than a statement per case.
-        let mut sql =
-            String::from("SELECT uid, capture_time, name, ratio, thumb_state, kind FROM photos");
+        let mut sql = String::from(
+            "SELECT uid, capture_time, name, ratio, thumb_state, kind, favorite FROM photos",
+        );
         let mut binds: Vec<i64> = Vec::new();
         let mut conds: Vec<String> = Vec::new();
         if let Some(k) = kind {
@@ -116,6 +132,9 @@ impl Db {
             conds.push(format!("capture_time >= ?{}", binds.len()));
             binds.push(to);
             conds.push(format!("capture_time < ?{}", binds.len()));
+        }
+        if favorites {
+            conds.push("favorite = 1".to_string());
         }
         if !conds.is_empty() {
             sql.push_str(" WHERE ");
@@ -139,6 +158,7 @@ impl Db {
                     ratio: r.get(3)?,
                     thumb_state: r.get(4)?,
                     kind: crate::control::PhotoKind::from_i64(r.get(5)?),
+                    favorite: r.get::<_, i64>(6)? != 0,
                 })
             })?
             .collect::<rusqlite::Result<_>>()?;
@@ -206,7 +226,7 @@ impl Db {
         let conn = self.conn.lock();
         let placeholders = vec!["?"; uids.len()].join(",");
         let mut stmt = conn.prepare(&format!(
-            "SELECT uid, capture_time, name, ratio, thumb_state, kind FROM photos
+            "SELECT uid, capture_time, name, ratio, thumb_state, kind, favorite FROM photos
              WHERE uid IN ({placeholders})"
         ))?;
         let rows = stmt.query_map(rusqlite::params_from_iter(uids), |r| {
@@ -217,6 +237,7 @@ impl Db {
                 ratio: r.get(3)?,
                 thumb_state: r.get(4)?,
                 kind: crate::control::PhotoKind::from_i64(r.get(5)?),
+                favorite: r.get::<_, i64>(6)? != 0,
             })
         })?;
         let mut photos = Vec::new();
@@ -224,6 +245,18 @@ impl Db {
             photos.push(row?);
         }
         Ok(photos)
+    }
+
+    /// Record a photo's favourite flag locally, after the server accepted the
+    /// change. A uid the timeline does not hold is a no-op — an album photo on
+    /// someone else's volume is never in our own `photos` table.
+    pub fn photos_set_favorite(&self, uid: &str, favorite: bool) -> Result<()> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "UPDATE photos SET favorite = ?2 WHERE uid = ?1",
+            params![uid, favorite as i64],
+        )?;
+        Ok(())
     }
 
     /// Record what a thumbnail attempt learned: whether the photo now has one

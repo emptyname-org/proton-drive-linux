@@ -144,6 +144,17 @@ enum Command {
         /// Skip this many photos from the start of the timeline.
         #[arg(long, default_value_t = 0)]
         offset: usize,
+        /// List only favourited photos.
+        #[arg(long)]
+        favorites: bool,
+    },
+    /// Add or remove a photo's favourite mark.
+    Favorite {
+        /// Photo node uid in `volume~link` form (from `pdfs photos`).
+        uid: String,
+        /// Remove the mark instead of adding it.
+        #[arg(long)]
+        remove: bool,
     },
     /// List the photo albums (including ones shared with this account).
     Albums,
@@ -286,6 +297,11 @@ enum Command {
         /// Entry kind: member, proton or external.
         kind: ShareKindArg,
     },
+    /// Inspect and restore a file's earlier versions.
+    Versions {
+        #[command(subcommand)]
+        action: VersionCmd,
+    },
     /// Manage a node's public link.
     PublicLink {
         #[command(subcommand)]
@@ -378,6 +394,43 @@ impl ShareKindArg {
             ShareKindArg::External => ShareEntryKind::ExternalInvite,
         }
     }
+}
+
+/// `pdfs versions …` — a file's revision history.
+#[derive(Subcommand)]
+enum VersionCmd {
+    /// List a file's versions, newest first.
+    List {
+        /// File path, inside the mountpoint or relative to it.
+        path: PathBuf,
+    },
+    /// Make an earlier version the file's current content.
+    ///
+    /// The server applies this in the background, so the new content may take a
+    /// moment to show up in the mount.
+    Restore {
+        /// File path, inside the mountpoint or relative to it.
+        path: PathBuf,
+        /// Version id, from `pdfs versions list`.
+        id: String,
+    },
+    /// Write an earlier version to a local file, leaving the file untouched.
+    Save {
+        /// File path, inside the mountpoint or relative to it.
+        path: PathBuf,
+        /// Version id, from `pdfs versions list`.
+        id: String,
+        /// Where to write it. Must not already exist.
+        dest: PathBuf,
+    },
+    /// Permanently delete an earlier version. The content is unrecoverable, and
+    /// the version that is currently active cannot be deleted.
+    Rm {
+        /// File path, inside the mountpoint or relative to it.
+        path: PathBuf,
+        /// Version id, from `pdfs versions list`.
+        id: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -529,7 +582,12 @@ fn main() -> Result<()> {
         Command::Unpin { path } => cmd_unpin(path),
         Command::Pins => cmd_pins(),
         Command::Ls { path } => cmd_ls(path),
-        Command::Photos { limit, offset } => cmd_photos(limit, offset),
+        Command::Photos {
+            limit,
+            offset,
+            favorites,
+        } => cmd_photos(limit, offset, favorites),
+        Command::Favorite { uid, remove } => cmd_favorite(uid, remove),
         Command::Albums => cmd_albums(),
         Command::Album { uid, limit, offset } => cmd_album(uid, limit, offset),
         Command::OpenPhoto { uid } => cmd_open_photo(uid),
@@ -561,6 +619,7 @@ fn main() -> Result<()> {
             role,
         } => cmd_share_role(path, id, kind, role),
         Command::Unshare { path, id, kind } => cmd_unshare(path, id, kind),
+        Command::Versions { action } => cmd_versions(action),
         Command::PublicLink { action } => cmd_public_link(action),
         Command::Shared => cmd_shared(),
         Command::SharedWithMe { uid } => cmd_shared_with_me(uid),
@@ -786,6 +845,71 @@ fn cmd_share(
         role,
         message,
     })?)
+}
+
+fn cmd_versions(action: VersionCmd) -> Result<()> {
+    match action {
+        VersionCmd::List { path } => {
+            let response = control_request(CtlRequest::ListRevisions {
+                path: path_arg(&path)?,
+            })?;
+            if emit_json(&response)? {
+                return Ok(());
+            }
+            match response {
+                CtlResponse::Revisions { items } if items.is_empty() => {
+                    println!("No versions.");
+                }
+                CtlResponse::Revisions { items } => {
+                    for r in items {
+                        // The claimed plaintext size is what the user recognises;
+                        // the storage size is ciphertext and always larger.
+                        let size = r
+                            .claimed_size
+                            .filter(|size| *size >= 0)
+                            .unwrap_or(r.size_on_storage)
+                            .max(0) as u64;
+                        let mark = if r.is_active { "*" } else { " " };
+                        let by = r
+                            .signed_by
+                            .map(|email| format!("  {email}"))
+                            .unwrap_or_default();
+                        println!(
+                            "{mark} {:<20}  {:>10}  {}{by}",
+                            r.id,
+                            human_bytes(size),
+                            format_epoch(r.created),
+                        );
+                    }
+                    println!("(* = current)");
+                }
+                CtlResponse::Error { message, kind } => bail!("{}", cli_error(kind, &message)),
+                other => bail!("unexpected response: {other:?}"),
+            }
+            Ok(())
+        }
+        VersionCmd::Restore { path, id } => {
+            ok_or_bail(control_request(CtlRequest::RestoreRevision {
+                path: path_arg(&path)?,
+                revision_id: id,
+            })?)
+        }
+        VersionCmd::Save { path, id, dest } => {
+            // The daemon writes the file, so it needs a path that means the same
+            // thing in its process as in this one.
+            let dest = std::path::absolute(&dest)
+                .with_context(|| format!("resolve {}", dest.display()))?;
+            ok_or_bail(control_request(CtlRequest::SaveRevisionAs {
+                path: path_arg(&path)?,
+                revision_id: id,
+                dest: dest.to_string_lossy().into_owned(),
+            })?)
+        }
+        VersionCmd::Rm { path, id } => ok_or_bail(control_request(CtlRequest::DeleteRevision {
+            path: path_arg(&path)?,
+            revision_id: id,
+        })?),
+    }
 }
 
 fn cmd_members(path: PathBuf) -> Result<()> {
@@ -1487,12 +1611,13 @@ fn cmd_ls(path: Option<PathBuf>) -> Result<()> {
     Ok(())
 }
 
-fn cmd_photos(limit: usize, offset: usize) -> Result<()> {
+fn cmd_photos(limit: usize, offset: usize, favorites: bool) -> Result<()> {
     match control_request(CtlRequest::PhotosTimeline {
         offset,
         limit,
         kind: None,
         range: None,
+        favorites,
     })? {
         CtlResponse::Photos {
             available: false, ..
@@ -1511,6 +1636,13 @@ fn cmd_photos(limit: usize, offset: usize) -> Result<()> {
 ///
 /// A timeline or album reply only carries thumbnails already in the cache, so
 /// the rest of the page's are pulled in one batch rather than left blank.
+fn cmd_favorite(uid: String, remove: bool) -> Result<()> {
+    ok_or_bail(control_request(CtlRequest::SetPhotoFavorite {
+        uid,
+        favorite: !remove,
+    })?)
+}
+
 fn print_photo_page(items: Vec<pdfs_core::control::PhotoItem>) -> Result<()> {
     let uids: Vec<String> = items.iter().map(|p| p.uid.clone()).collect();
     let thumbs: HashMap<String, Option<String>> =
@@ -1524,7 +1656,8 @@ fn print_photo_page(items: Vec<pdfs_core::control::PhotoItem>) -> Result<()> {
             .and_then(|p| p.as_deref())
             .or(p.thumb_path.as_deref())
             .unwrap_or("(no thumbnail)");
-        println!("{}  {}  {thumb}", p.capture_time, p.uid);
+        let fav = if p.favorite { "*" } else { " " };
+        println!("{fav} {}  {}  {thumb}", p.capture_time, p.uid);
     }
     Ok(())
 }

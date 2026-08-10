@@ -18,6 +18,7 @@ use pages::trash::*;
 use pages::verify::*;
 use widgets::details::*;
 use widgets::share_dialog::*;
+use widgets::versions_dialog::*;
 
 use std::cell::{Cell, RefCell};
 
@@ -424,6 +425,8 @@ fn build_window(app: &adw::Application) {
             dates: gallery_widgets.dates.clone(),
             date_ranges: RefCell::new(vec![None]),
             range: Cell::new(None),
+            favorites_btn: gallery_widgets.favorites_btn.clone(),
+            favorites: Cell::new(false),
             date_suppress: Cell::new(false),
             loading: Cell::new(false),
             width: Cell::new(0),

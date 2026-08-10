@@ -38,6 +38,7 @@ use tracing::{debug, info, warn};
 
 use crate::transfers::{CountingWriter, OwnedCountingReader};
 use crate::{Core, now_secs, parse_uid};
+use pdfs_core::batch;
 use pdfs_core::control::{ActivityKind, TransferDirection};
 use pdfs_core::db::{StoredSyncEntry, StoredSyncFolder};
 use pdfs_core::syncignore::IgnoreRules;
@@ -513,7 +514,11 @@ impl Core {
                 let _ = self.db.sync_entry_remove(folder_id, rel);
                 continue;
             };
-            if let Err(e) = self.rt.block_on(self.client.trash_nodes(&[uid])) {
+            if let Err(e) = self
+                .rt
+                .block_on(self.client.trash_nodes(&[uid]))
+                .and_then(batch::into_unit)
+            {
                 warn!(rel, error = %e, "sync: trash remote failed");
                 self.log_activity(ActivityKind::Trash, base_name(rel), e.to_string(), false);
                 outcome.errors += 1;
@@ -754,6 +759,7 @@ impl Core {
                     if let Err(e) = self
                         .rt
                         .block_on(self.client.trash_nodes(std::slice::from_ref(&remote.uid)))
+                        .and_then(batch::into_unit)
                     {
                         warn!(rel, error = %e, "sync: trash remote failed");
                         self.log_activity(
@@ -808,7 +814,11 @@ impl Core {
         }
         delete_remote_dirs.sort_by_key(|(p, _)| std::cmp::Reverse(p.matches('/').count()));
         for (rel, uid) in delete_remote_dirs {
-            if let Err(e) = self.rt.block_on(self.client.trash_nodes(&[uid])) {
+            if let Err(e) = self
+                .rt
+                .block_on(self.client.trash_nodes(&[uid]))
+                .and_then(batch::into_unit)
+            {
                 warn!(rel, error = %e, "sync: trash remote folder failed");
                 self.log_activity(ActivityKind::Trash, base_name(&rel), e.to_string(), false);
                 outcome.errors += 1;

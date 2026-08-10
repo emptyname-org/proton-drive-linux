@@ -26,6 +26,8 @@ pub(crate) struct DetailsWidgets {
     pub(crate) pin_row: adw::SwitchRow,
     pub(crate) open_button: gtk4::Button,
     pub(crate) rename_button: gtk4::Button,
+    /// Files only — folders have no revision history.
+    pub(crate) versions_button: gtk4::Button,
     pub(crate) trash_button: gtk4::Button,
     pub(crate) close_button: gtk4::Button,
 }
@@ -96,6 +98,8 @@ pub(crate) fn build_details_pane() -> (gtk4::Widget, DetailsWidgets) {
     open_button.add_css_class("pill");
     let rename_button = gtk4::Button::builder().label("Rename").build();
     rename_button.add_css_class("pill");
+    let versions_button = gtk4::Button::builder().label("Versions").build();
+    versions_button.add_css_class("pill");
     let trash_button = gtk4::Button::builder().label("Move to Trash").build();
     trash_button.add_css_class("destructive-action");
     trash_button.add_css_class("pill");
@@ -104,6 +108,7 @@ pub(crate) fn build_details_pane() -> (gtk4::Widget, DetailsWidgets) {
     actions.set_margin_top(6);
     actions.append(&open_button);
     actions.append(&rename_button);
+    actions.append(&versions_button);
     actions.append(&trash_button);
 
     let inner = gtk4::Box::new(gtk4::Orientation::Vertical, 12);
@@ -137,6 +142,7 @@ pub(crate) fn build_details_pane() -> (gtk4::Widget, DetailsWidgets) {
             pin_row,
             open_button,
             rename_button,
+            versions_button,
             trash_button,
             close_button,
         },
@@ -190,6 +196,16 @@ pub(crate) fn wire_details(ui: &Rc<Ui>) {
             prompt_rename(&ui_rename, &entry);
         }
     });
+    let ui_versions = ui.clone();
+    ui.details
+        .details
+        .versions_button
+        .connect_clicked(move |_| {
+            let entry = ui_versions.details.details_entry.borrow().clone();
+            if let Some(entry) = entry {
+                open_versions_dialog(&ui_versions, &entry);
+            }
+        });
     let ui_trash = ui.clone();
     ui.details.details.trash_button.connect_clicked(move |_| {
         let entry = ui_trash.details.details_entry.borrow().clone();
@@ -246,6 +262,9 @@ pub(crate) fn show_details(ui: &Rc<Ui>, entry: &DirEntry) {
     d.pin_row.set_sensitive(*ui.mounted.borrow());
     d.open_button
         .set_label(if entry.is_dir { "Open folder" } else { "Open" });
+    // Only files have revisions, and only a connected daemon can fetch them.
+    d.versions_button.set_visible(!entry.is_dir);
+    d.versions_button.set_sensitive(*ui.mounted.borrow());
     ui.details.details_suppress.set(false);
 
     *ui.details.details_entry.borrow_mut() = Some(entry.clone());

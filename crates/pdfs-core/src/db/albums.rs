@@ -178,6 +178,10 @@ impl Db {
                     ratio: r.get(3)?,
                     thumb_state: r.get(4)?,
                     kind: crate::control::PhotoKind::from_i64(r.get(5)?),
+                    // Album rows have no favourite state of their own: an album
+                    // photo on someone else's volume is not in our timeline, and
+                    // favouriting one is not supported yet anyway.
+                    favorite: false,
                 })
             })?
             .collect::<rusqlite::Result<_>>()?;
@@ -218,6 +222,10 @@ impl Db {
                     ratio: r.get(3)?,
                     thumb_state: r.get(4)?,
                     kind: crate::control::PhotoKind::from_i64(r.get(5)?),
+                    // Album rows have no favourite state of their own: an album
+                    // photo on someone else's volume is not in our timeline, and
+                    // favouriting one is not supported yet anyway.
+                    favorite: false,
                 })
             })?
             .collect::<rusqlite::Result<_>>()?;

@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use parking_lot::Mutex;
+use pdfs_core::batch;
 use pdfs_core::control::{
     ActivityKind, DeviceInfo, JobItem, MountKind, MountSpec, SyncFolderInfo, SyncPhase,
     SyncProgress,
@@ -557,7 +558,10 @@ impl Core {
         let _ = self.sync_tx.send(sync::SyncMsg::Rewatch);
         if delete_remote
             && let Some(uid) = parse_uid(&folder.remote_uid)
-            && let Err(e) = self.rt.block_on(self.client.trash_nodes(&[uid]))
+            && let Err(e) = self
+                .rt
+                .block_on(self.client.trash_nodes(&[uid]))
+                .and_then(batch::into_unit)
         {
             warn!(id, error = %e, "delete remote device folder failed");
         }

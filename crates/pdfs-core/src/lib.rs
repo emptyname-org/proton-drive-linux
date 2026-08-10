@@ -4,6 +4,7 @@
 
 pub mod access;
 pub mod auth;
+pub mod batch;
 pub mod cache;
 pub mod config;
 pub mod control;
@@ -12,6 +13,7 @@ pub mod error;
 pub mod localindex;
 pub mod mounts;
 pub mod profile;
+pub mod sdkcache;
 pub mod search;
 pub mod service;
 pub mod shell;

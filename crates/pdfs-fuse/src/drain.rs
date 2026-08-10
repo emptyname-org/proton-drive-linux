@@ -25,6 +25,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
+use pdfs_core::batch;
 use pdfs_core::cache::{Baseline, StagedWrite};
 use pdfs_core::control::{ActivityKind, TransferDirection};
 use pdfs_core::db::{OP_CREATE, OP_MKDIR, OP_RENAME, OP_REVISION, OP_TRASH, PendingOp, RenameMeta};
@@ -340,6 +341,7 @@ impl Core {
         match self
             .rt
             .block_on(self.client.trash_nodes(std::slice::from_ref(&uid)))
+            .and_then(batch::into_unit)
         {
             Ok(()) => {}
             Err(e) if is_gone(&e) => {

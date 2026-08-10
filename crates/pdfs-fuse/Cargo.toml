@@ -10,6 +10,7 @@ description = "FUSE on-demand filesystem for Proton Drive"
 [dependencies]
 pdfs-core.workspace = true
 proton-drive-rs.workspace = true
+futures.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 fuser.workspace = true

@@ -9,7 +9,7 @@ use super::Db;
 use crate::Result;
 
 /// Current schema version. Bump on every forward migration added below.
-pub(super) const SCHEMA_VERSION: i64 = 19;
+pub(super) const SCHEMA_VERSION: i64 = 20;
 
 impl Db {
     pub(super) fn migrate(&self) -> Result<()> {
@@ -97,6 +97,9 @@ impl Db {
         }
         if current < 19 {
             tx.execute_batch(MIGRATION_V19)?;
+        }
+        if current < 20 {
+            tx.execute_batch(MIGRATION_V20)?;
         }
         tx.execute(
             "INSERT INTO sync_state (key, value) VALUES ('schema_version', ?1)
@@ -510,4 +513,17 @@ CREATE TABLE album_photos (
 
 CREATE INDEX idx_album_photos_seq ON album_photos(album_uid, seq);
 CREATE INDEX idx_album_photos_uid ON album_photos(uid);
+";
+
+/// V20: whether a photo is a favourite.
+///
+/// A column rather than a tag table: `Favorite` is the only Proton photo tag a
+/// user sets by hand (the rest — Video, Screenshot, Selfie, Raw… — are the
+/// server's own classification, and the Photos page already derives its tabs
+/// from the media type). Defaulting to 0 means an existing timeline stays
+/// intact and each row learns its real value on the next refresh, the same way
+/// `media_type` did.
+const MIGRATION_V20: &str = "
+ALTER TABLE photos ADD COLUMN favorite INTEGER NOT NULL DEFAULT 0;
+CREATE INDEX IF NOT EXISTS idx_photos_favorite ON photos(favorite, seq);
 ";

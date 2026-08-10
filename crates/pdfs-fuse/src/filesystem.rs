@@ -1856,6 +1856,7 @@ impl ProtonFs {
             .core
             .rt
             .block_on(self.core.client.trash_nodes(std::slice::from_ref(&uid)))
+            .and_then(batch::into_unit)
         {
             error!(%uid, error = %e, "trash failed");
             self.core

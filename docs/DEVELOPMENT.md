@@ -7,21 +7,20 @@ This document summarizes the work still pending after the 1.0.0 release branch a
 ## 1. Core Feature Roadmap (Horizon Tasks)
 Consolidated from the historical feature roadmap; current bug status lives in [`BUGS.md`](BUGS.md).
 
-* **Local Cache & Metadata Encryption at Rest (Priority 5 / Horizon 1)**: Encrypt the SQLite database `cache.db` on disk using SQLCipher (`rusqlite` feature `bundled-sqlcipher`), and encrypt raw content cache blocks (`content/blocks/` and `content/scratch/`) using a fast symmetric scheme like AES-GCM or ChaCha20-Poly1305. The encryption key should be derived from the OS Keyring.
+* **Local Cache & Metadata Encryption at Rest (Priority 5 / Horizon 1)**: Encrypt the SQLite database `cache.db` on disk using SQLCipher (`rusqlite` feature `bundled-sqlcipher`), and encrypt raw content cache blocks (`content/blocks/` and `content/scratch/`) using a fast symmetric scheme like AES-GCM or ChaCha20-Poly1305. The encryption key should be derived from the OS Keyring. (The SDK entity cache in `sdk_cache.db` is already encrypted at rest — see *Persistent SDK Entity Cache* below — but `cache.db` and the content cache are not.)
 * **Active Bandwidth Throttling & Traffic Shaping (Horizon 1)**: Add speed governors for daemon uploads and downloads. Support configuration variables `max_upload_rate_kbps` and `max_download_rate_kbps` in `config.json` that can be dynamically adjusted over the Unix control socket.
 * **Interactive & Policy-Based Conflict Resolution (Horizon 1)**: Implement configurable conflict resolution policies (`rename-local`, `rename-remote`, `prefer-local`, `prefer-remote`, `interactive`). Add a "Conflicts" tab to the GUI to notify the user, block sync, and launch external visual diff tools (like Meld or KDiff3).
 * **Multi-Account / Multi-Profile Support (Horizon 3)**: Enable running multiple profiles concurrently. Support separate configuration namespaces (e.g. `profiles/<profile_name>/`), independent SQLite databases, distinct mount paths (e.g. `~/ProtonDrive/Personal` and `~/ProtonDrive/Work`), and multiple daemon processes.
 * **Custom FUSE Mount Options (Horizon 1)**: Expose custom mounting parameters in configuration (e.g. `ro` for read-only, `direct_io` to bypass kernel caching, `allow_other`). Auto-generate systemd user mount units upon sync folder configuration.
 * **Symbolic Link & Hard Link Virtualization (Horizon 2)**: Add symbolic link virtualization inside the metadata store (`NodeType::Symlink`) by intercepting `readlink(2)` and `symlink(2)`. Targets should sync remotely as small encrypted metadata placeholder files on Drive (`proton-vfs-symlink: <target>`).
 * **Desktop File Manager Integration (Horizon 2)**: Develop shell extension plugins for popular Linux file managers (Nautilus Python plugin, Dolphin Service Menus, Thunar custom actions) to offer context-menu shortcuts ("Pin", "Unpin", "Copy Share Link", "View Version History") and file overlay sync badges.
-* **Integrated Photo Gallery Enhancements (Horizon 2)**: Extract and display Exif metadata (camera model, exposure, coordinates) from photos locally, support creating and editing Proton Photo Albums, build a date-based timeline scrollbar, and create an auto-upload Pictures folder pipeline.
+* **Integrated Photo Gallery Enhancements (Horizon 2)**: Support creating and editing Proton Photo Albums (album *writes* are unported in the SDK too) and create an auto-upload Pictures folder pipeline. Exif display, the date-based timeline scrubber and favourites are implemented.
 * **Random-Access Media Streaming seek support (Horizon 2)**: Intercept out-of-order sparse reads (player seeks) in `pdfs-fuse` and prioritize downloading blocks around the seek offset, aborting/postponing sequential pre-fetches.
 * **Dynamic Sync Dashboard & Queue Visualization (Horizon 2)**: GUI real-time transfer list (progress bars, speed, ETA), sync history feed, storage usage breakdown, and global pause/resume sync controls.
 * **Interactive Terminal UI (TUI) Mode (Horizon 3)**: Implement `pdfs tui` using the `ratatui` crate to show transfer speed, sync status, active transfer queue with progress bars, and scrolling daemon logs.
 * **Shutdown Safety & Write Queue Visibility (Horizon 1 / P4)**: Register systemd inhibitor locks in `pdfs-fuse` when there are outstanding staging writes to prevent shutdown or sleep, pop up warnings when exiting the GUI, and build a blocking `pdfs sync flush` command.
 * **Block-Level Deduplication (Horizon 3)**: Transition to a Content-Addressable block cache where cached blocks are stored on disk by their SHA-256 hash. Map logical ranges in the database: `(node_uid, block_idx) -> block_hash` to avoid storing or downloading identical blocks.
 * **Pre-emptive Sync Debouncing & File System Events (Horizon 3)**: Group filesystem write events on paths and delay sync queue insertion until a quiet period has elapsed (e.g. 5 seconds of inactivity) to prevent thrashing the Proton API.
-* **File Version History (Horizon 2)**: Expose past file revisions and version history inside the GUI browser tabs.
 
 ---
 
@@ -121,6 +120,45 @@ Derived from: [`BUGS.md`](BUGS.md)
 ---
 
 ## 6. Recently Implemented Features
+
+### File Version History (Implemented)
+**Files**: [`revisions.rs`](../crates/pdfs-fuse/src/revisions.rs), [`control.rs`](../crates/pdfs-core/src/control.rs), [`versions_dialog.rs`](../crates/pdfs-gui/src/app/widgets/versions_dialog.rs)
+
+Proton Drive keeps every revision a client committed; the daemon only ever addressed the active one, so a file overwritten by a sync pass could be recovered only from whatever the local `recovery/` directory happened to hold.
+
+The control protocol gained `ListRevisions` / `RestoreRevision` / `DeleteRevision` / `SaveRevisionAs` (each with a `…ByUid` twin for nodes the primary mount cannot name), the CLI gained `pdfs versions list|restore|save|rm`, and the browser's details pane gained a **Versions** button opening a per-file dialog.
+
+Three properties that shape the code:
+
+- **A restore is server-side and asynchronous.** No content crosses the wire and nothing enters the drain queue; the server answers 202 and swaps the active revision in the background, so the daemon evicts the file's cached blocks and open readers rather than describing the new state, and the UI wording promises the request, not the result.
+- **The active revision cannot be deleted.** `Core::delete_revision_for_uid` checks that locally so the user gets a sentence rather than an API code, and the dialog gives the current row no delete button.
+- **Saving a version never overwrites.** `SaveRevisionAs` refuses an existing destination and removes a partial file if the download fails — a half-written export looks identical to a good one to every tool that opens it afterwards.
+
+### Photo Favourites (Implemented)
+**Files**: [`photos.rs`](../crates/pdfs-fuse/src/photos.rs), [`photo_viewer.rs`](../crates/pdfs-gui/src/app/pages/photo_viewer.rs)
+
+The gallery can mark and filter favourites, through the SDK's photo-tag API (`update_photos`). Schema **v20** adds `photos.favorite`; the flag is learned in the timeline enrichment pass that already resolves each photo's name and media type, and is kept across a refresh that could not resolve a photo — the same learned-and-kept rule as `media_type`. The lightbox carries a star toggle, the Photos header a favourites filter, and the CLI has `pdfs favorite <uid> [--remove]` plus `pdfs photos --favorites`.
+
+Favouriting a photo that is not on this account's own photos volume (shared with us, or album-only) needs it re-encrypted for our timeline root, which the SDK does not implement; the daemon surfaces that as an error rather than silently doing nothing.
+
+### Persistent SDK Entity Cache (Implemented)
+**Files**: [`sdkcache.rs`](../crates/pdfs-core/src/sdkcache.rs), [`auth.rs`](../crates/pdfs-core/src/auth.rs), [`background.rs`](../crates/pdfs-fuse/src/background.rs)
+
+The SDK's Drive entity cache (decrypted node metadata: name, size, parent, signing share) defaulted to memory, so every daemon restart re-fetched and re-decrypted the tree the previous run had already walked. It is now backed by SQLite.
+
+- **Its own file** (`sdk_cache.db` in the state directory), not `cache.db`: the daemon's `Db` is one `Mutex<Connection>` shared by every FUSE thread and the control socket, and this traffic is frequent, small and entirely reconstructible. A separate file also means no schema migration — the store can be deleted at any time.
+- **Encrypted at rest** by wrapping it in the SDK's `EncryptedCacheRepository`, keyed by the mailbox password. A password change reads as a cold cache (the SDK treats an undecryptable entry as a miss and clears the store), not as an error.
+- **Staleness** is closed by the event loop, which already replays from a persisted cursor and calls `invalidate_caches_for_event` for every event — including those raised while the daemon was down. The one case with no trail is a *seeded* cursor (first-ever mount, or a lost cursor), where the seed path now clears the store instead of trusting it. `auth::logout` removes the file.
+
+Needed a small additive SDK change (`ProtonDriveClient::with_entity_repository`, 0.5.1): `with_entity_cache` is a constructor and so could not be combined with `with_key_salts`, which the daemon requires.
+
+### Per-node Batch Outcomes (Implemented)
+**File**: [`batch.rs`](../crates/pdfs-core/src/batch.rs)
+
+SDK 0.5.0 made `trash_nodes` / `restore_nodes` / `delete_nodes` report one outcome per node instead of failing the whole call (mirroring upstream's streamed `NodeActionResult`). `pdfs_core::batch::into_unit` collapses the single-node calls back to a `Result`; `batch::split` handles a collected batch.
+
+The trash view's restore and permanent-delete use the SDK's **streaming** variants (`restore_nodes_streaming` / `delete_nodes_streaming`) and apply local state per node as each batch lands rather than after the last one. For a permanent delete — which is irreversible — that means a daemon interrupted mid-batch has forgotten exactly the nodes the server destroyed, no more and no fewer. Both report per-node failures and count only what actually succeeded; only a batch where nothing succeeded is an error.
+
 
 ### Open-for-Write Deferral for Mirror Sync (Implemented)
 **File**: [`sync.rs`](../crates/pdfs-fuse/src/sync.rs)

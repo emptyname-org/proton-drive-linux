@@ -9,8 +9,10 @@
 use keyring::Entry;
 use proton_drive_rs::{KeySalt, ProtonDriveClient};
 use proton_sdk::api::{HumanVerification, HumanVerificationCredential};
+use proton_sdk::cache::EncryptedCacheRepository;
 use proton_sdk::config::ProtonClientConfiguration;
 use proton_sdk::session::{PasswordMode, ProtonApiSession, ResumeParameters};
+use proton_sdk::telemetry::TracingTelemetry;
 use serde::{Deserialize, Serialize};
 
 use crate::config::{APP_VERSION, AppDirs, KEYRING_SERVICE, USER_AGENT};
@@ -220,6 +222,21 @@ pub fn load() -> Result<StoredSession> {
 
 /// Forget the persisted session (best-effort; absent entry is not an error).
 pub fn logout() -> Result<()> {
+    // The persisted entity cache describes the account being logged out of. It
+    // is encrypted under that account's mailbox password, but leaving it behind
+    // would also mean the next account inherits a store it can only ever read as
+    // misses. Best-effort: failing to remove a cache must not block the logout.
+    if let Ok(dirs) = AppDirs::new() {
+        let path = dirs.state_dir().join("sdk_cache.db");
+        if let Some(cache) = crate::sdkcache::SdkCache::opened()
+            && let Err(e) = cache.clear_now()
+        {
+            tracing::warn!(error = %e, "clearing the SDK entity cache on logout failed");
+        }
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
+    }
     match keyring_entry()?.delete_credential() {
         Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
         Err(e) => Err(e.into()),
@@ -259,8 +276,48 @@ pub async fn resume_client() -> Result<(ProtonDriveClient, ProtonApiSession)> {
 
     register_refresh_handler(&session, password.clone(), key_salts.clone());
 
-    let client = ProtonDriveClient::with_key_salts(&session, password.into_bytes(), key_salts);
+    let client = tune(
+        ProtonDriveClient::with_key_salts(&session, password.clone().into_bytes(), key_salts),
+        password.as_bytes(),
+    );
     Ok((client, session))
+}
+
+/// The client settings every front-end wants, applied wherever a
+/// [`ProtonDriveClient`] is built for real work.
+///
+/// - **Telemetry** into `tracing`, so the SDK's own spans (transfers, block
+///   storage, per-request timings) land in the daemon's log next to the
+///   daemon's, instead of being dropped by the default no-op sink.
+/// - **Small-file uploads**: a file that fits in one block is uploaded as a
+///   single atomic request instead of the multi-step draft/block/commit dance.
+///   The SDK makes this opt-in because it has no remote feature-flag provider;
+///   the drain queue writes plenty of small files, and the shorter path is one
+///   failure point per write instead of three.
+/// - **A persistent entity cache** ([`crate::sdkcache`]), so a restart does not
+///   re-fetch and re-decrypt the tree the previous run already walked. It is
+///   wrapped in the SDK's [`EncryptedCacheRepository`] keyed by the mailbox
+///   password, so the decrypted node names it holds are not readable from the
+///   file alone — and a password change simply reads as a cold cache, since the
+///   SDK treats an undecryptable entry as a miss and clears the store.
+///
+///   Opening it is best-effort: a store this process cannot open costs cache
+///   hits, not the session, so the client falls back to the SDK's in-memory
+///   default.
+fn tune(client: ProtonDriveClient, mailbox_password: &[u8]) -> ProtonDriveClient {
+    let client = client
+        .with_telemetry(TracingTelemetry::shared())
+        .with_small_file_upload(true);
+    match AppDirs::new().and_then(|dirs| crate::sdkcache::SdkCache::shared(&dirs)) {
+        Ok(cache) => client.with_entity_repository(EncryptedCacheRepository::shared(
+            cache,
+            mailbox_password.to_vec(),
+        )),
+        Err(e) => {
+            tracing::warn!(error = %e, "persistent SDK entity cache unavailable; using memory");
+            client
+        }
+    }
 }
 
 /// Write the session's current tokens back to the keyring.
