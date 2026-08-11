@@ -2974,15 +2974,24 @@ impl Core {
             .collect())
     }
 
-    /// Return an absolute path through the most specific live on-demand mount
+    /// Return an absolute path through the most specific local location
     /// covering `uid`. A node may be below several configured roots, so prefer
     /// the root leaving the shortest descendant path.
+    ///
+    /// An on-demand folder only answers while its mount is live — without the
+    /// mount its `local_path` is an ordinary empty directory. A mirror folder
+    /// needs no mount: its files are real local copies the sync loop pushes
+    /// back, so it is a valid open target whenever it is configured.
     fn mounted_search_path(&self, uid: &str) -> Option<String> {
         let live_mounts = self.mounts.lock();
         let folders = self.db.sync_folder_list().ok()?;
         folders
             .into_iter()
-            .filter(|folder| folder.mode == "ondemand" && live_mounts.contains_key(&folder.id))
+            .filter(|folder| match folder.mode.as_str() {
+                "ondemand" => live_mounts.contains_key(&folder.id),
+                "mirror" => true,
+                _ => false,
+            })
             .filter_map(|folder| {
                 let relative = self.db.path_relative_to(&folder.remote_uid, uid).ok()??;
                 let depth = relative.split('/').count();
@@ -3164,7 +3173,68 @@ impl Core {
                 node_size(&e.node),
             )
         };
-        if let Some(p) = self.cache.cached_content_path(&uid, mtime, size) {
+        self.fetch_content(&uid, &name, mtime, size)
+    }
+
+    /// [`open_file`](Self::open_file) addressed by uid instead of by path.
+    ///
+    /// A search hit is a metadata-index row, and the index covers every
+    /// location this daemon knows — including on-demand sync folders and
+    /// mirrors, whose nodes have no path inside the primary mount's tree.
+    /// Walking such a hit's path from the mount root answers ENOENT even though
+    /// the node is perfectly reachable, so front-ends address hits by uid.
+    ///
+    /// Metadata comes from the live tree, then the index, then the API — the
+    /// last covers a node the index knows but no location holds. Unlike the
+    /// mutating by-uid handlers this does not demand a
+    /// [`resolve_anywhere`](Self::resolve_anywhere) residency proof: reading
+    /// one's own file is what the API authorizes anyway, and requiring
+    /// residency is exactly what turned an openable search hit into "no such
+    /// file or folder". [`open_shared_file`](Self::open_shared_file) already
+    /// works this way. Reserved (local/virtual) uids name no remote node and
+    /// are still rejected.
+    fn open_file_uid(&self, raw_uid: &str) -> CoreResult<PathBuf> {
+        let uid = parse_uid(raw_uid)
+            .filter(|uid| !is_local_uid(uid) && !is_virtual_uid(uid))
+            .ok_or_else(|| CoreError::invalid(format!("invalid uid: {raw_uid}")))?;
+        let live = self
+            .state
+            .lock()
+            .entries
+            .values()
+            .find(|e| e.uid == uid)
+            .map(|e| e.node.clone());
+        let node = match live {
+            Some(node) => node,
+            None => match self
+                .db
+                .node_by_uid(&uid.to_string())
+                .map_err(|e| CoreError::from_api(&e, "load node"))?
+            {
+                Some(node) => node,
+                None => self
+                    .rt
+                    .block_on(self.client.get_node(&uid))
+                    .map_err(|e| CoreError::from_api(&e, "get node"))?
+                    .ok_or_else(|| CoreError::not_found("node vanished"))?,
+            },
+        };
+        if !node.is_file() {
+            return Err(CoreError::invalid("not a regular file"));
+        }
+        self.fetch_content(&uid, &node.name, node.modification_time, node_size(&node))
+    }
+
+    /// Materialise a file's full content into the content cache, returning its
+    /// on-disk path. Serves a fresh cached blob without touching the network.
+    fn fetch_content(
+        &self,
+        uid: &NodeUid,
+        name: &str,
+        mtime: i64,
+        size: u64,
+    ) -> CoreResult<PathBuf> {
+        if let Some(p) = self.cache.cached_content_path(uid, mtime, size) {
             return Ok(p);
         }
 
@@ -3175,7 +3245,7 @@ impl Core {
         // from sharing a partially written staging file.
         static OPEN_TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
         let seq = OPEN_TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
-        let tmp = self.cache.content_path(&uid).with_extension(format!(
+        let tmp = self.cache.content_path(uid).with_extension(format!(
             "open-{}-{}-{seq}.tmp",
             std::process::id(),
             SystemTime::now()
@@ -3188,7 +3258,7 @@ impl Core {
             .create_new(true)
             .open(&tmp)
             .map_err(|e| CoreError::internal(format!("create download temp: {e}")))?;
-        let file = match self.download_file_tracked_to(&uid, &name, size, file) {
+        let file = match self.download_file_tracked_to(uid, name, size, file) {
             Ok(file) => file,
             Err(e) => {
                 let _ = std::fs::remove_file(&tmp);
@@ -3199,12 +3269,12 @@ impl Core {
             let _ = std::fs::remove_file(&tmp);
             return Err(CoreError::internal(format!("sync download temp: {e}")));
         }
-        if let Err(e) = self.cache.store_file(&uid, mtime, size, &tmp) {
+        if let Err(e) = self.cache.store_file(uid, mtime, size, &tmp) {
             let _ = std::fs::remove_file(&tmp);
             return Err(CoreError::internal(format!("cache store: {e}")));
         }
         let _ = std::fs::remove_file(&tmp);
-        Ok(self.cache.content_path(&uid))
+        Ok(self.cache.content_path(uid))
     }
 
     /// Drop the cached child listing of `rel`'s parent directory so the next

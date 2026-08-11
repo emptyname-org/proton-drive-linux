@@ -9,7 +9,6 @@
 
 use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -20,9 +19,12 @@ use pdfs_core::config::AppDirs;
 use pdfs_core::control::{
     LocalHit, Request, Response, SearchFilters, SearchHit, SearchKind, SearchSource, send,
 };
+use pdfs_core::menu::PromptMode;
+use pdfs_core::opener::{self, OpenWith};
 
 mod activation;
-use activation::{DriveActivation, drive_activation, mounted_path};
+mod dmenu;
+use activation::{DriveActivation, drive_activation, mounted_or_relative, mounted_target};
 
 const APP_ID: &str = "io.narl.proton-drive-linux-prompt";
 
@@ -220,6 +222,10 @@ fn rank_hits(hits: &mut [Hit]) {
 struct Ui {
     socket: PathBuf,
     mountpoint: RefCell<PathBuf>,
+    /// How a chosen file is launched. Read once at window build: the prompt is
+    /// resident, but a config edit is rare enough that a restart is a fair
+    /// price for not re-reading the file on every Enter.
+    opener: OpenWith,
 
     entry: gtk4::Entry,
     spinner: gtk4::Spinner,
@@ -328,12 +334,108 @@ impl Section {
     }
 }
 
+const USAGE: &str = "\
+pdfs-prompt — search Proton Drive and this computer
+
+Usage: pdfs-prompt [OPTIONS]
+
+Options:
+  --dmenu               Present the results in an external launcher (fuzzel,
+                        rofi, …) instead of the built-in GTK window. Also
+                        settable permanently as \"prompt\": { \"mode\": \"dmenu\" }
+                        in config.json.
+  --gtk                 Force the built-in window, overriding that setting.
+  --menu <COMMAND>      Launcher command line for --dmenu, e.g.
+                        --menu 'fuzzel --dmenu --width 60'. Overrides
+                        \"prompt\": { \"menu\": [...] }.
+  --query <TEXT>        Search for TEXT immediately instead of opening on the
+                        pinned-files list (--dmenu only).
+  -h, --help            Show this help.
+";
+
+/// What the command line asked for, before any GTK setup happens: the launcher
+/// path must not pay for — or fail on — a display connection it never uses.
+struct Args {
+    mode: Option<PromptMode>,
+    menu: Option<Vec<String>>,
+    query: Option<String>,
+}
+
+fn parse_args(argv: impl Iterator<Item = String>) -> Result<Args, String> {
+    let mut args = Args {
+        mode: None,
+        menu: None,
+        query: None,
+    };
+    let mut argv = argv.peekable();
+    while let Some(arg) = argv.next() {
+        match arg.as_str() {
+            "--dmenu" => args.mode = Some(PromptMode::Dmenu),
+            "--gtk" => args.mode = Some(PromptMode::Gtk),
+            // A launcher command is one shell-ish string so it can live in a
+            // keybinding; splitting on whitespace is enough for flags, and a
+            // launcher argument needing spaces belongs in config.json.
+            "--menu" => {
+                let value = argv
+                    .next()
+                    .ok_or_else(|| "--menu needs a command".to_string())?;
+                let parts: Vec<String> = value.split_whitespace().map(str::to_string).collect();
+                if parts.is_empty() {
+                    return Err("--menu needs a command".to_string());
+                }
+                args.menu = Some(parts);
+                // A launcher was named explicitly; that only makes sense here.
+                args.mode.get_or_insert(PromptMode::Dmenu);
+            }
+            "--query" => {
+                args.query = Some(
+                    argv.next()
+                        .ok_or_else(|| "--query needs a search term".to_string())?,
+                );
+            }
+            other => return Err(format!("unrecognised argument: {other}")),
+        }
+    }
+    Ok(args)
+}
+
 fn main() -> glib::ExitCode {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
+
+    let raw: Vec<String> = std::env::args().skip(1).collect();
+    if raw.iter().any(|arg| arg == "-h" || arg == "--help") {
+        print!("{USAGE}");
+        return glib::ExitCode::SUCCESS;
+    }
+    let args = match parse_args(raw.into_iter()) {
+        Ok(args) => args,
+        Err(message) => {
+            eprintln!("pdfs-prompt: {message}\n\n{USAGE}");
+            return glib::ExitCode::FAILURE;
+        }
+    };
+
+    // The stored mode makes an existing keybinding switch front ends without
+    // being re-bound; an explicit flag still wins.
+    let stored = AppDirs::new()
+        .map(|dirs| dirs.load_config().resolved_prompt().resolved_mode())
+        .unwrap_or_default();
+    if args.mode.unwrap_or(stored) == PromptMode::Dmenu {
+        return match dmenu::run(dmenu::Options {
+            menu: args.menu,
+            query: args.query,
+        }) {
+            Ok(()) => glib::ExitCode::SUCCESS,
+            Err(message) => {
+                eprintln!("pdfs-prompt: {message}");
+                glib::ExitCode::FAILURE
+            }
+        };
+    }
 
     let app = adw::Application::builder().application_id(APP_ID).build();
     // GtkApplication normally remains active while it owns a window, including
@@ -354,7 +456,8 @@ fn main() -> glib::ExitCode {
         };
         ui.activate();
     });
-    app.run()
+    // GTK must not try to parse our own flags; they were consumed above.
+    app.run_with_args::<&str>(&[])
 }
 
 fn build_window(app: &adw::Application) -> Option<Rc<Ui>> {
@@ -478,6 +581,7 @@ fn build_window(app: &adw::Application) -> Option<Rc<Ui>> {
     let ui = Rc::new(Ui {
         socket: dirs.control_socket(),
         mountpoint: RefCell::new(dirs.default_mountpoint()),
+        opener: dirs.load_config().resolved_open_with(),
         entry: entry.clone(),
         spinner,
         stack,
@@ -684,6 +788,20 @@ impl Ui {
         }
         window.present();
         self.entry.grab_focus();
+    }
+
+    /// Hand a resolved path to the configured opener — `xdg-open` unless
+    /// `open_with` in `config.json` says otherwise (a terminal editor for text
+    /// files, say).
+    fn open_path(&self, path: &Path, is_dir: bool) {
+        opener::open(&self.opener, path, is_dir);
+    }
+
+    /// Open a file the daemon just materialised into the content cache. The
+    /// blob is named after its content hash, so the open rules have to be
+    /// matched against the Drive name instead.
+    fn open_materialized(&self, path: &Path, name: &str) {
+        opener::open_named(&self.opener, path, name, false);
     }
 
     /// Dismiss without destroying the application window. GTK continues to
@@ -1081,7 +1199,7 @@ impl Ui {
 
         match hit {
             Hit::Local(local) => {
-                xdg_open(Path::new(&local.path));
+                self.open_path(Path::new(&local.path), local.is_dir);
                 self.dismiss();
             }
             Hit::Drive(drive) => {
@@ -1091,25 +1209,28 @@ impl Ui {
                 // this handles non-recursively pinned folders without mistaking
                 // them for files and sending an invalid OpenFile request.
                 if self.rendered_query.borrow().is_empty() {
-                    let path = drive.mounted_path.as_deref().map_or_else(
-                        || mounted_path(&self.mountpoint.borrow(), &drive.path),
-                        PathBuf::from,
-                    );
-                    xdg_open(&path);
+                    let path = mounted_or_relative(&self.mountpoint.borrow(), &drive);
+                    self.open_path(&path, drive.is_dir);
                     self.dismiss();
                     return;
                 }
                 match drive_activation(&drive.name, drive.is_dir) {
                     DriveActivation::Folder | DriveActivation::MountedMedia => {
-                        let path = drive.mounted_path.as_deref().map_or_else(
-                            || mounted_path(&self.mountpoint.borrow(), &drive.path),
-                            PathBuf::from,
-                        );
-                        xdg_open(&path);
+                        let path = mounted_or_relative(&self.mountpoint.borrow(), &drive);
+                        self.open_path(&path, drive.is_dir);
                         self.dismiss();
                         return;
                     }
-                    DriveActivation::Materialize => {}
+                    // The mount holds the real file; the cache holds a copy an
+                    // editor would save into for nothing. Prefer the mount, and
+                    // materialise only what it does not expose.
+                    DriveActivation::Materialize => {
+                        if let Some(path) = mounted_target(&self.mountpoint.borrow(), &drive) {
+                            self.open_path(&path, false);
+                            self.dismiss();
+                            return;
+                        }
+                    }
                 }
 
                 self.opening.set(true);
@@ -1121,6 +1242,7 @@ impl Ui {
                     self.socket.clone(),
                     Request::OpenFile {
                         path: drive.path.clone(),
+                        uid: Some(drive.uid.clone()),
                     },
                 );
                 let ui = self.clone();
@@ -1131,7 +1253,7 @@ impl Ui {
                     ui.opening.set(false);
                     match reply {
                         Ok(Ok(Response::FilePath { path })) => {
-                            xdg_open(Path::new(&path));
+                            ui.open_materialized(Path::new(&path), &drive.name);
                             ui.dismiss();
                         }
                         Ok(Ok(Response::Error { message, .. })) => {
@@ -1222,13 +1344,6 @@ fn spawn_request(
         let _ = tx.send_blocking(send(&socket, &request).map_err(|e| e.to_string()));
     });
     rx
-}
-
-fn xdg_open(path: &Path) {
-    tracing::info!(path = %path.display(), "opening");
-    if let Err(e) = Command::new("xdg-open").arg(path).spawn() {
-        tracing::error!("xdg-open failed: {e}");
-    }
 }
 
 fn dirs_home() -> Option<PathBuf> {
@@ -1465,5 +1580,43 @@ mod tests {
         rank_hits(&mut hits);
         assert!(matches!(&hits[0], Hit::Local(hit) if hit.name == "better.pdf"));
         assert!(matches!(&hits[1], Hit::Drive(hit) if hit.name == "alpha.pdf"));
+    }
+
+    fn parse(args: &[&str]) -> Result<Args, String> {
+        parse_args(args.iter().map(|a| (*a).to_string()))
+    }
+
+    #[test]
+    fn no_arguments_defer_the_mode_to_config() {
+        let args = parse(&[]).unwrap();
+        assert_eq!(args.mode, None);
+        assert_eq!(args.menu, None);
+        assert_eq!(args.query, None);
+    }
+
+    #[test]
+    fn naming_a_launcher_implies_dmenu_but_an_explicit_mode_still_wins() {
+        let args = parse(&["--menu", "fuzzel --dmenu"]).unwrap();
+        assert_eq!(args.mode, Some(PromptMode::Dmenu));
+        assert_eq!(
+            args.menu,
+            Some(vec!["fuzzel".to_string(), "--dmenu".to_string()])
+        );
+
+        let args = parse(&["--gtk", "--menu", "rofi -dmenu"]).unwrap();
+        assert_eq!(args.mode, Some(PromptMode::Gtk));
+    }
+
+    #[test]
+    fn a_flag_without_its_value_is_an_error_not_a_default() {
+        assert!(parse(&["--menu"]).is_err());
+        assert!(parse(&["--query"]).is_err());
+        assert!(parse(&["--nonsense"]).is_err());
+    }
+
+    #[test]
+    fn a_query_is_taken_verbatim_including_spaces() {
+        let args = parse(&["--dmenu", "--query", "tax return 2024"]).unwrap();
+        assert_eq!(args.query.as_deref(), Some("tax return 2024"));
     }
 }

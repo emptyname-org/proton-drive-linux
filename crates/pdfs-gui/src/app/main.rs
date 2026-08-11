@@ -996,11 +996,18 @@ fn capitalize(s: &str) -> String {
     }
 }
 
-/// Open a local path with the user's default handler.
+/// Open a local path with the handler the user configured — `xdg-open` unless
+/// `open_with` in `config.json` overrides it for this kind of file.
 fn open_path(path: &str) {
-    if let Err(e) = Command::new("xdg-open").arg(path).spawn() {
-        tracing::error!("xdg-open {path} failed: {e}");
-    }
+    let path = Path::new(path);
+    pdfs_core::opener::open_default(path, path.is_dir());
+}
+
+/// [`open_path`] for a file the daemon materialised into the content cache,
+/// where the on-disk name is a content hash and carries no extension for the
+/// rules (or `xdg-open`) to key off. `name` is the Drive name it was opened as.
+pub(crate) fn open_named_path(path: &str, name: &str) {
+    pdfs_core::opener::open_default_named(Path::new(path), name, false);
 }
 
 /// Format a byte count as a short binary-unit string (e.g. `1.2 GiB`).

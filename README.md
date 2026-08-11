@@ -27,6 +27,80 @@ A fast, unofficial Proton Drive client for Linux. This client features an advanc
 
 The prompt stays resident after its first launch, so invoking the shortcut again reuses and resets the existing window. Drive folders open from the mount. Audio and video results also open through FUSE, allowing media players to seek and request ranges without downloading the entire file first; ordinary Drive files are materialized into the local cache before opening.
 
+### Using your own launcher (fuzzel, rofi, wofi, …)
+
+`pdfs-prompt --dmenu` runs the same search through an external dmenu-style
+launcher instead of the built-in window, so the HUD matches the rest of a
+tiling-WM desktop:
+
+```bash
+pdfs-prompt --dmenu                                   # fuzzel/rofi/wofi/tofi/bemenu/dmenu, whichever is installed
+pdfs-prompt --dmenu --menu 'fuzzel --dmenu --width 60'
+pdfs-prompt --dmenu --query invoice                   # skip straight to a search
+```
+
+A launcher filters a fixed list — it cannot ask for a new one per keystroke — so
+searching takes two steps, and the prompt says which step you are on:
+
+- `Search Drive ›` lists your pinned files. Type anything that isn't one of them
+  and press Enter to search for it.
+- `Drive: invoice ›` lists the results. Enter opens one; typing something else
+  and pressing Enter searches again. Escape closes.
+
+`--query` skips the first step. fuzzel and rofi also get file-type icons.
+
+To make an existing keybinding use it without re-binding, and to pin the
+launcher command, set them in `config.json`:
+
+```json
+{
+  "prompt": {
+    "mode": "dmenu",
+    "menu": ["fuzzel", "--dmenu", "--width", "60"],
+    "menu_limit": 50
+  }
+}
+```
+
+`--gtk` overrides `"mode": "dmenu"` for one invocation. A `{prompt}` token
+anywhere in `menu` is replaced by the prompt text; without one, the launcher's
+own prompt flag is appended.
+
+## Choosing How Files Open
+
+By default every result is handed to `xdg-open`. An `open_with` block in
+`config.json` overrides that per file type — for instance opening text in
+Neovim inside Alacritty, while everything else still goes to the desktop:
+
+```json
+{
+  "open_with": {
+    "terminal": ["alacritty", "-e"],
+    "rules": [
+      { "match": ["@text"], "command": ["nvim"], "terminal": true },
+      { "match": ["*.png", "*.jpg"], "command": ["imv"] }
+    ]
+  }
+}
+```
+
+- `match` takes file-name globs (`*.md`, `notes-*.txt`) or the classes `@dir`,
+  `@text`, `@document`, `@image`, `@media`, `@any`. First matching rule wins.
+- `command` is argv, not a shell line. A `{}` token is replaced by the path;
+  without one the path is appended. `$VAR` tokens expand from the environment,
+  so `["$EDITOR"]` follows your editor.
+- `"terminal": true` wraps the command in `terminal`. When that is unset, the
+  terminal comes from `$PDFS_TERMINAL`, then `$TERMINAL`, then the first known
+  emulator on `PATH`; a bare name like `TERMINAL=alacritty` gains the right
+  "run this" flag automatically.
+- `"default": [...]` replaces `xdg-open` for everything unmatched.
+
+The rules apply to the prompt (both front ends) and to the GTK browser, so a
+file opens the same way wherever it was picked. Patterns are matched against the
+Drive name — a downloaded file is stored in the cache under its content hash,
+which says nothing about its type, so matching that would send everything to
+`xdg-open`.
+
 ## Selective Sync (`.pdfsignore`)
 
 Two-way synced folders skip paths matched by ignore rules, so syncing a project

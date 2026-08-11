@@ -120,7 +120,18 @@ pub enum Request {
     /// Download a Drive file's full content into the cache; replies with the
     /// on-disk path so the front-end can open it with the default app. `path`
     /// is mountpoint-relative.
-    OpenFile { path: String },
+    ///
+    /// `uid` addresses the same node directly and is preferred when present: a
+    /// search hit's path comes from the metadata index, which also indexes
+    /// nodes the primary mount's tree does not expose (an on-demand sync
+    /// folder, a mirror), and walking such a path from the mount root fails
+    /// with "no such file or folder". Defaulted for wire-compat with clients
+    /// predating the field; the daemon falls back to `path` without it.
+    OpenFile {
+        path: String,
+        #[serde(default)]
+        uid: Option<String>,
+    },
     /// Full-text search node names against the daemon's local metadata index.
     /// `limit` caps the number of hits returned. Replies with [`Response::SearchResults`].
     Search { query: String, limit: usize },
@@ -2171,6 +2182,24 @@ mod tests {
             assert_eq!(decoded_uid, "vol~link");
             assert_eq!(serde_json::to_string(&decoded).unwrap(), wire);
         }
+    }
+
+    #[test]
+    fn open_file_accepts_a_request_from_a_client_predating_the_uid_field() {
+        let legacy = r#"{"OpenFile":{"path":"Documents/ONBOARDING.md"}}"#;
+        let Request::OpenFile { path, uid } = serde_json::from_str::<Request>(legacy).unwrap()
+        else {
+            panic!("decoded into the wrong variant");
+        };
+        assert_eq!(path, "Documents/ONBOARDING.md");
+        assert_eq!(uid, None);
+
+        let with_uid = serde_json::to_string(&Request::OpenFile {
+            path: "Documents/ONBOARDING.md".into(),
+            uid: Some("vol~link".into()),
+        })
+        .unwrap();
+        assert!(with_uid.contains("vol~link"));
     }
 
     #[test]

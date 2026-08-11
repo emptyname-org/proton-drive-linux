@@ -1,4 +1,4 @@
-use crate::activation::{DriveActivation, drive_activation, mounted_path};
+use crate::activation::{DriveActivation, drive_activation, mounted_path, mounted_target_rel};
 use crate::*;
 
 pub(crate) struct BrowserState {
@@ -659,21 +659,35 @@ pub(crate) fn activate_entry(ui: &Rc<Ui>, entry: &DirEntry) {
     }
 }
 
-/// Download a file's full content into the cache and hand it to the user's
-/// default application. The download-and-open path behind both a plain
-/// double-click and the context menu's "Open" (including for a video, when the
-/// user explicitly wants a local copy rather than to stream it).
+/// Hand a file to the user's default application: through the mount when it is
+/// there, otherwise downloaded into the cache first. The open path behind both
+/// a plain double-click and the context menu's "Open" (including for a video,
+/// when the user wants their default application rather than the player).
+///
+/// The mount comes first because the cache blob is a *copy* keyed by content
+/// hash — an application saving into it writes where Drive will never look, and
+/// the cache may evict it afterwards. See
+/// [`mounted_target`](crate::activation::mounted_target).
 pub(crate) fn download_and_open(ui: &Rc<Ui>, entry: &DirEntry) {
     let rel = entry_rel(ui, entry);
+    let mountpoint = ui.dirs.resolved_mountpoint(&ui.dirs.load_config());
+    if let Some(path) = mounted_target_rel(&mountpoint, &rel) {
+        open_path(&path.to_string_lossy());
+        return;
+    }
     // Ignore a repeat activation of a file already downloading, so an impatient
     // double-click doesn't kick off a second round-trip.
     if !ui.opening.borrow_mut().insert(rel.clone()) {
         return;
     }
     ui.busy_begin();
+    let name = entry.name.clone();
     let rx = spawn_request(
         ui.dirs.control_socket(),
-        Request::OpenFile { path: rel.clone() },
+        Request::OpenFile {
+            path: rel.clone(),
+            uid: Some(entry.uid.clone()),
+        },
     );
     let ui = ui.clone();
     glib::spawn_future_local(async move {
@@ -681,7 +695,9 @@ pub(crate) fn download_and_open(ui: &Rc<Ui>, entry: &DirEntry) {
         ui.busy_end();
         ui.opening.borrow_mut().remove(&rel);
         match result {
-            Ok(Ok(Response::FilePath { path })) => open_path(&path),
+            // A cache blob is named by content hash: match the open rules
+            // against the Drive name the user clicked, not that path.
+            Ok(Ok(Response::FilePath { path })) => open_named_path(&path, &name),
             Ok(Ok(Response::Error { message, kind })) => {
                 toast_failure(&ui, "Couldn't open file", &message, kind)
             }

@@ -332,15 +332,20 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
                 }
             }
         }
-        Ok(CtlRequest::OpenFile { path }) => match rel_to_mount(mountpoint, &path) {
-            Ok(rel) => match core.open_file(&rel) {
+        // A uid addresses the node wherever it lives; the path only works for
+        // the primary mount's tree. Prefer the uid when the client sent one.
+        Ok(CtlRequest::OpenFile { path, uid }) => {
+            let opened = match uid.as_deref() {
+                Some(uid) => core.open_file_uid(uid),
+                None => rel_to_mount(mountpoint, &path).and_then(|rel| core.open_file(&rel)),
+            };
+            match opened {
                 Ok(p) => CtlResponse::FilePath {
                     path: p.display().to_string(),
                 },
                 Err(e) => CtlResponse::error(e),
-            },
-            Err(e) => CtlResponse::error(e),
-        },
+            }
+        }
         Ok(CtlRequest::Search { query, limit }) => match core.search(&query, limit) {
             Ok(hits) => CtlResponse::SearchResults { hits },
             Err(e) => CtlResponse::error(e),

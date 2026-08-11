@@ -134,9 +134,7 @@ fn poll_state(socket: &Path, default_mountpoint: &Path) -> DriveState {
 }
 
 fn open_folder(mountpoint: &Path) {
-    if let Err(e) = Command::new("xdg-open").arg(mountpoint).spawn() {
-        tracing::error!("failed to xdg-open {}: {e}", mountpoint.display());
-    }
+    pdfs_core::opener::open_default(mountpoint, true);
 }
 
 /// Launch (or, since it's `SingleMainWindow`, raise) the settings/management

@@ -388,12 +388,15 @@ fn open_shared_file(ui: &Rc<Ui>, uid: &str, name: &str) {
     );
     let ui = ui.clone();
     let uid = uid.to_string();
+    let name = name.to_string();
     glib::spawn_future_local(async move {
         let result = rx.recv().await;
         ui.busy_end();
         ui.opening.borrow_mut().remove(&uid);
         match result {
-            Ok(Ok(Response::FilePath { path })) => open_path(&path),
+            // A cache blob is named by content hash, so the open rules key off
+            // the shared node's name instead.
+            Ok(Ok(Response::FilePath { path })) => open_named_path(&path, &name),
             Ok(Ok(Response::Error { message, kind })) => {
                 toast_failure(&ui, "Couldn't open file", &message, kind)
             }

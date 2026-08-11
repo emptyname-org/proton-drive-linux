@@ -6,6 +6,8 @@ use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
+use crate::menu::PromptConfig;
+use crate::opener::OpenWith;
 use crate::syncignore::DEFAULT_IGNORE_PATTERNS;
 
 /// Proton requires `external-drive-{name}@{semver}-{channel}` (channel ∈
@@ -106,6 +108,17 @@ pub struct AppConfig {
     /// the field, and overridable at runtime via [`CONFLICT_SWEEP_ENV`].
     #[serde(default)]
     pub conflict_sweep: Option<SweepMode>,
+    /// How files opened from the prompt/browser are launched. `None` means
+    /// "hand everything to `xdg-open`", which is what the client did before
+    /// this existed. See [`crate::opener`]. Defaulted for configs predating the
+    /// field.
+    #[serde(default)]
+    pub open_with: Option<OpenWith>,
+    /// `pdfs-prompt` behaviour, including the external launcher used by
+    /// `--dmenu`. See [`crate::menu`]. Defaulted for configs predating the
+    /// field.
+    #[serde(default)]
+    pub prompt: Option<PromptConfig>,
 }
 
 impl Default for AppConfig {
@@ -118,6 +131,8 @@ impl Default for AppConfig {
             ignore_patterns: None,
             device_uid: None,
             conflict_sweep: None,
+            open_with: None,
+            prompt: None,
         }
     }
 }
@@ -127,6 +142,18 @@ impl AppConfig {
     /// [`DEFAULT_CACHE_BUDGET_BYTES`] when unset.
     pub fn resolved_cache_budget(&self) -> u64 {
         self.cache_budget.unwrap_or(DEFAULT_CACHE_BUDGET_BYTES)
+    }
+
+    /// The effective opener policy: the user's rules, or the all-`xdg-open`
+    /// default. Cloned rather than borrowed because callers hold it for the
+    /// life of a window, long after the config value is gone.
+    pub fn resolved_open_with(&self) -> OpenWith {
+        self.open_with.clone().unwrap_or_default()
+    }
+
+    /// The effective prompt settings, defaulted when the section is absent.
+    pub fn resolved_prompt(&self) -> PromptConfig {
+        self.prompt.clone().unwrap_or_default()
     }
 
     /// The effective conflict-sweep mode: the [`CONFLICT_SWEEP_ENV`] override if
@@ -448,6 +475,8 @@ mod tests {
             ignore_patterns: Some(vec!["build/".to_string()]),
             device_uid: Some("dev-uid".to_string()),
             conflict_sweep: Some(SweepMode::Enforce),
+            open_with: None,
+            prompt: None,
         };
         let json = serde_json::to_string(&config).unwrap();
         let decoded: AppConfig = serde_json::from_str(&json).unwrap();
