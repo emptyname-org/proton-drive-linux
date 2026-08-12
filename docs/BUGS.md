@@ -12,6 +12,119 @@ Conventions:
 
 ---
 
+## B82 — A `parent_uid` cycle hangs the daemon on any short search
+
+**Status:** Fixed (unverified) 2026-08-12 — unit-tested, not driven against a
+real corrupted database (nobody has one).
+**Found:** 2026-08-12, writing a test for B80. The test built a two-node cycle
+and called `search`; `cargo test -p pdfs-core` then sat at
+`search_excludes_a_parent_cycle` for 29 minutes with **zero CPU** before it was
+killed. Two earlier runs had already been abandoned to the same stall without
+the cause being understood — it looks exactly like a cargo lock contention
+problem, which is what it was first blamed on.
+**Where:** `path_of` (`crates/pdfs-core/src/db/utils.rs`), `upsert_node_tx`'s
+`descendants` CTE (`db/nodes.rs`).
+
+**Root cause.** Both walks are recursive CTEs using `UNION ALL`, which does not
+deduplicate, so `a.parent = b, b.parent = a` never terminates. The index side
+was never exposed — `node_is_indexable_tx` rejects a cycle — but a query shorter
+than `TRIGRAM_MIN` (3 chars) takes the `LIKE` lane, and **that lane reads
+`nodes` directly and never consults the index**. Every row it returns is then
+handed to `path_of`. So typing two characters into the prompt was enough, and
+the spin happens while holding the daemon's only SQLite connection: the mount,
+the drain, and every control request stop with it.
+
+The API is what would produce such a cycle (a rename/move race, a malformed
+event), so this is not a "corrupt your own DB" scenario only.
+
+**Fix.** `path_of` is depth-capped at 256 and returns the truncated path rather
+than hanging; `path_relative_to` already carried a 1024 cap, which is the
+precedent. The `descendants` CTE in `upsert_node_tx` got the same guard for the
+write side. Cycles also stay out of the index (see B80).
+
+**Still open:** `pin_is_pinned`'s ancestor walk (`db/pins.rs`) has the same
+shape and no guard. Not reached from search, so it was left alone.
+
+## B81 — Prompt labels every Drive hit "My files", including device folders
+
+**Status:** Fixed (unverified) 2026-08-12 — needs a GUI/dmenu run.
+**Found:** 2026-08-12, reading the prompt while fixing B80: with B80 fixed, a
+device-folder hit would render as `My files / Downloads`, a folder that does not
+exist under the primary mount, while activating the same row opens
+`~/Downloads/…`. Label and action disagreed.
+**Where:** `Hit::location()` (`crates/pdfs-gui/src/prompt.rs`), shared by the
+GTK prompt and the dmenu front-end.
+
+The label was built from `SearchHit::path` with a hardcoded `My files /` prefix.
+The daemon already resolves a device/sync-folder hit to a real local path in
+`mounted_path` (`Core::mounted_search_path`), which is also what activation
+uses; the label now derives from that when it is set, and falls back to
+`My files` only for the primary mount.
+
+**Second defect, same area.** Pin rows set `is_dir` from `Pin::recursive`
+(`prompt.rs`, `dmenu.rs`). That flag is pin *policy* — whether the subtree is
+kept on disk — not node kind, so a folder pinned non-recursively drew a file
+icon and sent an invalid `OpenFile`. `Pin` now carries an `is_dir: Option<bool>`
+resolved from the `nodes` row by `pin_list`, serde-defaulted so an older daemon
+(which omits it) still parses; front-ends fall back to `recursive` only when the
+node is not cached.
+
+## B80 — 29% of the account is absent from the search index
+
+**Status:** Fixed (unverified) 2026-08-12 — migration replayed against a
+read-only copy of the live DB; not yet run by the daemon itself.
+**Found:** 2026-08-12, auditing `cache.db` after a user report that search felt
+unreliable. `pdfs search tickets` returned only the My Files folder
+`Documents/Tickets`, never the `tickets.pdf` sitting in the device folder
+`Downloads`. Counting the tables explained it:
+
+```
+nodes                     9252
+nodes_fts                 6547     ← 2705 rows never indexed
+nodes in orphan subtrees  2705     ← exactly the missing set
+```
+
+**Where:** `node_is_indexable_tx` (`crates/pdfs-core/src/db/nodes.rs`).
+
+**Root cause — the same one as B79.** A node was indexed only if walking
+`parent_uid` reached a row with `parent_uid IS NULL`. Exactly one row is stored
+that way (the My Files root). A device folder's root lives in `device` /
+`sync_folder` and is **never persisted as a `nodes` row**, so `Downloads`,
+`Pictures`, `Documents`, `Music` and `Videos` walk up to a parent that does not
+exist and were judged unindexable, along with everything beneath them. Stale
+`pdfs-acceptance-*` roots hit the same path.
+
+The v16 backfill did *not* share the bug — it rooted its walk at any node whose
+parent is null **or absent**. So the index was correct immediately after
+migrating and then lost each subtree the first time one of its nodes was
+rewritten. That divergence between backfill and write path is why this survived:
+a fresh install looks fine.
+
+**Fix.** Indexability now requires only that the walk terminates with nothing
+trashed on the way; a cycle is still rejected explicitly (B82). `MIGRATION_V21`
+(`SCHEMA_VERSION` → 21) rebuilds `nodes_fts` so existing installs recover
+without waiting for each node to be rewritten, and fixes two gaps in the v16
+walk it replays: descendants of a trashed folder stay out, and the walk is
+depth-capped.
+
+Replayed against a `.backup` of the live DB: **9276 non-trashed nodes → 9276
+indexed** (from 6547), 300 rows under `Downloads`, `tickets.pdf` at
+`Downloads/tickets.pdf`.
+
+**Watch for.** That path is the second thing this uncovered: the backfill first
+seeded an uncached-parent root with an empty path, so the migration indexed
+`tickets.pdf` while a later upsert indexed `Downloads/tickets.pdf` — the same
+node with two paths depending on which code wrote it. Any future rebuild of this
+index has to match `path_of`, not invent its own root rule.
+
+**Related, not a defect.** The local half of the prompt indexes 110,187 files,
+63,399 of them (58%) the Go module cache. Candidates are capped at 1000 and
+scored *after* SQLite, so for a common term the pool filled with vendored files
+before a real one was considered — for "test", 367 of the 500 best-ranked
+candidates came from `go/pkg/mod`. `SKIP_DIRS` gained `dist`/`build`, a new
+`SKIP_PATH_SUFFIXES` covers `go/pkg/mod`, and both candidate functions gained a
+whole-query prefix lane ahead of the existing single-character one.
+
 ## B79 — Every write in an on-demand device-folder mount fails EACCES
 
 **Status:** Fixed (verified live 2026-07-31, running in a locally rebuilt 1.2.1

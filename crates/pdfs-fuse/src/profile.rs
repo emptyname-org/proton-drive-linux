@@ -149,10 +149,10 @@ impl Core {
             .pin_list()
             .map_err(|e| CoreError::internal(format!("db: {e:?}")))?
             .into_iter()
-            .map(|(uid, path, recursive)| ProfilePin {
-                uid,
-                path,
-                recursive,
+            .map(|row| ProfilePin {
+                uid: row.uid,
+                path: row.path,
+                recursive: row.recursive,
             })
             .collect();
         let cfg = pdfs_core::config::AppDirs::new()

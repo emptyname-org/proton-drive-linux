@@ -989,6 +989,62 @@ fn search_excludes_trashed_and_respects_limit() {
     assert_eq!(db.search("alph", 1).unwrap().len(), 1);
 }
 
+/// A device folder's root is stored in `device`/`sync_folder`, never in
+/// `nodes`, so its children's `parent_uid` points at a row that does not exist.
+/// Requiring the ancestor walk to reach a `parent_uid IS NULL` row therefore
+/// excluded every device-folder subtree from search: 2,705 of 9,252 nodes on
+/// the account this was found on, including everything under `~/Downloads`.
+#[test]
+fn search_finds_nodes_below_an_uncached_parent() {
+    let db = Db::open_in_memory().unwrap();
+    // "device-root" is deliberately never upserted.
+    db.upsert_node(&folder("downloads", Some("device-root"), "Downloads"))
+        .unwrap();
+    db.upsert_node(&file("t", "downloads", "tickets.pdf", 1))
+        .unwrap();
+
+    let hits = db.search("tickets", 10).unwrap();
+    assert_eq!(hits.len(), 1, "a device folder's files must be searchable");
+    assert_eq!(hits[0].path, "Downloads/tickets.pdf");
+}
+
+/// The relaxed rule must not also start indexing trash: a node whose *parent*
+/// is trashed stays out even though the walk now terminates happily.
+#[test]
+fn search_excludes_a_node_under_a_trashed_ancestor() {
+    let db = Db::open_in_memory().unwrap();
+    db.upsert_node(&folder("root", None, "My Files")).unwrap();
+    let mut folder_gone = folder("boxed", Some("root"), "Boxed");
+    folder_gone.trashed = true;
+    db.upsert_node(&folder_gone).unwrap();
+    db.upsert_node(&file("f1", "boxed", "buried.txt", 1))
+        .unwrap();
+
+    assert!(db.search("buried", 10).unwrap().is_empty());
+}
+
+/// A parent cycle is corrupt data the API can still hand us. It must stay out
+/// of the index, and — because the short-query `LIKE` lane reads `nodes`
+/// directly and never consults the index — resolving one's path must terminate
+/// rather than spin inside the daemon's only SQLite connection.
+#[test]
+fn a_parent_cycle_is_unindexed_and_never_hangs_a_search() {
+    let db = Db::open_in_memory().unwrap();
+    db.upsert_node(&folder("a", Some("b"), "Alphaville"))
+        .unwrap();
+    db.upsert_node(&folder("b", Some("a"), "Betamax")).unwrap();
+
+    // Index lane: the cycle is not indexed, so it cannot be found.
+    assert!(db.search("alphaville", 10).unwrap().is_empty());
+    assert!(db.search("betamax", 10).unwrap().is_empty());
+
+    // LIKE lane (below the trigram minimum): the rows are reachable, and what
+    // matters is that resolving their paths returns at all.
+    let hits = db.search("al", 10).unwrap();
+    assert_eq!(hits.len(), 1);
+    assert!(hits[0].path.ends_with("Alphaville"));
+}
+
 #[test]
 fn search_short_query_like_fallback() {
     let db = Db::open_in_memory().unwrap();
@@ -2472,14 +2528,41 @@ fn pin_add_list_remove_roundtrip() {
     db.pin_add("vol~d", "docs", true).unwrap();
     let list = db.pin_list().unwrap();
     assert_eq!(list.len(), 2);
-    assert_eq!(list[0], ("vol~a".into(), "docs/a.txt".into(), false));
-    assert_eq!(list[1], ("vol~d".into(), "docs".into(), true));
+    // No `nodes` row for either pin, so the kind is unknown rather than guessed
+    // from the recursive flag.
+    assert_eq!(
+        list[0],
+        PinRow {
+            uid: "vol~a".into(),
+            path: "docs/a.txt".into(),
+            recursive: false,
+            is_dir: None,
+        }
+    );
+    assert_eq!(
+        list[1],
+        PinRow {
+            uid: "vol~d".into(),
+            path: "docs".into(),
+            recursive: true,
+            is_dir: None,
+        }
+    );
+
+    // Once the node is cached, the pin reports the real kind — a folder pinned
+    // non-recursively must not look like a file.
+    db.upsert_node(&folder("root", None, "My Files")).unwrap();
+    db.upsert_node(&folder("d", Some("root"), "docs")).unwrap();
+    db.pin_add("vol~d", "docs", false).unwrap();
+    let list = db.pin_list().unwrap();
+    assert!(!list[1].recursive, "pin policy stays non-recursive");
+    assert_eq!(list[1].is_dir, Some(true), "but the node is still a folder");
 
     // Re-pin refreshes path/flag, not a duplicate row.
     db.pin_add("vol~a", "moved/a.txt", false).unwrap();
     let list = db.pin_list().unwrap();
     assert_eq!(list.len(), 2);
-    assert_eq!(list[0].1, "moved/a.txt");
+    assert_eq!(list[0].path, "moved/a.txt");
 
     assert!(db.pin_remove("vol~a").unwrap());
     assert!(!db.pin_remove("vol~a").unwrap());

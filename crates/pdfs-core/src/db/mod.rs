@@ -50,6 +50,7 @@ pub use ops::{
     PendingCounts, PendingOp, RenameMeta, op_supersedes,
 };
 pub use photos::{StoredPhoto, THUMB_HAVE, THUMB_NONE, THUMB_UNKNOWN, TimelineRow};
+pub use pins::PinRow;
 pub use sync::{StoredSyncEntry, StoredSyncFolder};
 pub use trash::StoredTrash;
 

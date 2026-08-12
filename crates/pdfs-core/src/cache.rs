@@ -102,6 +102,16 @@ pub struct Pin {
     /// file. Defaulted so a legacy `pins.json` (file pins only) still parses.
     #[serde(default)]
     pub recursive: bool,
+    /// Whether the pinned node is a folder, when the node cache knows.
+    ///
+    /// `recursive` is pin *policy*, not node kind: a folder pinned
+    /// non-recursively has `recursive: false`, and a front-end reading it as
+    /// "this is a file" draws a file icon and sends an invalid `OpenFile`. This
+    /// is resolved from the `nodes` row at list time, so it is `None` for a pin
+    /// whose node is not cached — and absent from an older daemon's reply,
+    /// which is why it is defaulted.
+    #[serde(default)]
+    pub is_dir: Option<bool>,
 }
 
 /// The legacy JSON pin registry, kept only to import a pre-P5 `pins.json` into
@@ -1348,10 +1358,11 @@ impl ContentCache {
             .pin_list()
             .unwrap_or_default()
             .into_iter()
-            .map(|(uid, path, recursive)| Pin {
-                uid,
-                path,
-                recursive,
+            .map(|row| Pin {
+                uid: row.uid,
+                path: row.path,
+                recursive: row.recursive,
+                is_dir: row.is_dir,
             })
             .collect()
     }

@@ -130,7 +130,7 @@ fn pins(socket: &Path) -> Result<Vec<Hit>, String> {
             Hit::Drive(SearchHit {
                 name: file_name(&pin.path),
                 path: pin.path,
-                is_dir: pin.recursive,
+                is_dir: pin.is_dir.unwrap_or(pin.recursive),
                 size: 0,
                 modified: 0,
                 pinned: true,

@@ -5252,14 +5252,17 @@ mod tests {
         );
         descendant.parent_uid = Some(shared_with_me_uid());
         state.db.upsert_node(&descendant).unwrap();
-        assert!(
-            state
-                .db
-                .search("AtomicRollbackFindable", 10)
-                .unwrap()
-                .is_empty(),
-            "a descendant with no synthetic ancestor starts outside FTS"
-        );
+        // A node whose parent row is not cached — the synthetic root is not one
+        // until this publication commits — is indexed under the path it can
+        // actually be resolved to, which is its bare name. Publication reindexes
+        // the subtree beneath the synthetic ancestor, so that path is what the
+        // rollback has to restore.
+        let path_before = {
+            let hits = state.db.search("AtomicRollbackFindable", 10).unwrap();
+            assert_eq!(hits.len(), 1, "the descendant starts out searchable");
+            hits[0].path.clone()
+        };
+        assert_eq!(path_before, "AtomicRollbackFindable");
 
         // The pin is the transaction's final statement. Failing it proves the
         // earlier access, node, and descendant FTS work rolls back with it.
@@ -5321,13 +5324,12 @@ mod tests {
                 .is_none()
         );
         assert_eq!(state.db.share_access(&shared_with_me_uid()).unwrap(), None);
-        assert!(
-            state
-                .db
-                .search("AtomicRollbackFindable", 10)
-                .unwrap()
-                .is_empty(),
-            "descendant FTS visibility must roll back with the failed pin"
+        let hits = state.db.search("AtomicRollbackFindable", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(
+            hits[0].path, path_before,
+            "the descendant's indexed path must roll back with the failed pin, \
+             not keep the synthetic ancestor the publication tried to add"
         );
     }
 

@@ -182,16 +182,36 @@ impl Db {
         if !terms.is_empty()
             && let Some(first) = query.chars().next()
         {
-            let prefix = format!("{}%", like_escape(&first.to_string()));
-            let mut stmt = conn.prepare(
-                "SELECT path, name, is_dir, size, mtime FROM local_files
-                 WHERE name COLLATE NOCASE LIKE ?1 ESCAPE '\\'
-                 ORDER BY name COLLATE NOCASE LIMIT ?2",
-            )?;
-            let fallback = stmt
-                .query_map(params![prefix, lane_limit as i64], local_hit)?
-                .collect::<std::result::Result<Vec<_>, _>>()?;
-            for hit in fallback {
+            // Trigram rank says nothing about how well a name *starts* with the
+            // query, so on a home directory full of dependency trees the pool
+            // fills with vendored files before the obvious answer is reached
+            // (measured: 73% of the 500 best-ranked candidates for "test" came
+            // from one Go module cache). Give whole-query prefix matches their
+            // own lane, newest first, and keep the single-character lane —
+            // which recovers a typo that destroyed every trigram — behind it.
+            let mut lanes = vec![(
+                format!("{}%", like_escape(query)),
+                "ORDER BY mtime DESC LIMIT ?2",
+            )];
+            lanes.push((
+                format!("{}%", like_escape(&first.to_string())),
+                "ORDER BY name COLLATE NOCASE LIMIT ?2",
+            ));
+            let mut extra = Vec::new();
+            for (pattern, order) in lanes {
+                let mut stmt = conn.prepare(&format!(
+                    "SELECT path, name, is_dir, size, mtime FROM local_files
+                     WHERE name COLLATE NOCASE LIKE ?1 ESCAPE '\\' {order}"
+                ))?;
+                extra.extend(
+                    stmt.query_map(params![pattern, lane_limit as i64], local_hit)?
+                        .collect::<std::result::Result<Vec<_>, _>>()?,
+                );
+            }
+            // Prefix hits go in front: `rows` is truncated to `limit` below, and
+            // the lane exists precisely because trigram rank was burying them.
+            let trigram = std::mem::take(&mut rows);
+            for hit in extra.into_iter().chain(trigram) {
                 if !rows.iter().any(|existing| existing.path == hit.path) {
                     rows.push(hit);
                 }

@@ -31,19 +31,32 @@ pub(super) fn like_escape(s: &str) -> String {
         .replace('_', "\\_")
 }
 
+/// How deep the parent walk may go before it gives up. Real Drive trees are
+/// nowhere near this; a parent *cycle* is unbounded, and this query is on the
+/// path of every search result, including the `LIKE` lane that reads `nodes`
+/// directly and so never passed through the index's cycle check.
+const MAX_PATH_DEPTH: usize = 256;
+
 /// Resolve a node's mountpoint-relative path by walking `parent_uid` to the
 /// root via a recursive CTE. The root (the node with no parent) is excluded, so
 /// a top-level file `report.pdf` yields `"report.pdf"`, not `"My Files/report.pdf"`.
+///
+/// A cycle in `parent_uid` is corrupt data the API can still hand us, and
+/// `UNION ALL` over one never terminates — the walk is therefore depth-capped
+/// and returns the truncated path rather than hanging the caller. That caller is
+/// usually a search serving a keystroke, holding the daemon's only SQLite
+/// connection.
 pub(super) fn path_of(conn: &Connection, uid: &str) -> Result<String> {
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare(&format!(
         "WITH RECURSIVE anc(uid, parent_uid, name, depth) AS (
            SELECT uid, parent_uid, name, 0 FROM nodes WHERE uid = ?1
            UNION ALL
            SELECT n.uid, n.parent_uid, n.name, anc.depth + 1
            FROM nodes n JOIN anc ON n.uid = anc.parent_uid
+           WHERE anc.depth < {MAX_PATH_DEPTH}
          )
-         SELECT name, parent_uid FROM anc ORDER BY depth DESC",
-    )?;
+         SELECT name, parent_uid FROM anc ORDER BY depth DESC"
+    ))?;
     let rows = stmt.query_map(params![uid], |r| {
         Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
     })?;

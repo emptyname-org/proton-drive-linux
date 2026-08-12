@@ -147,29 +147,26 @@ impl Hit {
     }
 
     /// The dimmed second line: the containing folder, as the user thinks of it.
+    ///
+    /// A Drive hit is only "My files" when it really sits in the primary mount.
+    /// A node inside a device folder resolves to a path on this machine
+    /// (`~/Downloads/…`) — the daemon has already worked that out in
+    /// `mounted_path`, and saying "My files / Downloads" for it names a folder
+    /// the user cannot find and does not match where activating the row opens.
     fn location(&self) -> String {
         match self {
-            Hit::Drive(h) => {
-                let parent = parent_of(&h.path);
-                if parent.is_empty() {
-                    "My files".to_string()
-                } else {
-                    format!("My files / {}", parent.replace('/', " / "))
+            Hit::Drive(h) => match h.mounted_path.as_deref() {
+                Some(mounted) => home_relative(&parent_of(mounted)),
+                None => {
+                    let parent = parent_of(&h.path);
+                    if parent.is_empty() {
+                        "My files".to_string()
+                    } else {
+                        format!("My files / {}", parent.replace('/', " / "))
+                    }
                 }
-            }
-            Hit::Local(h) => {
-                let parent = parent_of(&h.path);
-                match dirs_home().and_then(|home| {
-                    Path::new(&parent)
-                        .strip_prefix(&home)
-                        .ok()
-                        .map(|rel| rel.display().to_string())
-                }) {
-                    Some(rel) if rel.is_empty() => "Home".to_string(),
-                    Some(rel) => format!("Home / {}", rel.replace('/', " / ")),
-                    None => parent,
-                }
-            }
+            },
+            Hit::Local(h) => home_relative(&parent_of(&h.path)),
         }
     }
 
@@ -869,7 +866,7 @@ impl Ui {
                     .map(|pin| SearchHit {
                         name: file_name(&pin.path),
                         path: pin.path,
-                        is_dir: pin.recursive,
+                        is_dir: pin.is_dir.unwrap_or(pin.recursive),
                         size: 0,
                         modified: 0,
                         pinned: true,
@@ -1356,6 +1353,21 @@ fn file_name(path: &str) -> String {
         .and_then(|n| n.to_str())
         .unwrap_or(path)
         .to_string()
+}
+
+/// An absolute directory path as "Home / …", falling back to the path itself
+/// for anything outside the home directory.
+fn home_relative(parent: &str) -> String {
+    match dirs_home().and_then(|home| {
+        Path::new(parent)
+            .strip_prefix(&home)
+            .ok()
+            .map(|rel| rel.display().to_string())
+    }) {
+        Some(rel) if rel.is_empty() => "Home".to_string(),
+        Some(rel) => format!("Home / {}", rel.replace('/', " / ")),
+        None => parent.to_string(),
+    }
 }
 
 fn parent_of(path: &str) -> String {

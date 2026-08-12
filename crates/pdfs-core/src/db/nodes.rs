@@ -403,22 +403,30 @@ impl Db {
             )?;
             collect_pairs(stmt.query_map(params![expression, lane_limit as i64], pair)?)?
         };
-        // A short substitution can destroy every trigram (`vedio` vs `video`).
-        // Feed the scorer an additional indexed same-initial lane so it can
-        // recover those candidates without scanning the full node table.
+        // Trigram rank does not know that a name *starts* with the query, and a
+        // short substitution can destroy every trigram outright (`vedio` vs
+        // `video`). Two indexed lanes cover both without scanning the node
+        // table: whole-query prefix first, then same-initial.
         if !terms.is_empty()
             && let Some(first) = query.chars().next()
         {
-            let prefix = format!("{}%", like_escape(&first.to_string()));
             let mut stmt = conn.prepare(
                 "SELECT node_json, uid FROM nodes
                  WHERE name COLLATE NOCASE LIKE ?1 ESCAPE '\\'
                    AND trashed = 0 AND node_json IS NOT NULL
                  ORDER BY name COLLATE NOCASE LIMIT ?2",
             )?;
-            let fallback =
-                collect_pairs(stmt.query_map(params![prefix, lane_limit as i64], pair)?)?;
-            for row in fallback {
+            let mut extra = Vec::new();
+            for pattern in [
+                format!("{}%", like_escape(query)),
+                format!("{}%", like_escape(&first.to_string())),
+            ] {
+                extra.extend(collect_pairs(
+                    stmt.query_map(params![pattern, lane_limit as i64], pair)?,
+                )?);
+            }
+            let trigram = std::mem::take(&mut rows);
+            for row in extra.into_iter().chain(trigram) {
                 if !rows.iter().any(|(_, uid)| uid == &row.1) {
                     rows.push(row);
                 }
@@ -556,12 +564,18 @@ fn upsert_node_tx(tx: &Transaction<'_>, node: &Node) -> Result<()> {
     )?;
     let mut affected = vec![rowid];
     if node.is_folder() {
+        // The depth cap is a liveness guard, not a policy: `UNION ALL` over a
+        // parent cycle (a's parent is b, b's parent is a — corrupt data, but the
+        // API can hand it to us) never terminates, and this runs inside the
+        // write transaction that holds the daemon's only SQLite connection.
+        // Real Drive trees are nowhere near this deep.
         let mut stmt = tx.prepare(
-            "WITH RECURSIVE descendants(rowid, uid) AS (
-               SELECT rowid, uid FROM nodes WHERE parent_uid = ?1
+            "WITH RECURSIVE descendants(rowid, uid, depth) AS (
+               SELECT rowid, uid, 0 FROM nodes WHERE parent_uid = ?1
                UNION ALL
-               SELECT n.rowid, n.uid FROM nodes n
+               SELECT n.rowid, n.uid, d.depth + 1 FROM nodes n
                  JOIN descendants d ON n.parent_uid = d.uid
+                WHERE d.depth < 256
              ) SELECT rowid FROM descendants",
         )?;
         for descendant in stmt.query_map(params![uid], |row| row.get(0))? {
@@ -603,13 +617,27 @@ fn direct_child_uids_tx(tx: &Transaction<'_>, parent: &str) -> Result<Vec<String
     Ok(uids)
 }
 
+/// Whether a node belongs in the search index: it exists, and nothing on the
+/// way up to the top of its cached chain is trashed.
+///
+/// The chain does *not* have to reach a `parent_uid IS NULL` row. Only the My
+/// Files root is stored that way; a device folder's root lives in `device` /
+/// `sync_folder` and never gets a `nodes` row, so requiring a null-parent
+/// ancestor silently excluded every device-folder subtree from search — 29% of
+/// the nodes on the account this was found on. A subtree whose topmost cached
+/// row has an uncached parent is ordinary, reachable data.
+///
+/// What is still excluded is a *cycle*: the walk's own guard stops it, but
+/// [`path_of`] has no such guard, so an indexed cycle would hang a search. A
+/// clean chain ends at a row whose parent is null or simply not cached; a cycle
+/// ends at one whose parent is a row we have already visited.
 fn node_is_indexable_tx(tx: &Transaction<'_>, uid: &str) -> Result<bool> {
     let indexable: i64 = tx.query_row(
-        "WITH RECURSIVE ancestors(uid, parent_uid, trashed, path) AS (
-           SELECT uid, parent_uid, trashed, char(31) || uid || char(31)
+        "WITH RECURSIVE ancestors(uid, parent_uid, trashed, depth, path) AS (
+           SELECT uid, parent_uid, trashed, 0, char(31) || uid || char(31)
              FROM nodes WHERE uid = ?1
            UNION ALL
-           SELECT n.uid, n.parent_uid, n.trashed,
+           SELECT n.uid, n.parent_uid, n.trashed, a.depth + 1,
                   a.path || n.uid || char(31)
              FROM ancestors a JOIN nodes n ON n.uid = a.parent_uid
             WHERE instr(a.path, char(31) || n.uid || char(31)) = 0
@@ -617,7 +645,12 @@ fn node_is_indexable_tx(tx: &Transaction<'_>, uid: &str) -> Result<bool> {
          SELECT CASE
            WHEN COUNT(*) = 0 THEN 0
            WHEN MAX(trashed) != 0 THEN 0
-           WHEN MAX(CASE WHEN parent_uid IS NULL THEN 1 ELSE 0 END) = 0 THEN 0
+           WHEN EXISTS (
+             SELECT 1 FROM ancestors a
+              WHERE a.depth = (SELECT MAX(depth) FROM ancestors)
+                AND a.parent_uid IS NOT NULL
+                AND EXISTS (SELECT 1 FROM nodes p WHERE p.uid = a.parent_uid)
+           ) THEN 0
            ELSE 1
          END
          FROM ancestors",

@@ -26,9 +26,19 @@ const SKIP_DIRS: &[&str] = &[
     "venv",
     ".venv",
     "vendor",
+    "dist",
     "dist-newstyle",
+    "build",
     "Trash",
 ];
+
+/// Directory *paths* skipped when they end with one of these, for caches whose
+/// own name is too generic to blacklist (`mod`). The Go module cache was 63,399
+/// of the 110,187 entries indexed on the machine this was measured on — 58% of
+/// the index, crowding real files out of the bounded candidate pool the fuzzy
+/// scorer draws from. The other big dependency caches (`.cargo`, `.rustup`,
+/// `.gradle`, `.m2`) are already skipped by the hidden-file filter.
+const SKIP_PATH_SUFFIXES: &[&str] = &["go/pkg/mod"];
 
 /// Hard cap on indexed entries, so a pathological home directory cannot grow the
 /// database without bound. Reaching it stops the walk early.
@@ -90,7 +100,10 @@ pub fn scan(
             if excludes.iter().any(|e| path.starts_with(e)) {
                 return false;
             }
-            !matches!(entry.file_name().to_str(), Some(name) if SKIP_DIRS.contains(&name))
+            if matches!(entry.file_name().to_str(), Some(name) if SKIP_DIRS.contains(&name)) {
+                return false;
+            }
+            !is_skipped_path(path)
         });
 
     let state = parking_lot::Mutex::new(SinkState {
@@ -148,6 +161,17 @@ impl<F: FnMut(Vec<LocalEntry>)> SinkState<F> {
             (self.sink)(batch);
         }
     }
+}
+
+/// Whether `path` is (or is inside) one of the [`SKIP_PATH_SUFFIXES`] caches.
+/// Matched on the path's own components so a directory merely *named* `mod`
+/// keeps being indexed.
+fn is_skipped_path(path: &Path) -> bool {
+    let path = path.to_string_lossy();
+    SKIP_PATH_SUFFIXES.iter().any(|suffix| {
+        path.strip_suffix(suffix)
+            .is_some_and(|head| head.is_empty() || head.ends_with('/'))
+    })
 }
 
 /// Convert a walker entry into a [`LocalEntry`], reusing the metadata the walker
@@ -218,6 +242,29 @@ mod tests {
         assert!(!report.is_dir);
         assert_eq!(report.size, 1);
         assert!(report.path.ends_with("docs/report.pdf"));
+
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    /// The Go module cache is the single largest source of index noise on a
+    /// developer's machine (58% of the entries on the one this was measured
+    /// on), and it cannot be pruned by directory name: `mod` is far too
+    /// common a name to blacklist outright.
+    #[test]
+    fn the_go_module_cache_is_pruned_but_a_plain_mod_dir_is_not() {
+        let tmp = std::env::temp_dir().join(format!("pdfs-scan-gomod-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(tmp.join("go/pkg/mod/example.com/lib")).unwrap();
+        std::fs::create_dir_all(tmp.join("kernel/mod")).unwrap();
+        std::fs::write(tmp.join("go/pkg/mod/example.com/lib/vendored.go"), b"x").unwrap();
+        std::fs::write(tmp.join("kernel/mod/mine.conf"), b"x").unwrap();
+
+        let mut got = Vec::new();
+        scan(std::slice::from_ref(&tmp), &[], |batch| got.extend(batch));
+
+        let names: Vec<&str> = got.iter().map(|e| e.name.as_str()).collect();
+        assert!(!names.contains(&"vendored.go"), "{names:?}");
+        assert!(names.contains(&"mine.conf"), "{names:?}");
 
         std::fs::remove_dir_all(&tmp).unwrap();
     }

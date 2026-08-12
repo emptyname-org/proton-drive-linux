@@ -9,7 +9,7 @@ use super::Db;
 use crate::Result;
 
 /// Current schema version. Bump on every forward migration added below.
-pub(super) const SCHEMA_VERSION: i64 = 20;
+pub(super) const SCHEMA_VERSION: i64 = 21;
 
 impl Db {
     pub(super) fn migrate(&self) -> Result<()> {
@@ -100,6 +100,18 @@ impl Db {
         }
         if current < 20 {
             tx.execute_batch(MIGRATION_V20)?;
+        }
+        if current < 21 {
+            // A V17-and-older fixture may carry only the tables its own test
+            // cares about; there is nothing to reindex without `nodes`.
+            let has_nodes: bool = tx.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'nodes'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )? > 0;
+            if has_nodes {
+                tx.execute_batch(MIGRATION_V21)?;
+            }
         }
         tx.execute(
             "INSERT INTO sync_state (key, value) VALUES ('schema_version', ?1)
@@ -526,4 +538,48 @@ CREATE INDEX idx_album_photos_uid ON album_photos(uid);
 const MIGRATION_V20: &str = "
 ALTER TABLE photos ADD COLUMN favorite INTEGER NOT NULL DEFAULT 0;
 CREATE INDEX IF NOT EXISTS idx_photos_favorite ON photos(favorite, seq);
+";
+
+/// V21: rebuild the node search index after fixing what counts as indexable.
+///
+/// The v16 backfill rooted its path walk at any node whose parent is null *or*
+/// not cached, but the write path's `node_is_indexable_tx` demanded a
+/// null-parent ancestor. Only the My Files root has one — a device folder's
+/// root is stored in `device`/`sync_folder`, never in `nodes` — so every node
+/// under a device folder was dropped from `nodes_fts` the first time it was
+/// upserted after the backfill, and was unfindable from the prompt (2,705 of
+/// 9,252 nodes on the account this was diagnosed against).
+///
+/// The rule now matches the backfill, so this replays it: same recursive walk
+/// as v16, over the current `nodes`.
+/// Two details the v16 backfill did not carry, both cheap here: a node under a
+/// trashed folder stays out (the write path has always excluded it, and
+/// `tombstone_subtree_tx` only marks a subtree it was told about), and the walk
+/// is depth-capped so a parent cycle in a corrupted database cannot spin the
+/// migration forever.
+const MIGRATION_V21: &str = "
+DROP TABLE IF EXISTS nodes_fts;
+CREATE VIRTUAL TABLE nodes_fts USING fts5(
+  name, path, tokenize='trigram'
+);
+INSERT INTO nodes_fts (rowid, name, path)
+WITH RECURSIVE paths(rowid, uid, path, trashed, depth) AS (
+  -- Only a true root (no parent at all) contributes nothing to the path: its
+  -- name is the mount. A row whose parent is merely uncached is an ordinary
+  -- folder and keeps its name, which is what `path_of` does at runtime.
+  SELECT n.rowid, n.uid,
+         CASE WHEN n.parent_uid IS NULL THEN '' ELSE n.name END, n.trashed, 0
+    FROM nodes n
+   WHERE n.parent_uid IS NULL
+      OR NOT EXISTS (SELECT 1 FROM nodes p WHERE p.uid = n.parent_uid)
+  UNION ALL
+  SELECT n.rowid, n.uid,
+         CASE WHEN paths.path = '' THEN n.name ELSE paths.path || '/' || n.name END,
+         MAX(paths.trashed, n.trashed), paths.depth + 1
+    FROM nodes n JOIN paths ON n.parent_uid = paths.uid
+   WHERE paths.depth < 256
+)
+SELECT n.rowid, n.name, paths.path
+  FROM nodes n JOIN paths ON paths.rowid = n.rowid
+ WHERE paths.trashed = 0;
 ";

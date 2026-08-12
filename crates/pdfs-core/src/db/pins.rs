@@ -6,6 +6,18 @@ use rusqlite::{OptionalExtension, params};
 use super::Db;
 use crate::Result;
 
+/// One row of [`Db::pin_list`]. `recursive` is pin *policy* — whether the whole
+/// subtree is kept — while `is_dir` is the node's kind as the node cache knows
+/// it, or `None` for a pin whose node is not cached. Reading the former as the
+/// latter is what made a non-recursively pinned folder render as a file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PinRow {
+    pub uid: String,
+    pub path: String,
+    pub recursive: bool,
+    pub is_dir: Option<bool>,
+}
+
 impl Db {
     pub fn pin_add(&self, uid: &str, path: &str, recursive: bool) -> Result<()> {
         let conn = self.conn.lock();
@@ -25,16 +37,23 @@ impl Db {
         Ok(n > 0)
     }
 
-    /// Every directly-pinned entry `(uid, path, recursive)`, ordered by uid.
-    pub fn pin_list(&self) -> Result<Vec<(String, String, bool)>> {
+    /// Every directly-pinned entry, ordered by uid.
+    pub fn pin_list(&self) -> Result<Vec<PinRow>> {
         let conn = self.conn.lock();
-        let mut stmt = conn.prepare("SELECT uid, path, recursive FROM pins ORDER BY uid")?;
+        // `recursive` is pin policy; the node's kind comes from `nodes`, and is
+        // NULL for a pin whose node was never cached.
+        let mut stmt = conn.prepare(
+            "SELECT p.uid, p.path, p.recursive, n.is_dir
+               FROM pins p LEFT JOIN nodes n ON n.uid = p.uid
+              ORDER BY p.uid",
+        )?;
         let rows = stmt.query_map([], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, i64>(2)? != 0,
-            ))
+            Ok(PinRow {
+                uid: r.get(0)?,
+                path: r.get(1)?,
+                recursive: r.get::<_, i64>(2)? != 0,
+                is_dir: r.get::<_, Option<i64>>(3)?.map(|is_dir| is_dir != 0),
+            })
         })?;
         let mut out = Vec::new();
         for r in rows {
