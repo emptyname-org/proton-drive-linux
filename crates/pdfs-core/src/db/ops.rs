@@ -157,7 +157,7 @@ pub struct AttachedBlob {
 impl Db {
     /// Whether a specific desired-state operation is still queued for a node.
     pub fn has_pending_op(&self, uid: &str, kind: &str) -> Result<bool> {
-        let conn = self.conn.lock();
+        let conn = self.read();
         conn.query_row(
             "SELECT EXISTS(
                 SELECT 1 FROM pending_op WHERE uid = ?1 AND kind = ?2
@@ -170,7 +170,7 @@ impl Db {
 
     /// Read an existing operation's metadata before a superseding enqueue.
     pub fn pending_op_meta(&self, uid: &str, kind: &str) -> Result<Option<String>> {
-        let conn = self.conn.lock();
+        let conn = self.read();
         conn.query_row(
             "SELECT meta_json FROM pending_op WHERE uid = ?1 AND kind = ?2",
             params![uid, kind],
@@ -369,7 +369,7 @@ impl Db {
 
     /// Check if a queued create or mkdir op exists for `uid`.
     pub fn has_create_op(&self, uid: &str) -> Result<bool> {
-        let conn = self.conn.lock();
+        let conn = self.read();
         let count: i64 = conn.query_row(
             "SELECT COUNT(*) FROM pending_op WHERE uid = ?1 AND kind IN (?2, ?3)",
             params![uid, OP_CREATE, OP_MKDIR],
@@ -385,7 +385,7 @@ impl Db {
     /// bytes are still owed an upload, and dropping it would discard the staged
     /// blob that holds them (`docs/BUGS.md` B71).
     pub fn has_any_op(&self, uid: &str) -> Result<bool> {
-        let conn = self.conn.lock();
+        let conn = self.read();
         let count: i64 = conn.query_row(
             "SELECT COUNT(*) FROM pending_op WHERE uid = ?1",
             params![uid],
@@ -481,7 +481,7 @@ impl Db {
     /// sort, and no separate index to maintain. The common case (something is
     /// due) exits on the first row.
     pub fn next_due_op(&self, now: i64) -> Result<Option<PendingOp>> {
-        let conn = self.conn.lock();
+        let conn = self.read();
         let mut stmt = conn.prepare_cached(&format!(
             "SELECT id, kind, uid, parent_uid, name, blob_path, meta_json, created_at,
                     attempts, last_error, next_attempt_at
@@ -517,7 +517,7 @@ impl Db {
     /// debounced or backed-off op becomes eligible rather than waiting the full
     /// idle-poll interval.
     pub fn earliest_due_at(&self) -> Result<Option<i64>> {
-        let conn = self.conn.lock();
+        let conn = self.read();
         let ts: Option<i64> = conn
             .query_row(
                 &format!(
@@ -537,7 +537,7 @@ impl Db {
     /// Every queued op, oldest first. For status read-outs and the CLI — the
     /// drain wants [`next_due_op`](Self::next_due_op) instead.
     pub fn pending_ops(&self) -> Result<Vec<PendingOp>> {
-        let conn = self.conn.lock();
+        let conn = self.read();
         let mut stmt = conn.prepare(
             "SELECT id, kind, uid, parent_uid, name, blob_path, meta_json, created_at,
                     attempts, last_error, next_attempt_at
@@ -570,7 +570,7 @@ impl Db {
     /// mount owes the server, but it carries no bytes and reporting it as an
     /// upload is simply untrue.
     pub fn pending_op_counts(&self) -> Result<PendingCounts> {
-        let conn = self.conn.lock();
+        let conn = self.read();
         let uploads = conn.query_row(
             "SELECT COUNT(*) FROM pending_op WHERE kind IN (?1, ?2)",
             params![OP_REVISION, OP_CREATE],
@@ -659,7 +659,7 @@ impl Db {
     /// `staging/`: the difference is bytes the kernel was told were written and
     /// that nothing is going to upload.
     pub fn op_blob_paths(&self) -> Result<std::collections::HashSet<String>> {
-        let conn = self.conn.lock();
+        let conn = self.read();
         let mut stmt =
             conn.prepare("SELECT blob_path FROM pending_op WHERE blob_path IS NOT NULL")?;
         let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
@@ -700,7 +700,7 @@ impl Db {
     /// supersedes rather than forking a `(sync-conflict)` copy (docs/BUGS.md
     /// B70 layer B).
     pub fn own_sealed_rev(&self, uid: &str, now_ms: i64) -> Result<Option<String>> {
-        let conn = self.conn.lock();
+        let conn = self.read();
         Ok(conn
             .query_row(
                 "SELECT revision_id FROM own_sealed_rev

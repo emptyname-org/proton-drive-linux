@@ -2,9 +2,17 @@
 //! inode bookkeeping, full-text search, content-cache LRU tracking, and pins.
 //!
 //! Only the daemon (`pdfs-fuse`) opens this for writes; the GUI and CLI reach
-//! the same data through the control socket. The connection is wrapped in a
-//! `Mutex` because the FUSE callbacks are synchronous and already serialize
-//! behind the `State` lock, so a connection pool would be overkill.
+//! the same data through the control socket. There is one write connection
+//! behind a `Mutex` — SQLite allows exactly one writer, and the single-instance
+//! `flock` makes sure it is ours — and a small pool of read-only connections
+//! behind [`Db::read`], which every `SELECT`-only method uses.
+//!
+//! The pool is what makes WAL worth having. The original justification for a
+//! single connection was that "FUSE callbacks already serialize behind the
+//! `State` lock"; that stopped being true when reads moved onto an 11-thread
+//! worker pool, and a lookup then queued behind whatever listing happened to be
+//! committing. Under WAL a reader never blocks the writer and vice versa, so the
+//! only thing left serialising them was this process's own mutex.
 //!
 //! This module is the P0 foundation: it opens the database, enables WAL, and
 //! applies the forward-only schema migrations. Write-through of nodes, the
@@ -88,12 +96,111 @@ const WAL_AUTOCHECKPOINT_PAGES: i64 = 500;
 /// the inner `Mutex<Connection>`.
 pub struct Db {
     conn: Mutex<Connection>,
+    /// Read-only connections for `SELECT`-only methods. `None` for an in-memory
+    /// database, where a second connection would open a different, empty one —
+    /// those fall back to the write connection.
+    readers: Option<ReadPool>,
     /// The single-writer lock, held open for as long as this handle lives.
     ///
     /// Never read; dropping the `File` is what releases the `flock`, so it has
     /// to be owned here rather than by `open`'s stack frame. `None` for
     /// in-memory databases, which nothing else can reach.
     _single_writer: Option<File>,
+}
+
+/// Idle read-only connections, opened on demand and kept for reuse.
+///
+/// Not a bounded pool: the number in flight is bounded by the number of threads
+/// that can be inside a read at once (the FUSE worker lanes plus the control
+/// handlers), and blocking one of those on a permit would reintroduce exactly
+/// the queueing this exists to remove. Only the *idle* set is capped, so a burst
+/// does not leave a connection per thread parked forever.
+struct ReadPool {
+    path: PathBuf,
+    idle: Mutex<Vec<Connection>>,
+}
+
+/// How many idle read connections to keep. Enough that the steady state never
+/// reopens, small enough to be unremarkable.
+const MAX_IDLE_READERS: usize = 4;
+
+impl ReadPool {
+    fn take(&self) -> Option<Connection> {
+        if let Some(conn) = self.idle.lock().pop() {
+            return Some(conn);
+        }
+        match open_read_only(&self.path) {
+            Ok(conn) => Some(conn),
+            Err(error) => {
+                // Falling back to the write connection is correct, just slower,
+                // so this is a warning and not a failed read.
+                tracing::warn!(%error, "could not open a read-only connection");
+                None
+            }
+        }
+    }
+
+    fn put(&self, conn: Connection) {
+        let mut idle = self.idle.lock();
+        if idle.len() < MAX_IDLE_READERS {
+            idle.push(conn);
+        }
+    }
+}
+
+/// A connection to read through: one borrowed from [`ReadPool`], or the write
+/// connection when there is no pool (in-memory) or opening one failed.
+///
+/// Derefs to `Connection`, so a method converts by swapping `self.conn.lock()`
+/// for `self.read()` and nothing else.
+pub(super) struct Reader<'a> {
+    pooled: Option<Connection>,
+    writer: Option<parking_lot::MutexGuard<'a, Connection>>,
+    pool: Option<&'a ReadPool>,
+}
+
+impl std::ops::Deref for Reader<'_> {
+    type Target = Connection;
+
+    fn deref(&self) -> &Connection {
+        self.pooled
+            .as_ref()
+            .or(self.writer.as_deref())
+            .expect("a Reader always holds one of the two")
+    }
+}
+
+impl Drop for Reader<'_> {
+    fn drop(&mut self) {
+        if let (Some(conn), Some(pool)) = (self.pooled.take(), self.pool) {
+            pool.put(conn);
+        }
+    }
+}
+
+/// Open a second connection to the same file for reads only.
+///
+/// `SQLITE_OPEN_READ_ONLY` plus `query_only` is belt and braces: the flag stops
+/// a routing mistake at the file, the pragma stops it at the statement. The rest
+/// mirror [`Db::open_configured`] — a read connection has its own page cache,
+/// its own temp store and its own busy timeout, and gets nothing from the
+/// writer's.
+///
+/// `journal_mode` is deliberately absent: it is a property of the database file,
+/// which the writer already set to WAL, and a read-only connection cannot change
+/// it anyway.
+fn open_read_only(path: &Path) -> Result<Connection> {
+    use rusqlite::OpenFlags;
+    let conn = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    conn.busy_timeout(BUSY_TIMEOUT)?;
+    conn.pragma_update(None, "cache_size", -CACHE_SIZE_KIB)?;
+    conn.pragma_update(None, "temp_store", "MEMORY")?;
+    conn.pragma_update(None, "mmap_size", MMAP_SIZE)?;
+    conn.pragma_update(None, "query_only", true)?;
+    Ok(conn)
 }
 
 impl Db {
@@ -125,8 +232,37 @@ impl Db {
         };
         Ok(Self {
             conn: Mutex::new(conn),
+            // No pool for `:memory:`. A second connection to that name is a
+            // second, empty database rather than another view of this one, so
+            // every routed read would find a schema that does not exist.
+            readers: (!is_in_memory(path)).then(|| ReadPool {
+                path: path.to_path_buf(),
+                idle: Mutex::new(Vec::new()),
+            }),
             _single_writer: single_writer,
         })
+    }
+
+    /// A connection for a `SELECT`-only method.
+    ///
+    /// Reads see the last committed state, which is the same thing they saw
+    /// through the write connection: every method here commits before it
+    /// returns, and nothing holds a transaction open across calls.
+    pub(super) fn read(&self) -> Reader<'_> {
+        if let Some(pool) = &self.readers
+            && let Some(conn) = pool.take()
+        {
+            return Reader {
+                pooled: Some(conn),
+                writer: None,
+                pool: Some(pool),
+            };
+        }
+        Reader {
+            pooled: None,
+            writer: Some(self.conn.lock()),
+            pool: None,
+        }
     }
 
     /// Open the file, apply every PRAGMA, and migrate. Split out of
@@ -177,6 +313,7 @@ impl Db {
 
         let db = Self {
             conn: Mutex::new(conn),
+            readers: None,
             _single_writer: None,
         };
         db.migrate()?;
@@ -200,6 +337,7 @@ impl Db {
         conn.pragma_update(None, "foreign_keys", "ON")?;
         let db = Self {
             conn: Mutex::new(conn),
+            readers: None,
             _single_writer: None,
         };
         db.migrate()?;

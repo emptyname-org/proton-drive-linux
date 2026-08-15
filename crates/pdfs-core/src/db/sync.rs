@@ -57,7 +57,7 @@ impl Db {
 
     /// Every synced folder, oldest first.
     pub fn sync_folder_list(&self) -> Result<Vec<StoredSyncFolder>> {
-        let conn = self.conn.lock();
+        let conn = self.read();
         let mut stmt = conn.prepare(
             "SELECT id, local_path, remote_uid, remote_share_id, mode, pending_mode, state, last_sync
              FROM sync_folder ORDER BY id",
@@ -83,7 +83,7 @@ impl Db {
 
     /// Look up one synced folder by id.
     pub fn sync_folder_get(&self, id: i64) -> Result<Option<StoredSyncFolder>> {
-        let conn = self.conn.lock();
+        let conn = self.read();
         conn.query_row(
             "SELECT id, local_path, remote_uid, remote_share_id, mode, pending_mode, state, last_sync
              FROM sync_folder WHERE id = ?1",
@@ -166,7 +166,7 @@ impl Db {
 
     /// The whole per-file sync baseline for a folder, keyed by relative path.
     pub fn sync_entries(&self, folder_id: i64) -> Result<HashMap<String, StoredSyncEntry>> {
-        let conn = self.conn.lock();
+        let conn = self.read();
         let mut stmt = conn.prepare(
             "SELECT rel_path, remote_uid, local_mtime, local_size, remote_rev, remote_hash
              FROM sync_entry WHERE folder_id = ?1",
@@ -196,7 +196,7 @@ impl Db {
     /// `sync_folder` and descendants come from the last successful
     /// `sync_entry` baseline.
     pub fn mirror_contains_uid(&self, uid: &str) -> Result<bool> {
-        let conn = self.conn.lock();
+        let conn = self.read();
         conn.query_row(
             "SELECT EXISTS(
                  SELECT 1

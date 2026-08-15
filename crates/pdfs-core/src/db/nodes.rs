@@ -10,7 +10,9 @@ use crate::{Access, Result};
 use proton_drive_rs::proton_sdk::ids::{LinkId, NodeUid, VolumeId};
 use proton_drive_rs::{Node, NodeKind};
 
-use super::utils::{TRIGRAM_MIN, collect_pairs, like_escape, pair, path_of};
+use super::utils::{
+    HitRow, TRIGRAM_MIN, collect_hits, hit_row, join_path, like_escape, path_of, walk_path_of,
+};
 
 pub struct StoredNode {
     pub node: Node,
@@ -59,7 +61,7 @@ impl Db {
     /// flag. Synthetic shared listings use this to serve the last completed
     /// snapshot while offline, including after a live event expired its TTL.
     pub fn visible_children(&self, parent: &NodeUid) -> Result<Vec<Node>> {
-        let conn = self.conn.lock();
+        let conn = self.read();
         let mut stmt = conn.prepare(
             "SELECT node_json FROM nodes
               WHERE parent_uid = ?1 AND trashed = 0 AND node_json IS NOT NULL
@@ -285,13 +287,32 @@ impl Db {
     /// Check if a folder node has any non-trashed children in the database.
     pub fn has_children(&self, parent_uid: &NodeUid) -> Result<bool> {
         let uid_str = parent_uid.to_string();
-        let conn = self.conn.lock();
+        let conn = self.read();
         let count: i64 = conn.query_row(
             "SELECT COUNT(*) FROM nodes WHERE parent_uid = ?1 AND trashed = 0",
             params![uid_str],
             |row| row.get(0),
         )?;
         Ok(count > 0)
+    }
+
+    /// A node's mountpoint-relative path, or `None` when it is not cached.
+    ///
+    /// One indexed read of the stored `path`. Callers that need to relate many
+    /// nodes to a handful of roots — search decorating each hit with its
+    /// mountpoint — resolve the roots once through this and do the rest as
+    /// string arithmetic, instead of a `path_relative_to` walk per pair.
+    pub fn node_path(&self, uid: &str) -> Result<Option<String>> {
+        let conn = self.read();
+        let exists: Option<i64> = conn
+            .query_row("SELECT 1 FROM nodes WHERE uid = ?1", params![uid], |r| {
+                r.get(0)
+            })
+            .optional()?;
+        if exists.is_none() {
+            return Ok(None);
+        }
+        Ok(Some(path_of(&conn, uid)?))
     }
 
     /// Resolve `uid` relative to an ancestor node.
@@ -302,7 +323,7 @@ impl Db {
     /// chain keeps callers from accidentally joining a Drive-wide path onto the
     /// wrong mountpoint. The ancestor itself resolves to the empty path.
     pub fn path_relative_to(&self, ancestor_uid: &str, uid: &str) -> Result<Option<String>> {
-        let conn = self.conn.lock();
+        let conn = self.read();
         let mut stmt = conn.prepare(
             "WITH RECURSIVE anc(uid, parent_uid, name, depth) AS (
                SELECT uid, parent_uid, name, 0 FROM nodes WHERE uid = ?1
@@ -338,15 +359,15 @@ impl Db {
         if query.is_empty() {
             return Ok(Vec::new());
         }
-        let conn = self.conn.lock();
-        let rows: Vec<(String, String)> = if query.chars().count() < TRIGRAM_MIN {
+        let conn = self.read();
+        let rows: Vec<HitRow> = if query.chars().count() < TRIGRAM_MIN {
             let pat = format!("%{}%", like_escape(query));
             let mut stmt = conn.prepare(
-                "SELECT node_json, uid FROM nodes
+                "SELECT node_json, uid, path FROM nodes
                  WHERE name LIKE ?1 ESCAPE '\\' AND trashed = 0 AND node_json IS NOT NULL
                  ORDER BY name LIMIT ?2",
             )?;
-            collect_pairs(stmt.query_map(params![pat, limit as i64], pair)?)?
+            collect_hits(stmt.query_map(params![pat, limit as i64], hit_row)?)?
         } else {
             // Escape double quotes and quote each term, then combine with AND so
             // all terms must match but can appear in any order or position.
@@ -356,18 +377,21 @@ impl Db {
                 .collect::<Vec<_>>()
                 .join(" AND ");
             let mut stmt = conn.prepare(
-                "SELECT n.node_json, n.uid
+                "SELECT n.node_json, n.uid, n.path
                  FROM nodes_fts f JOIN nodes n ON n.rowid = f.rowid
                  WHERE f.name MATCH ?1 AND n.trashed = 0 AND n.node_json IS NOT NULL
                  ORDER BY f.rank LIMIT ?2",
             )?;
-            collect_pairs(stmt.query_map(params![phrase, limit as i64], pair)?)?
+            collect_hits(stmt.query_map(params![phrase, limit as i64], hit_row)?)?
         };
 
         let mut hits = Vec::with_capacity(rows.len());
-        for (json, uid) in rows {
+        for (json, uid, path) in rows {
             let node: Node = serde_json::from_str(&json)?;
-            let path = path_of(&conn, &uid)?;
+            let path = match path {
+                Some(path) => path,
+                None => walk_path_of(&conn, &uid)?,
+            };
             hits.push(SearchHit { node, path });
         }
         Ok(hits)
@@ -382,26 +406,26 @@ impl Db {
         if query.is_empty() || limit == 0 {
             return Ok(Vec::new());
         }
-        let conn = self.conn.lock();
+        let conn = self.read();
         let terms = candidate_trigrams(query);
         let lane_limit = limit.div_ceil(2);
-        let mut rows: Vec<(String, String)> = if terms.is_empty() {
+        let mut rows: Vec<HitRow> = if terms.is_empty() {
             let pat = format!("%{}%", like_escape(query));
             let mut stmt = conn.prepare(
-                "SELECT node_json, uid FROM nodes
+                "SELECT node_json, uid, path FROM nodes
                  WHERE name LIKE ?1 ESCAPE '\\' AND trashed = 0 AND node_json IS NOT NULL
                  ORDER BY name LIMIT ?2",
             )?;
-            collect_pairs(stmt.query_map(params![pat, limit as i64], pair)?)?
+            collect_hits(stmt.query_map(params![pat, limit as i64], hit_row)?)?
         } else {
             let expression = terms.join(" OR ");
             let mut stmt = conn.prepare(
-                "SELECT n.node_json, n.uid
+                "SELECT n.node_json, n.uid, n.path
                    FROM nodes_fts f JOIN nodes n ON n.rowid = f.rowid
                   WHERE nodes_fts MATCH ?1 AND n.trashed = 0 AND n.node_json IS NOT NULL
                   ORDER BY f.rank LIMIT ?2",
             )?;
-            collect_pairs(stmt.query_map(params![expression, lane_limit as i64], pair)?)?
+            collect_hits(stmt.query_map(params![expression, lane_limit as i64], hit_row)?)?
         };
         // Trigram rank does not know that a name *starts* with the query, and a
         // short substitution can destroy every trigram outright (`vedio` vs
@@ -411,7 +435,7 @@ impl Db {
             && let Some(first) = query.chars().next()
         {
             let mut stmt = conn.prepare(
-                "SELECT node_json, uid FROM nodes
+                "SELECT node_json, uid, path FROM nodes
                  WHERE name COLLATE NOCASE LIKE ?1 ESCAPE '\\'
                    AND trashed = 0 AND node_json IS NOT NULL
                  ORDER BY name COLLATE NOCASE LIMIT ?2",
@@ -421,23 +445,26 @@ impl Db {
                 format!("{}%", like_escape(query)),
                 format!("{}%", like_escape(&first.to_string())),
             ] {
-                extra.extend(collect_pairs(
-                    stmt.query_map(params![pattern, lane_limit as i64], pair)?,
+                extra.extend(collect_hits(
+                    stmt.query_map(params![pattern, lane_limit as i64], hit_row)?,
                 )?);
             }
             let trigram = std::mem::take(&mut rows);
             for row in extra.into_iter().chain(trigram) {
-                if !rows.iter().any(|(_, uid)| uid == &row.1) {
+                if !rows.iter().any(|(_, uid, _)| uid == &row.1) {
                     rows.push(row);
                 }
             }
             rows.truncate(limit);
         }
         rows.into_iter()
-            .map(|(json, uid)| {
+            .map(|(json, uid, path)| {
                 Ok(SearchHit {
                     node: serde_json::from_str(&json)?,
-                    path: path_of(&conn, &uid)?,
+                    path: match path {
+                        Some(path) => path,
+                        None => walk_path_of(&conn, &uid)?,
+                    },
                 })
             })
             .collect()
@@ -457,7 +484,7 @@ impl Db {
 
     /// Load every persisted node for cold-start hydration of the `State` maps.
     pub fn load_all(&self) -> Result<Vec<StoredNode>> {
-        let conn = self.conn.lock();
+        let conn = self.read();
         let mut stmt =
             conn.prepare("SELECT node_json, listed FROM nodes WHERE node_json IS NOT NULL")?;
         let rows = stmt.query_map([], |row| {
@@ -478,7 +505,7 @@ impl Db {
     /// when the API is unreachable, so the mount can still serve the cached tree
     /// (offline.md Phase 1).
     pub fn node_by_uid(&self, uid: &str) -> Result<Option<Node>> {
-        let conn = self.conn.lock();
+        let conn = self.read();
         let json: Option<String> = conn
             .query_row(
                 "SELECT node_json FROM nodes WHERE uid = ?1 AND node_json IS NOT NULL",
@@ -496,7 +523,7 @@ impl Db {
     /// The daemon resumes from this on restart instead of reseeding to the
     /// server head, so changes made while unmounted are still applied (P2).
     pub fn children_if_listed(&self, parent: &NodeUid) -> Result<Option<Vec<Node>>> {
-        let conn = self.conn.lock();
+        let conn = self.read();
         let listed: Option<i64> = conn
             .query_row(
                 "SELECT listed FROM nodes WHERE uid = ?1",
@@ -529,13 +556,57 @@ impl Db {
     // in sync on every store/read/evict, so it is authoritative for eviction.
 }
 
+/// What a node's row looked like before this upsert, for the fields that decide
+/// whether the subtree below it has to be touched at all.
+struct PriorRow {
+    parent_uid: Option<String>,
+    name: String,
+    path: Option<String>,
+    trashed: bool,
+}
+
 fn upsert_node_tx(tx: &Transaction<'_>, node: &Node) -> Result<()> {
     let json = serde_json::to_string(node)?;
     let uid = node.uid.to_string();
+    let parent_uid = node.parent_uid.as_ref().map(|u| u.to_string());
+
+    let prior: Option<PriorRow> = tx
+        .query_row(
+            "SELECT parent_uid, name, path, trashed FROM nodes WHERE uid = ?1",
+            params![uid],
+            |row| {
+                Ok(PriorRow {
+                    parent_uid: row.get(0)?,
+                    name: row.get(1)?,
+                    path: row.get(2)?,
+                    trashed: row.get::<_, i64>(3)? != 0,
+                })
+            },
+        )
+        .optional()?;
+
+    // A node's path is its parent's path plus its own name — one indexed lookup,
+    // where resolving it from scratch is a recursive walk to the root. A node
+    // whose parent is not cached (a device folder's root lives in `device`, never
+    // in `nodes`) starts a path of its own, which is what the walk did too.
+    let path = match &parent_uid {
+        None => String::new(),
+        Some(parent) => {
+            let parent_path: Option<Option<String>> = tx
+                .query_row(
+                    "SELECT path FROM nodes WHERE uid = ?1",
+                    params![parent],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            join_path(parent_path.flatten().as_deref().unwrap_or(""), &node.name)
+        }
+    };
+
     tx.execute(
         "INSERT INTO nodes
-           (uid, parent_uid, name, is_dir, size, mtime, trashed, node_json)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+           (uid, parent_uid, name, is_dir, size, mtime, trashed, node_json, path)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
          ON CONFLICT(uid) DO UPDATE SET
            parent_uid = excluded.parent_uid,
            name       = excluded.name,
@@ -543,65 +614,116 @@ fn upsert_node_tx(tx: &Transaction<'_>, node: &Node) -> Result<()> {
            size       = excluded.size,
            mtime      = excluded.mtime,
            trashed    = excluded.trashed,
-           node_json  = excluded.node_json",
+           node_json  = excluded.node_json,
+           path       = excluded.path",
         params![
             uid,
-            node.parent_uid.as_ref().map(|u| u.to_string()),
+            parent_uid,
             node.name,
             node.is_folder() as i64,
             node_size(node),
             node.modification_time,
             node.trashed as i64,
             json,
+            path,
         ],
     )?;
-    // FTS5 has no UPSERT. Folder moves also change every descendant path, so
-    // refresh the whole affected subtree while keeping rowid deletes indexed.
     let rowid: i64 = tx.query_row(
         "SELECT rowid FROM nodes WHERE uid = ?1",
         params![uid],
         |row| row.get(0),
     )?;
-    let mut affected = vec![rowid];
-    if node.is_folder() {
-        // The depth cap is a liveness guard, not a policy: `UNION ALL` over a
-        // parent cycle (a's parent is b, b's parent is a — corrupt data, but the
-        // API can hand it to us) never terminates, and this runs inside the
-        // write transaction that holds the daemon's only SQLite connection.
-        // Real Drive trees are nowhere near this deep.
-        let mut stmt = tx.prepare(
-            "WITH RECURSIVE descendants(rowid, uid, depth) AS (
-               SELECT rowid, uid, 0 FROM nodes WHERE parent_uid = ?1
-               UNION ALL
-               SELECT n.rowid, n.uid, d.depth + 1 FROM nodes n
-                 JOIN descendants d ON n.parent_uid = d.uid
-                WHERE d.depth < 256
-             ) SELECT rowid FROM descendants",
-        )?;
-        for descendant in stmt.query_map(params![uid], |row| row.get(0))? {
-            affected.push(descendant?);
-        }
-    }
-    for affected_rowid in affected {
+
+    // FTS5 has no UPSERT, so the node's own row is always replaced.
+    let indexable = node_is_indexable_tx(tx, &uid)?;
+    tx.execute("DELETE FROM nodes_fts WHERE rowid = ?1", params![rowid])?;
+    if indexable {
         tx.execute(
-            "DELETE FROM nodes_fts WHERE rowid = ?1",
-            params![affected_rowid],
+            "INSERT INTO nodes_fts (rowid, name, path) VALUES (?1, ?2, ?3)",
+            params![rowid, node.name, path],
         )?;
-        let indexed: Option<(String, String)> = tx
-            .query_row(
-                "SELECT name, uid FROM nodes WHERE rowid = ?1",
-                params![affected_rowid],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .optional()?;
-        if let Some((name, indexed_uid)) = indexed
-            && node_is_indexable_tx(tx, &indexed_uid)?
-        {
-            let path = path_of(tx, &indexed_uid)?;
-            tx.execute(
-                "INSERT INTO nodes_fts (rowid, name, path) VALUES (?1, ?2, ?3)",
-                params![affected_rowid, name, path],
-            )?;
+    }
+
+    // Everything below only matters when the subtree's paths or reachability
+    // actually moved. Re-listing a folder upserts it unchanged, and paying for a
+    // full descendant walk on each of those was most of what a large tree spent
+    // its time on.
+    let subtree_moved = prior.is_none_or(|prior| {
+        prior.parent_uid != parent_uid
+            || prior.name != node.name
+            || prior.path.as_deref() != Some(path.as_str())
+            || prior.trashed != node.trashed
+    });
+    if node.is_folder() && subtree_moved {
+        reindex_subtree_tx(tx, &uid, &path, indexable)?;
+    }
+    Ok(())
+}
+
+/// Rewrite every descendant's stored path and search-index row after `folder`
+/// moved, was renamed, or changed reachability.
+///
+/// One recursive walk carries both the new path and whether anything on the way
+/// down is trashed, so each descendant costs two trivial statements instead of a
+/// `path_of` walk plus an ancestor walk of its own. `folder_indexable` is the
+/// answer `node_is_indexable_tx` gave for the folder itself: what is above the
+/// subtree is the same for every node in it.
+///
+/// The depth cap is a liveness guard, not a policy: `UNION ALL` over a parent
+/// cycle (a's parent is b, b's parent is a — corrupt data, but the API can hand
+/// it to us) never terminates, and this runs inside the write transaction that
+/// holds the daemon's only SQLite connection. Real Drive trees are nowhere near
+/// this deep.
+fn reindex_subtree_tx(
+    tx: &Transaction<'_>,
+    folder: &str,
+    folder_path: &str,
+    folder_indexable: bool,
+) -> Result<()> {
+    let descendants: Vec<(i64, String, bool)> = {
+        let mut stmt = tx.prepare(
+            "WITH RECURSIVE sub(rowid, uid, name, path, blocked, depth) AS (
+               SELECT n.rowid, n.uid, n.name,
+                      CASE WHEN ?2 = '' THEN n.name ELSE ?2 || '/' || n.name END,
+                      n.trashed, 0
+                 FROM nodes n WHERE n.parent_uid = ?1
+               UNION ALL
+               SELECT n.rowid, n.uid, n.name,
+                      sub.path || '/' || n.name,
+                      MAX(sub.blocked, n.trashed), sub.depth + 1
+                 FROM nodes n JOIN sub ON n.parent_uid = sub.uid
+                WHERE sub.depth < 256
+             )
+             SELECT rowid, path, blocked FROM sub",
+        )?;
+        let rows = stmt.query_map(params![folder, folder_path], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)? != 0,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        out
+    };
+    if descendants.is_empty() {
+        return Ok(());
+    }
+
+    let mut set_path = tx.prepare("UPDATE nodes SET path = ?2 WHERE rowid = ?1")?;
+    let mut unindex = tx.prepare("DELETE FROM nodes_fts WHERE rowid = ?1")?;
+    let mut index = tx.prepare(
+        "INSERT INTO nodes_fts (rowid, name, path)
+         SELECT rowid, name, ?2 FROM nodes WHERE rowid = ?1",
+    )?;
+    for (rowid, path, blocked) in descendants {
+        set_path.execute(params![rowid, path])?;
+        unindex.execute(params![rowid])?;
+        if folder_indexable && !blocked {
+            index.execute(params![rowid, path])?;
         }
     }
     Ok(())

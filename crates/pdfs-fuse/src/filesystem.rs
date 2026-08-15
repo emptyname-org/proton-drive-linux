@@ -94,13 +94,13 @@ impl Filesystem for ProtonFs {
     }
 
     fn forget(&self, _req: &Request, ino: INodeNo, nlookup: u64) {
-        let mut st = self.core.state.lock();
+        let mut st = self.core.state();
         st.forget_lookup(ino.0, nlookup);
     }
 
     fn getattr(&self, _req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
         let (attr, provisional_in) = {
-            let st = self.core.state.lock();
+            let st = self.core.state();
             match st.entries.get(&ino.0) {
                 Some(e) => {
                     // A file still carrying the cheap enumeration's placeholder
@@ -146,7 +146,7 @@ impl Filesystem for ProtonFs {
             // Re-read: the upgrade writes through `state`, and on timeout or
             // failure this is simply the provisional attr we already had.
             let attr = {
-                let st = fs.core.state.lock();
+                let st = fs.core.state();
                 match st.entries.get(&ino) {
                     Some(e) => fs.attr(ino, &e.node, e.access),
                     // Forgotten while we waited.
@@ -218,7 +218,7 @@ impl Filesystem for ProtonFs {
         // has always had between a write and a read of the same handle; a mostly
         // local read is not worth reasoning about that for.
         let handle = {
-            let st = self.core.state.lock();
+            let st = self.core.state();
             st.active_writes.get(&ino.0).map(|h| {
                 (
                     h.file.clone(),
@@ -247,7 +247,7 @@ impl Filesystem for ProtonFs {
             return;
         }
         let (uid, mtime, fsize, is_video) = {
-            let st = self.core.state.lock();
+            let st = self.core.state();
             match st.entries.get(&ino.0) {
                 Some(e) if e.node.is_file() => {
                     let media_type = match &e.node.kind {
@@ -347,7 +347,7 @@ impl Filesystem for ProtonFs {
         // Stage the bytes straight into the scratch file (no base download): only
         // the untouched remainder is pulled from the remote, and only at commit.
         let file = {
-            let st = self.core.state.lock();
+            let st = self.core.state();
             match st.handles.get(&fh).and_then(|&i| st.active_writes.get(&i)) {
                 Some(aw) => aw.file.clone(),
                 None => {
@@ -371,7 +371,7 @@ impl Filesystem for ProtonFs {
             return;
         }
         let new_len = {
-            let mut st = self.core.state.lock();
+            let mut st = self.core.state();
             let Some(aw) = st
                 .handles
                 .get(&fh)
@@ -428,7 +428,7 @@ impl Filesystem for ProtonFs {
         if let Some(size) = size {
             let fh = fh.map(|f| f.0).filter(|&f| f != 0);
             let handled = {
-                let mut st = self.core.state.lock();
+                let mut st = self.core.state();
                 match st.active_writes.get_mut(&ino.0) {
                     Some(aw) => {
                         if size < aw.len {
@@ -471,7 +471,7 @@ impl Filesystem for ProtonFs {
                 });
                 return;
             }
-            self.core.state.lock().set_size(ino.0, size);
+            self.core.state().set_size(ino.0, size);
         }
         self.reply_attr(ino.0, reply);
     }
@@ -496,7 +496,7 @@ impl Filesystem for ProtonFs {
         let is_punch_hole = (mode & 0x02) != 0; // FALLOC_FL_PUNCH_HOLE
 
         let res = {
-            let mut st = self.core.state.lock();
+            let mut st = self.core.state();
             match st
                 .handles
                 .get(&_fh.0)
@@ -590,7 +590,7 @@ impl Filesystem for ProtonFs {
         reply: ReplyEmpty,
     ) {
         let (handle, unlinked_uid) = {
-            let mut st = self.core.state.lock();
+            let mut st = self.core.state();
             let unlinked_uid = release_unlinked_entry(&mut st, _ino.0);
             let ino = st.handles.remove(&fh.0);
             let h = ino.and_then(|i| {
@@ -736,7 +736,7 @@ impl Filesystem for ProtonFs {
     }
 
     fn access(&self, _req: &Request, ino: INodeNo, mask: AccessFlags, reply: ReplyEmpty) {
-        let state = self.core.state.lock();
+        let state = self.core.state();
         let Some(entry) = state.entries.get(&ino.0) else {
             reply.error(Errno::ENOENT);
             return;
@@ -921,7 +921,7 @@ impl ProtonFs {
     /// Build the filesystem rooted at `root` (the user's My Files folder).
     pub(super) fn new(core: Core, root: Node) -> Self {
         {
-            let mut st = core.state.lock();
+            let mut st = core.state();
             if let Err(e) = st.db.upsert_node(&root) {
                 warn!(uid = %root.uid, error = %e, "db upsert root failed");
             }
@@ -963,7 +963,7 @@ impl ProtonFs {
             return;
         }
         let hit = {
-            let st = self.core.state.lock();
+            let st = self.core.state();
             st.children.get(&parent).and_then(|kids| {
                 kids.iter().copied().find_map(|ino| {
                     st.entries
@@ -1013,7 +1013,7 @@ impl ProtonFs {
             // Re-read: on timeout or failure this is the provisional attr again,
             // which is no worse than what this path used to always send.
             let attr = {
-                let st = fs.core.state.lock();
+                let st = fs.core.state();
                 st.entries
                     .get(&ino)
                     .map_or(attr, |e| fs.attr(ino, &e.node, e.access))
@@ -1032,7 +1032,7 @@ impl ProtonFs {
             reply.error(e);
             return;
         }
-        let st = self.core.state.lock();
+        let st = self.core.state();
         let parent = st.entries.get(&ino).map_or(ROOT_INO, |e| e.parent);
 
         // "." and ".." occupy offsets 0 and 1; real children follow.
@@ -1099,7 +1099,7 @@ impl ProtonFs {
     fn serve_open(&self, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
         let write_requested = flags.acc_mode() != OpenAccMode::O_RDONLY;
         let (uid, base_mtime, base_size, base_revision_id) = {
-            let mut st = self.core.state.lock();
+            let mut st = self.core.state();
             match st.entries.get_mut(&ino.0) {
                 Some(e) if e.node.is_file() => {
                     if write_requested && !e.writable() {
@@ -1144,7 +1144,7 @@ impl ProtonFs {
         // safely by WriteHandle, so fail the open rather than risk corruption.
         let pending_base = self.core.pending.lock().get(&uid).cloned();
         if pending_base.as_ref().is_some_and(|p| !p.meta.complete) {
-            if let Some(entry) = self.core.state.lock().entries.get_mut(&ino.0) {
+            if let Some(entry) = self.core.state().entries.get_mut(&ino.0) {
                 entry.open_count = entry.open_count.saturating_sub(1);
             }
             error!(%uid, "refusing write over incomplete queued revision");
@@ -1154,7 +1154,7 @@ impl ProtonFs {
         let (file, path) = match self.core.cache.create_scratch() {
             Ok(x) => x,
             Err(e) => {
-                if let Some(entry) = self.core.state.lock().entries.get_mut(&ino.0) {
+                if let Some(entry) = self.core.state().entries.get_mut(&ino.0) {
                     entry.open_count = entry.open_count.saturating_sub(1);
                 }
                 error!(%uid, error = %e, "create scratch file failed");
@@ -1168,7 +1168,7 @@ impl ProtonFs {
             // a byte-for-byte copy of a multi-GB pending revision is the kind of
             // work `open` must not do (`ContentCache::clone_or_copy`).
             if let Err(e) = ContentCache::clone_or_copy(&pending.path, &path) {
-                if let Some(entry) = self.core.state.lock().entries.get_mut(&ino.0) {
+                if let Some(entry) = self.core.state().entries.get_mut(&ino.0) {
                     entry.open_count = entry.open_count.saturating_sub(1);
                 }
                 let _ = std::fs::remove_file(&path);
@@ -1179,7 +1179,7 @@ impl ProtonFs {
             }
             initial_written.add(0, pending.meta.len);
         }
-        let mut st = self.core.state.lock();
+        let mut st = self.core.state();
         let fh = st.next_fh;
         st.next_fh += 1;
         let aw = st.active_writes.entry(ino.0).or_insert_with(|| {
@@ -1209,7 +1209,7 @@ impl ProtonFs {
         // Everything the durability sidecar needs, copied out so no lock is held
         // across the sync.
         let handle = {
-            let st = self.core.state.lock();
+            let st = self.core.state();
             let ino = st.handles.get(&fh.0).copied();
             ino.and_then(|i| st.active_writes.get(&i)).map(|aw| {
                 (
@@ -1301,7 +1301,7 @@ impl ProtonFs {
             return;
         }
         let parent_uid = {
-            let st = self.core.state.lock();
+            let st = self.core.state();
             match st.entries.get(&parent) {
                 Some(e) => e.uid.clone(),
                 None => {
@@ -1383,7 +1383,7 @@ impl ProtonFs {
                 return;
             }
         };
-        let mut st = self.core.state.lock();
+        let mut st = self.core.state();
         let ino = st.intern(parent, node);
         if let Some(entry) = st.entries.get_mut(&ino) {
             entry.open_count = entry.open_count.saturating_add(1);
@@ -1438,7 +1438,7 @@ impl ProtonFs {
             return;
         }
         let parent_uid = {
-            let st = self.core.state.lock();
+            let st = self.core.state();
             match st.entries.get(&parent) {
                 Some(e) => e.uid.clone(),
                 None => {
@@ -1488,7 +1488,7 @@ impl ProtonFs {
                 }
             }
         };
-        let mut st = self.core.state.lock();
+        let mut st = self.core.state();
         let local = is_local_uid(&node.uid);
         let uid = node.uid.clone();
         let ino = st.intern(parent, node);
@@ -1520,7 +1520,7 @@ impl ProtonFs {
             return;
         }
         if let Ok((ino, _)) = self.core.lookup_child(parent, name_str) {
-            let st = self.core.state.lock();
+            let st = self.core.state();
             if let Some(entry) = st.entries.get(&ino)
                 && entry.node.is_folder()
             {
@@ -1539,7 +1539,7 @@ impl ProtonFs {
         }
         if let Ok((ino, _)) = self.core.lookup_child(parent, name_str) {
             {
-                let st = self.core.state.lock();
+                let st = self.core.state();
                 if st
                     .entries
                     .get(&ino)
@@ -1556,7 +1556,7 @@ impl ProtonFs {
                 reply.error(e);
                 return;
             }
-            if self.core.state.lock().has_children(ino) {
+            if self.core.state().has_children(ino) {
                 reply.error(Errno::ENOTEMPTY);
                 return;
             }
@@ -1637,7 +1637,7 @@ impl ProtonFs {
         };
         // Ancestor cycle check: moving a directory into itself or one of its descendants is forbidden by POSIX (EINVAL).
         {
-            let st = self.core.state.lock();
+            let st = self.core.state();
             if let Some(entry) = st.entries.get(&ino)
                 && entry.node.is_folder()
                 && st.is_ancestor_of(ino, newparent)
@@ -1656,7 +1656,7 @@ impl ProtonFs {
             return;
         }
         let (old_parent_uid, new_parent_uid) = {
-            let st = self.core.state.lock();
+            let st = self.core.state();
             match (st.entries.get(&parent), st.entries.get(&newparent)) {
                 (Some(old), Some(new)) => (old.uid.clone(), new.uid.clone()),
                 _ => {
@@ -1697,7 +1697,7 @@ impl ProtonFs {
             // check has to happen before anything is trashed: getting it wrong
             // turns a refusal into the destruction of the destination.
             let (src_dir, dst_dir) = {
-                let st = self.core.state.lock();
+                let st = self.core.state();
                 let is_dir = |i: &u64| {
                     st.entries
                         .get(i)
@@ -1760,12 +1760,9 @@ impl ProtonFs {
                 newname,
             ) {
                 Ok(true) => {
-                    self.core.state.lock().rename_in_place(
-                        ino,
-                        newparent,
-                        &new_parent_uid,
-                        newname,
-                    );
+                    self.core
+                        .state()
+                        .rename_in_place(ino, newparent, &new_parent_uid, newname);
                     // Finalize: a transient scratch file (its create parked, bytes
                     // held back) renamed to a finished name is the moment the
                     // completed file is meant to reach Drive. Un-park the create so
@@ -1906,7 +1903,7 @@ impl ProtonFs {
             if let Err(e) = moved {
                 error!(%uid, attempts, error = %e, "move after rename failed");
                 // The rename half landed in the source directory.
-                let mut state = self.core.state.lock();
+                let mut state = self.core.state();
                 let old_parent_uid = state
                     .entries
                     .get(&parent)
@@ -1932,7 +1929,7 @@ impl ProtonFs {
     /// Answer with an inode's current attributes, or `ENOENT` if it went away
     /// while the caller was doing something slower.
     fn reply_attr(&self, ino: u64, reply: ReplyAttr) {
-        let st = self.core.state.lock();
+        let st = self.core.state();
         match st.entries.get(&ino) {
             Some(e) => {
                 let attr = self.attr(ino, &e.node, e.access);
@@ -1969,7 +1966,7 @@ impl ProtonFs {
                 reply.error(error);
                 return;
             }
-            self.core.state.lock().forget_or_unlink(&uid);
+            self.core.state().forget_or_unlink(&uid);
             debug!(%uid, name, "deleted a node that had not been created remotely yet");
             reply.ok();
             return;
@@ -2003,7 +2000,7 @@ impl ProtonFs {
         // Only remove the namespace entry after Drive accepted the mutation.
         // Otherwise an EIO response still made the path disappear locally.
         self.core.hidden.lock().insert(uid.clone());
-        self.core.state.lock().forget_or_unlink(&uid);
+        self.core.state().forget_or_unlink(&uid);
         if !open_now {
             if let Err(error) = self.core.discard_queued_ops(&uid) {
                 warn!(%uid, ?error, "remote trash landed but queued-op cleanup failed");
@@ -2067,7 +2064,7 @@ impl ProtonFs {
     /// request for an unadvertised name, so nothing becomes unreachable.
     fn serve_listxattr(&self, ino: INodeNo, size: u32, reply: ReplyXattr) {
         let thumbnailable = {
-            let st = self.core.state.lock();
+            let st = self.core.state();
             match st.entries.get(&ino.0) {
                 Some(e) => match &e.node.kind {
                     NodeKind::File { media_type, .. } => {

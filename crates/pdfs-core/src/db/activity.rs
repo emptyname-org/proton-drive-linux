@@ -33,7 +33,7 @@ impl Db {
     /// whose stored `kind` no longer parses (written by an older build) are
     /// skipped rather than failing the whole read.
     pub fn activity_list(&self, limit: usize) -> Result<Vec<ActivityEntry>> {
-        let conn = self.conn.lock();
+        let conn = self.read();
         let mut stmt = conn.prepare(
             "SELECT time, kind, target, detail, ok FROM activity
              ORDER BY id DESC LIMIT ?1",

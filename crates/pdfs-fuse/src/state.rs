@@ -166,13 +166,163 @@ pub(crate) struct State {
     /// on every explicit role/tombstone change. Descendant inheritance reads
     /// this map instead of issuing one SQLite query per interned inode.
     pub(crate) share_access: HashMap<NodeUid, Access>,
-    /// Unified SQLite metadata cache. Every map mutation below writes through to
-    /// it inside the `State` lock so the DB stays the authoritative copy across
-    /// restarts (see plan.md P1).
+    /// Unified SQLite metadata cache. Read from here (`has_children`) but never
+    /// written: mutations go to [`State::outbox`] and are applied after the lock
+    /// is released. See [`StateGuard`].
     pub(crate) db: Arc<Db>,
+    /// Write-throughs this mutation owes SQLite, applied by [`StateGuard`] once
+    /// the inode lock is released.
+    ///
+    /// The DB stays the authoritative copy across restarts, so every map
+    /// mutation still writes through — it just no longer does so with the
+    /// whole-mount lock held. A single listing's write-through is one
+    /// transaction over up to a few thousand rows, and every other FUSE callback
+    /// used to wait behind it for no reason: the maps were already updated
+    /// before the first row was written.
+    outbox: Vec<DbWrite>,
+}
+
+/// A write-through queued by a `State` mutation, applied after the lock drops.
+///
+/// Deliberately a small closed set rather than a boxed closure: these run
+/// outside the lock, and what they can touch should be readable here.
+pub(crate) enum DbWrite {
+    /// One node or a whole listing. Both go through `upsert_nodes`, which is a
+    /// single transaction either way, so there is nothing to gain by splitting
+    /// them — and a `Node` is large enough that a variant holding one inline
+    /// would set the size of every other.
+    Upsert(Vec<Node>),
+    Delete(NodeUid),
+    SetListed(NodeUid, bool),
+    SetShareAccess(NodeUid, Access),
+}
+
+impl DbWrite {
+    fn apply(self, db: &Db) {
+        let outcome = match &self {
+            Self::Upsert(nodes) => db.upsert_nodes(nodes),
+            Self::Delete(uid) => db.delete_node(uid),
+            Self::SetListed(uid, listed) => db.set_listed(uid, *listed),
+            Self::SetShareAccess(uid, access) => db.set_share_access(uid, *access),
+        };
+        if let Err(error) = outcome {
+            let what = match &self {
+                Self::Upsert(_) => "upsert_nodes",
+                Self::Delete(_) => "delete_node",
+                Self::SetListed(..) => "set_listed",
+                Self::SetShareAccess(..) => "set_share_access",
+            };
+            warn!(%error, write = what, "db write-through failed");
+        }
+    }
+}
+
+/// The inode lock, held for the duration of a mutation, plus the write-throughs
+/// that mutation owed the database.
+///
+/// Dropping it releases the lock *first* and only then writes, which is the
+/// whole point: interning a five-thousand-child listing commits one transaction
+/// — several fsyncs' worth — and nothing about that needs the maps frozen. The
+/// write still happens synchronously on this thread before the caller proceeds,
+/// so a read that follows a mutation still sees it.
+pub(crate) struct StateGuard<'a> {
+    guard: Option<parking_lot::MutexGuard<'a, State>>,
+    db: &'a Arc<Db>,
+}
+
+/// Take a mount's inode lock through a [`StateGuard`], for the loops that walk
+/// every live mount rather than this `Core`'s own.
+pub(crate) fn lock_state<'a>(
+    state: &'a parking_lot::Mutex<State>,
+    db: &'a Arc<Db>,
+) -> StateGuard<'a> {
+    StateGuard::new(state.lock(), db)
+}
+
+impl<'a> StateGuard<'a> {
+    pub(crate) fn new(guard: parking_lot::MutexGuard<'a, State>, db: &'a Arc<Db>) -> Self {
+        Self {
+            guard: Some(guard),
+            db,
+        }
+    }
+}
+
+impl std::ops::Deref for StateGuard<'_> {
+    type Target = State;
+
+    fn deref(&self) -> &State {
+        self.guard.as_ref().expect("held until drop")
+    }
+}
+
+impl std::ops::DerefMut for StateGuard<'_> {
+    fn deref_mut(&mut self) -> &mut State {
+        self.guard.as_mut().expect("held until drop")
+    }
+}
+
+impl Drop for StateGuard<'_> {
+    fn drop(&mut self) {
+        let Some(mut guard) = self.guard.take() else {
+            return;
+        };
+        let writes = std::mem::take(&mut guard.outbox);
+        // The lock goes before the writes do. That ordering is the feature.
+        drop(guard);
+        for write in writes {
+            write.apply(self.db);
+        }
+    }
 }
 
 impl State {
+    /// A fresh, empty inode space over `db`.
+    ///
+    /// `next_ino` differs by caller: a real mount hands out [`crate::ROOT_INO`]
+    /// to its root and starts allocating above it, while a bare state under test
+    /// has no root and starts at 1.
+    /// Apply the write-throughs this state owes SQLite, here and now.
+    ///
+    /// Production code never calls this: [`StateGuard`] releases the inode lock
+    /// first and then applies them, which is the whole point. A test driving a
+    /// bare `State` has no guard, so it calls this where the daemon would have
+    /// dropped one.
+    #[cfg(test)]
+    pub(crate) fn flush_outbox(&mut self) {
+        let db = self.db.clone();
+        for write in std::mem::take(&mut self.outbox) {
+            write.apply(&db);
+        }
+    }
+
+    /// The database, with everything this state owes it already written.
+    ///
+    /// What a test means by `st.db` is almost always "the database as of now",
+    /// which in the daemon is the state after the guard dropped. Handing back an
+    /// owned `Arc` rather than a borrow keeps it usable inside an `assert_eq!`
+    /// that also touches `st`.
+    #[cfg(test)]
+    pub(crate) fn flushed_db(&mut self) -> Arc<Db> {
+        self.flush_outbox();
+        self.db.clone()
+    }
+
+    pub(crate) fn new(db: Arc<Db>, share_access: HashMap<NodeUid, Access>, next_ino: u64) -> Self {
+        Self {
+            entries: HashMap::new(),
+            by_uid: HashMap::new(),
+            children: HashMap::new(),
+            next_ino,
+            active_writes: HashMap::new(),
+            handles: HashMap::new(),
+            next_fh: 1,
+            access_changes: HashSet::new(),
+            share_access,
+            db,
+            outbox: Vec::new(),
+        }
+    }
     /// Whether `uid` names an owned node currently reachable from this mount's
     /// root. Resident entries can outlive their dentries for open-handle and
     /// access-revocation semantics, so `by_uid` membership alone is not proof
@@ -278,11 +428,9 @@ impl State {
                 || stored.unwrap_or(Access::Viewer),
                 |membership| access_for(membership.role_exact(), parent_access, true),
             );
-            if let Err(error) = self.db.set_share_access(&node.uid, access) {
-                warn!(uid = %node.uid, ?access, %error, "db set_share_access failed");
-            } else {
-                self.share_access.insert(node.uid.clone(), access);
-            }
+            self.outbox
+                .push(DbWrite::SetShareAccess(node.uid.clone(), access));
+            self.share_access.insert(node.uid.clone(), access);
             return access;
         }
         parent_access
@@ -313,11 +461,9 @@ impl State {
             None => (None, Access::Unknown),
         };
         let access = access_for(role, parent_access, true);
-        if let Err(error) = self.db.set_share_access(uid, access) {
-            warn!(%uid, ?access, %error, "db set observed share access failed");
-        } else {
-            self.share_access.insert(uid.clone(), access);
-        }
+        self.outbox
+            .push(DbWrite::SetShareAccess(uid.clone(), access));
+        self.share_access.insert(uid.clone(), access);
         let Some(root) = root else {
             return Vec::new();
         };
@@ -602,18 +748,14 @@ impl State {
             })
             .collect();
         for (uid, access) in discovered {
-            if let Err(error) = self.db.set_share_access(&uid, access) {
-                warn!(%uid, ?access, %error, "db set hydrated share access failed");
-            } else {
-                self.share_access.insert(uid, access);
-            }
+            self.outbox
+                .push(DbWrite::SetShareAccess(uid.clone(), access));
+            self.share_access.insert(uid, access);
         }
     }
 
     pub(crate) fn intern(&mut self, parent: u64, node: Node) -> u64 {
-        if let Err(e) = self.db.upsert_node(&node) {
-            warn!(uid = %node.uid, error = %e, "db upsert_node failed");
-        }
+        self.outbox.push(DbWrite::Upsert(vec![node.clone()]));
         self.intern_mem(parent, node)
     }
 
@@ -685,9 +827,7 @@ impl State {
     /// This is what keeps `ls` on a large folder quick: one commit for the
     /// listing, rather than one autocommit — and one fsync — per child.
     pub(crate) fn intern_batch(&mut self, parent: u64, nodes: Vec<Node>) -> Vec<u64> {
-        if let Err(e) = self.db.upsert_nodes(&nodes) {
-            warn!(error = %e, "db upsert_nodes failed");
-        }
+        self.outbox.push(DbWrite::Upsert(nodes.clone()));
         nodes
             .into_iter()
             .map(|node| self.intern_mem(parent, node))
@@ -769,9 +909,7 @@ impl State {
     /// `(parent_ino, name)` when the node was known, so the caller can notify
     /// the kernel.
     pub(crate) fn forget(&mut self, uid: &NodeUid) -> Option<(u64, String)> {
-        if let Err(e) = self.db.delete_node(uid) {
-            warn!(%uid, error = %e, "db delete_node failed");
-        }
+        self.outbox.push(DbWrite::Delete(uid.clone()));
         self.forget_mem(uid)
     }
 
@@ -834,9 +972,7 @@ impl State {
                 kids.push(ino);
             }
         }
-        if let Err(e) = self.db.upsert_node(&node) {
-            warn!(uid = %node.uid, error = %e, "db upsert_node failed for a queued rename");
-        }
+        self.outbox.push(DbWrite::Upsert(vec![node]));
         self.recompute_descendant_access(ino);
     }
 
@@ -851,9 +987,7 @@ impl State {
         self.children.remove(&ino);
         if let Some(e) = self.entries.get(&ino) {
             let uid = e.uid.clone();
-            if let Err(err) = self.db.set_listed(&uid, false) {
-                warn!(%uid, error = %err, "db set_listed(false) failed");
-            }
+            self.outbox.push(DbWrite::SetListed(uid, false));
         }
     }
 
@@ -920,24 +1054,15 @@ impl State {
     /// file is as long as the caller was told it is. Without it a restart serves
     /// the stale size and the file reads as truncated — or empty — while its
     /// bytes sit safely in staging (offline.md Phase 3).
-    /// Failure is reported rather than logged: dropping the row silently means
+    /// Returns the node to persist rather than queueing it in the outbox, and is
+    /// the one mutation here whose write-through the caller must do itself:
+    /// failure has to be reported, not logged. Dropping the row silently means
     /// the daemon acknowledged a write and then serves the old size for it, so
     /// the caller has to be able to turn it into a failed `release`.
-    pub(crate) fn record_pending_write(
-        &mut self,
-        ino: u64,
-        size: u64,
-        mtime: i64,
-    ) -> pdfs_core::Result<()> {
+    pub(crate) fn record_pending_write(&mut self, ino: u64, size: u64, mtime: i64) -> Option<Node> {
         self.set_size(ino, size);
         self.touch_mtime(ino, mtime);
-        if let Some(e) = self.entries.get(&ino) {
-            self.db.upsert_node(&e.node).map_err(|err| {
-                warn!(uid = %e.uid, error = %err, "db upsert_node failed for a queued write");
-                err
-            })?;
-        }
-        Ok(())
+        self.entries.get(&ino).map(|e| e.node.clone())
     }
 }
 
@@ -1018,18 +1143,7 @@ mod tests {
         let dir = TempDir::new();
         let db = Db::open(&dir.0.join("cache.db")).unwrap();
         let share_access = db.all_share_access().unwrap();
-        let st = State {
-            entries: HashMap::new(),
-            by_uid: HashMap::new(),
-            children: HashMap::new(),
-            next_ino: 1,
-            active_writes: HashMap::new(),
-            handles: HashMap::new(),
-            next_fh: 1,
-            access_changes: HashSet::new(),
-            share_access,
-            db: Arc::new(db),
-        };
+        let st = State::new(Arc::new(db), share_access, 1);
         (st, dir)
     }
 
@@ -1042,8 +1156,8 @@ mod tests {
         let f = st.intern(src, node("f", "src", "f.txt", false));
         st.children.insert(src, vec![f]);
         st.children.insert(dst, vec![]);
-        st.db.set_listed(&uid("src"), true).unwrap();
-        st.db.set_listed(&uid("dst"), true).unwrap();
+        st.flushed_db().set_listed(&uid("src"), true).unwrap();
+        st.flushed_db().set_listed(&uid("dst"), true).unwrap();
         (st, dir, src, dst)
     }
 
@@ -1057,11 +1171,17 @@ mod tests {
         st.relocate(f, src, dst, &uid("dst"), "f.txt");
 
         assert!(
-            st.db.children_if_listed(&uid("dst")).unwrap().is_none(),
+            st.flushed_db()
+                .children_if_listed(&uid("dst"))
+                .unwrap()
+                .is_none(),
             "destination re-enumerates: it gained a child whose row was just deleted"
         );
         assert!(
-            st.db.children_if_listed(&uid("src")).unwrap().is_none(),
+            st.flushed_db()
+                .children_if_listed(&uid("src"))
+                .unwrap()
+                .is_none(),
             "source re-enumerates: its listing predates the move, and a stale \
              `listed` flag would hide every later remote change under it"
         );
@@ -1084,10 +1204,39 @@ mod tests {
         let (mut st, _dir, src, _dst) = two_folders();
         let f = st.by_uid[&uid("f")];
         st.relocate(f, src, src, &uid("src"), "renamed.txt");
-        assert!(st.db.children_if_listed(&uid("src")).unwrap().is_none());
+        assert!(
+            st.flushed_db()
+                .children_if_listed(&uid("src"))
+                .unwrap()
+                .is_none()
+        );
         assert!(!st.children.contains_key(&src));
         assert_eq!(st.by_uid.get(&uid("f")), Some(&f), "the inode is stable");
         assert_eq!(st.entries[&f].node.name, "renamed.txt");
+    }
+
+    /// DB1: a mutation's write-through must not happen with the inode lock
+    /// held. Interning a listing commits a transaction over every child, and
+    /// every other FUSE callback used to wait behind that for no reason — the
+    /// maps it needs were updated before the first row was written.
+    #[test]
+    fn a_mutation_writes_through_only_after_the_lock_is_released() {
+        let (st, _dir) = state();
+        let db = st.db.clone();
+        let root = uid("root").to_string();
+        let state = parking_lot::Mutex::new(st);
+        {
+            let mut guard = lock_state(&state, &db);
+            guard.intern(0, node("root", "none", "My Files", true));
+            assert!(
+                db.node_by_uid(&root).unwrap().is_none(),
+                "the row must not be written while the lock is held"
+            );
+        }
+        assert!(
+            db.node_by_uid(&root).unwrap().is_some(),
+            "…and must be written by the time the guard is gone"
+        );
     }
 
     /// The failure mode the fix exists for, stated directly: forgetting the node
@@ -1097,7 +1246,7 @@ mod tests {
     fn forget_alone_leaves_the_source_claiming_a_complete_listing() {
         let (mut st, _dir, _src, _dst) = two_folders();
         st.forget(&uid("f"));
-        let listed = st.db.children_if_listed(&uid("src")).unwrap();
+        let listed = st.flushed_db().children_if_listed(&uid("src")).unwrap();
         assert!(
             listed.is_some(),
             "forget does not clear the flag — which is exactly why relocate must"
@@ -1146,7 +1295,7 @@ mod tests {
         assert!(!st.has_children(folder), "cleared memory children");
 
         // DB children
-        st.db
+        st.flushed_db()
             .upsert_node(&node("file2_uid", "dir_uid", "file2.txt", false))
             .unwrap();
         assert!(
@@ -1172,7 +1321,7 @@ mod tests {
         assert_eq!(st.entries[&shared_ino].access, Access::Editor);
         assert_eq!(st.entries[&child].access, Access::Editor);
         assert_eq!(
-            st.db.share_access(&uid("shared")).unwrap(),
+            st.flushed_db().share_access(&uid("shared")).unwrap(),
             Some(Access::Editor)
         );
     }
@@ -1184,8 +1333,8 @@ mod tests {
         let virtual_uid = NodeUid::new(VolumeId::from("virtual"), LinkId::from("sharedwithme"));
         let mut virtual_root = node("placeholder", "root", "Shared with me", true);
         virtual_root.uid = virtual_uid.clone();
-        st.db.upsert_node(&virtual_root).unwrap();
-        st.db
+        st.flushed_db().upsert_node(&virtual_root).unwrap();
+        st.flushed_db()
             .set_share_access(&virtual_uid, Access::Viewer)
             .unwrap();
         let virtual_ino = st.intern_published_share_root(owned_root, virtual_root, Access::Viewer);
@@ -1193,15 +1342,17 @@ mod tests {
         let mut shared = node("shared", "placeholder", "Retained", true);
         shared.parent_uid = Some(virtual_uid.clone());
         shared.membership = Some(membership(6));
-        st.db.upsert_node(&shared).unwrap();
-        st.db.set_share_access(&shared.uid, Access::Editor).unwrap();
+        st.flushed_db().upsert_node(&shared).unwrap();
+        st.flushed_db()
+            .set_share_access(&shared.uid, Access::Editor)
+            .unwrap();
         let shared_ino =
             st.intern_published_share_root(virtual_ino, shared.clone(), Access::Editor);
         let child = st.intern(
             shared_ino,
             node("shared-child", "shared", "pending.txt", false),
         );
-        st.db
+        st.flushed_db()
             .enqueue_op(&pdfs_core::db::PendingOp {
                 id: 0,
                 kind: pdfs_core::db::OP_RENAME.to_string(),
@@ -1219,20 +1370,20 @@ mod tests {
         assert_eq!(st.entries[&shared_ino].access, Access::Editor);
         assert_eq!(st.entries[&child].access, Access::Editor);
 
-        st.db
+        st.flushed_db()
             .publish_shared_roots(&virtual_uid, std::slice::from_ref(&shared.uid), &[])
             .unwrap();
-        let snapshot = st.db.visible_children(&virtual_uid).unwrap();
+        let snapshot = st.flushed_db().visible_children(&virtual_uid).unwrap();
         assert_eq!(snapshot.len(), 1);
         st.intern_published_share_root(virtual_ino, snapshot[0].clone(), Access::Viewer);
 
         assert_eq!(
-            st.db.share_access(&shared.uid).unwrap(),
+            st.flushed_db().share_access(&shared.uid).unwrap(),
             Some(Access::Viewer)
         );
         assert_eq!(st.entries[&shared_ino].access, Access::Viewer);
         assert_eq!(st.entries[&child].access, Access::Viewer);
-        assert_eq!(st.db.pending_ops().unwrap().len(), 1);
+        assert_eq!(st.flushed_db().pending_ops().unwrap().len(), 1);
     }
 
     #[test]
@@ -1243,12 +1394,12 @@ mod tests {
         let child_node = node("offline-child", "offline-share", "nested folder", true);
         let leaf_node = node("offline-leaf", "offline-child", "child.txt", false);
         for node in [&root_node, &shared_node, &child_node, &leaf_node] {
-            st.db.upsert_node(node).unwrap();
+            st.flushed_db().upsert_node(node).unwrap();
         }
-        st.db
+        st.flushed_db()
             .set_share_access(&uid("offline-share"), Access::Viewer)
             .unwrap();
-        st.share_access = st.db.all_share_access().unwrap();
+        st.share_access = st.flushed_db().all_share_access().unwrap();
 
         // Reconstruct in deliberately non-topological order, matching the
         // database hydration path that first allocates every inode and only
@@ -1306,7 +1457,7 @@ mod tests {
     /// `ORPHAN_INO`. `nodes[0]` becomes the mount root.
     fn hydrate_from(st: &mut State, nodes: &[Node]) -> Vec<u64> {
         for node in nodes {
-            st.db.upsert_node(node).unwrap();
+            st.flushed_db().upsert_node(node).unwrap();
         }
         let inos: Vec<u64> = nodes
             .iter()
@@ -1404,10 +1555,10 @@ mod tests {
     #[test]
     fn persisted_authority_outranks_the_own_volume_fail_open() {
         let (mut st, _dir) = state();
-        st.db
+        st.flushed_db()
             .set_share_access(&uid("device-root"), Access::Viewer)
             .unwrap();
-        st.share_access = st.db.all_share_access().unwrap();
+        st.share_access = st.flushed_db().all_share_access().unwrap();
         let nodes = [
             node("root", "none", "My Files", true),
             node("documents", "device-root", "Documents", true),
@@ -1441,7 +1592,7 @@ mod tests {
             assert_eq!(st.require_writable(ino).unwrap_err().code(), libc::EACCES);
         }
         assert_eq!(
-            st.db.share_access(&uid("shared")).unwrap(),
+            st.flushed_db().share_access(&uid("shared")).unwrap(),
             Some(Access::Viewer)
         );
     }
@@ -1451,8 +1602,10 @@ mod tests {
         for persisted in [Access::Viewer, Access::Editor] {
             let (mut st, _dir) = state();
             let owned_root = st.intern(0, node("root", "none", "My Files", true));
-            st.db.set_share_access(&uid("shared"), persisted).unwrap();
-            st.share_access = st.db.all_share_access().unwrap();
+            st.flushed_db()
+                .set_share_access(&uid("shared"), persisted)
+                .unwrap();
+            st.share_access = st.flushed_db().all_share_access().unwrap();
             let shared = st.intern(
                 owned_root,
                 node("shared", "root", "Shared without membership", true),
@@ -1464,7 +1617,10 @@ mod tests {
 
             assert_eq!(st.entries[&shared].access, persisted);
             assert_eq!(st.entries[&child].access, persisted);
-            assert_eq!(st.db.share_access(&uid("shared")).unwrap(), Some(persisted));
+            assert_eq!(
+                st.flushed_db().share_access(&uid("shared")).unwrap(),
+                Some(persisted)
+            );
         }
     }
 
@@ -1472,7 +1628,7 @@ mod tests {
     fn explicit_missing_share_role_fails_closed_and_marks_kernel_attrs() {
         let (mut st, _dir) = state();
         let owned_root = st.intern(0, node("root", "none", "My Files", true));
-        st.db
+        st.flushed_db()
             .set_share_access(&uid("shared"), Access::Editor)
             .unwrap();
         let shared = st.intern(owned_root, node("shared", "root", "Shared", true));
@@ -1484,7 +1640,7 @@ mod tests {
         assert_eq!(st.entries[&shared].access, Access::Viewer);
         assert_eq!(st.entries[&child].access, Access::Viewer);
         assert_eq!(
-            st.db.share_access(&uid("shared")).unwrap(),
+            st.flushed_db().share_access(&uid("shared")).unwrap(),
             Some(Access::Viewer)
         );
         assert!(changed.contains(&shared));
@@ -1501,7 +1657,7 @@ mod tests {
         let virtual_uid = NodeUid::new(VolumeId::from("virtual"), LinkId::from("sharedwithme"));
         let mut virtual_node = node("sharedwithme", "root", "Shared with me", true);
         virtual_node.uid = virtual_uid.clone();
-        st.db
+        st.flushed_db()
             .set_share_access(&virtual_uid, Access::Viewer)
             .unwrap();
         st.share_access.insert(virtual_uid.clone(), Access::Viewer);
@@ -1568,7 +1724,7 @@ mod tests {
         let child = st.intern(shared, node("child", "shared", "folder", true));
         let leaf = st.intern(child, node("leaf", "child", "leaf.txt", false));
 
-        st.db
+        st.flushed_db()
             .set_share_access(&uid("shared"), Access::Viewer)
             .unwrap();
         let changed = st.downgrade_shared_subtree(&uid("shared"));
@@ -1582,7 +1738,7 @@ mod tests {
         assert_eq!(st.entries[&leaf].access, Access::Viewer);
         assert_eq!(st.require_writable(leaf).unwrap_err().code(), libc::EACCES);
         assert_eq!(
-            st.db.effective_node_access(&uid("leaf")).unwrap(),
+            st.flushed_db().effective_node_access(&uid("leaf")).unwrap(),
             Some(Access::Viewer)
         );
 
@@ -1638,7 +1794,7 @@ mod tests {
         let shared = st.intern(owned_root, shared_node);
         let shared_child = st.intern(shared, node("child", "shared", "child.txt", false));
 
-        st.db.downgrade_all_share_access().unwrap();
+        st.flushed_db().downgrade_all_share_access().unwrap();
         let changed = st.downgrade_known_shared_access();
 
         assert!(changed.contains(&shared));
@@ -1662,7 +1818,7 @@ mod tests {
             let parent_link = st.entries[&parent].uid.link_id.to_string();
             parent = st.intern(parent, node(&link, &parent_link, &link, true));
         }
-        st.db.downgrade_all_share_access().unwrap();
+        st.flushed_db().downgrade_all_share_access().unwrap();
 
         let changed = st.downgrade_known_shared_access();
 

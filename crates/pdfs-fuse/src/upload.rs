@@ -171,7 +171,7 @@ impl Core {
                     stats.bytes += size;
                     match self.fetch_node(&uid) {
                         Ok(node) => {
-                            let mut st = self.state.lock();
+                            let mut st = self.state();
                             let ino = st.intern(parent_ino, node);
                             if let Some(kids) = st.children.get_mut(&parent_ino)
                                 && !kids.contains(&ino)
@@ -216,7 +216,7 @@ impl Core {
         self.ensure_children(pino)
             .map_err(|e| self.errno_error(e, "enumerate"))?;
         let existing = {
-            let st = self.state.lock();
+            let st = self.state();
             st.children.get(&pino).and_then(|kids| {
                 kids.iter().find_map(|ino| {
                     st.entries
@@ -243,7 +243,7 @@ impl Core {
         let node = self
             .fetch_node(&new_uid)
             .map_err(|e| self.errno_error(e, "fetch node"))?;
-        let mut st = self.state.lock();
+        let mut st = self.state();
         let ino = st.intern(pino, node);
         if let Some(kids) = st.children.get_mut(&pino)
             && !kids.contains(&ino)

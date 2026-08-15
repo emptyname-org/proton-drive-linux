@@ -16,7 +16,7 @@ impl Db {
     /// remains the restart/offline authority and every explicit role change is
     /// written through before this cache is updated.
     pub fn all_share_access(&self) -> Result<HashMap<NodeUid, Access>> {
-        let conn = self.conn.lock();
+        let conn = self.read();
         let mut stmt = conn.prepare("SELECT root_uid, access FROM share_access")?;
         let rows = stmt.query_map([], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
@@ -42,7 +42,7 @@ impl Db {
 
     /// Read the effective access recorded for a shared-tree root.
     pub fn share_access(&self, uid: &NodeUid) -> Result<Option<Access>> {
-        let conn = self.conn.lock();
+        let conn = self.read();
         let value = conn
             .query_row(
                 "SELECT access FROM share_access WHERE root_uid = ?1",
@@ -96,7 +96,7 @@ impl Db {
     /// share root. `None` means the node itself is not persisted, which callers
     /// must not treat as owned: stale handles need to fail closed.
     pub fn effective_node_access(&self, uid: &NodeUid) -> Result<Option<Access>> {
-        let conn = self.conn.lock();
+        let conn = self.read();
         let exists: bool = conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM nodes WHERE uid = ?1)",
             [uid.to_string()],

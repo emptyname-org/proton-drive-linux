@@ -76,7 +76,7 @@ impl Db {
 
     /// The persisted album listing, in stored order.
     pub fn albums_list(&self) -> Result<Vec<StoredAlbum>> {
-        let conn = self.conn.lock();
+        let conn = self.read();
         let mut stmt = conn.prepare(
             "SELECT uid, name, photo_count, cover_uid, last_activity, shared
              FROM albums ORDER BY seq",
@@ -98,7 +98,7 @@ impl Db {
 
     /// Number of albums in the persisted listing.
     pub fn albums_count(&self) -> Result<usize> {
-        let conn = self.conn.lock();
+        let conn = self.read();
         let n: i64 = conn.query_row("SELECT COUNT(*) FROM albums", [], |r| r.get(0))?;
         Ok(n.max(0) as usize)
     }
@@ -164,7 +164,7 @@ impl Db {
         offset: usize,
         limit: usize,
     ) -> Result<Vec<StoredPhoto>> {
-        let conn = self.conn.lock();
+        let conn = self.read();
         let mut stmt = conn.prepare(
             "SELECT uid, capture_time, name, ratio, thumb_state, kind FROM album_photos
              WHERE album_uid = ?1 ORDER BY seq LIMIT ?2 OFFSET ?3",
@@ -190,7 +190,7 @@ impl Db {
 
     /// How many photos of `album_uid` are persisted.
     pub fn album_photos_count(&self, album_uid: &str) -> Result<usize> {
-        let conn = self.conn.lock();
+        let conn = self.read();
         let n: i64 = conn.query_row(
             "SELECT COUNT(*) FROM album_photos WHERE album_uid = ?1",
             [album_uid],
@@ -207,7 +207,7 @@ impl Db {
         if uids.is_empty() {
             return Ok(Vec::new());
         }
-        let conn = self.conn.lock();
+        let conn = self.read();
         let placeholders = vec!["?"; uids.len()].join(",");
         let mut stmt = conn.prepare(&format!(
             "SELECT uid, capture_time, name, ratio, thumb_state, kind FROM album_photos

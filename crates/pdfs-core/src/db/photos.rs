@@ -115,7 +115,7 @@ impl Db {
         range: Option<(i64, i64)>,
         favorites: bool,
     ) -> Result<Vec<StoredPhoto>> {
-        let conn = self.conn.lock();
+        let conn = self.read();
         // Built up so any combination of the optional filters is one indexed
         // query rather than a statement per case.
         let mut sql = String::from(
@@ -174,7 +174,7 @@ impl Db {
         &self,
         kind: Option<crate::control::PhotoKind>,
     ) -> Result<Vec<(i32, i32, usize)>> {
-        let conn = self.conn.lock();
+        let conn = self.read();
         let (filter, binds): (&str, Vec<i64>) = match kind {
             Some(k) => (" WHERE kind = ?1", vec![k.as_i64()]),
             None => ("", Vec::new()),
@@ -201,7 +201,7 @@ impl Db {
     /// Per-tab counts for the Photos page subtitle: `(photos, videos, raw)`.
     pub fn photos_counts(&self) -> Result<(usize, usize, usize)> {
         use crate::control::PhotoKind;
-        let conn = self.conn.lock();
+        let conn = self.read();
         let mut stmt = conn.prepare("SELECT kind, COUNT(*) FROM photos GROUP BY kind")?;
         let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))?;
         let (mut photos, mut videos, mut raw) = (0usize, 0usize, 0usize);
@@ -223,7 +223,7 @@ impl Db {
         if uids.is_empty() {
             return Ok(Vec::new());
         }
-        let conn = self.conn.lock();
+        let conn = self.read();
         let placeholders = vec!["?"; uids.len()].join(",");
         let mut stmt = conn.prepare(&format!(
             "SELECT uid, capture_time, name, ratio, thumb_state, kind, favorite FROM photos
@@ -273,7 +273,7 @@ impl Db {
 
     /// Number of photos in the persisted timeline.
     pub fn photos_count(&self) -> Result<usize> {
-        let conn = self.conn.lock();
+        let conn = self.read();
         let n: i64 = conn.query_row("SELECT COUNT(*) FROM photos", [], |r| r.get(0))?;
         Ok(n.max(0) as usize)
     }

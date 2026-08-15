@@ -106,7 +106,7 @@ use mount::{
     SecondaryInsertRejection, SecondaryMount, clear_stale_mount, fuse_connection_id, spawn_session,
 };
 use reads::{BlockFlight, BlockRing, PREFETCH_BUDGET, Prefetch, ReaderSlot, STREAM_BYPASS_MIN};
-use state::{Entry, Intervals, PendingRevision, State, WriteHandle};
+use state::{Entry, Intervals, PendingRevision, State, StateGuard, WriteHandle, lock_state};
 use tracing::{debug, error, info, warn};
 use transfers::{CountingWriter, JobGuard, OwnedCountingReader, TransferRegistry};
 use r#virtual::{
@@ -320,6 +320,45 @@ impl RootListingSnapshot {
 struct VirtualRootPlan {
     node: Node,
     visible: bool,
+}
+
+/// The sync folders a search hit can be opened through, as
+/// (Drive-relative root path, local directory) pairs.
+///
+/// Built once per search by [`Core::search_roots`]; resolving a hit against it
+/// is string arithmetic over the paths the index already carries, with no
+/// further queries.
+struct SearchRoots {
+    roots: Vec<(String, PathBuf)>,
+}
+
+impl SearchRoots {
+    /// The absolute local path for a hit at Drive-relative `path`, through the
+    /// most specific root covering it. A node can sit below several configured
+    /// roots, so the one leaving the shortest descendant path wins.
+    fn resolve(&self, path: &str) -> Option<String> {
+        self.roots
+            .iter()
+            .filter_map(|(root, local)| {
+                let relative = relative_to(root, path)?;
+                Some((relative.split('/').count(), local.join(relative)))
+            })
+            .min_by_key(|(depth, _)| *depth)
+            .map(|(_, path)| path.to_string_lossy().into_owned())
+    }
+}
+
+/// `path` expressed relative to `root`, or `None` if it is not below it. The
+/// root itself resolves to the empty path; an empty root is the mount itself
+/// and covers everything.
+fn relative_to<'a>(root: &str, path: &'a str) -> Option<&'a str> {
+    if root.is_empty() {
+        return Some(path);
+    }
+    if path == root {
+        return Some("");
+    }
+    path.strip_prefix(root)?.strip_prefix('/')
 }
 
 #[derive(Clone)]
@@ -835,10 +874,20 @@ impl Core {
     /// `pending_op` row records a uid, not the session that queued it. Applying
     /// to all of them is correct because a uid is unique across mounts — at most
     /// one state has an entry for it, and the rest are no-ops.
+    /// Take this mount's inode lock.
+    ///
+    /// The guard is what applies the mutation's write-throughs, after releasing
+    /// the lock — see [`StateGuard`]. Every caller takes it this way; nothing
+    /// locks `self.state` directly, or the writes it queues would be applied
+    /// only when some later caller happened to take the guard.
+    fn state(&self) -> StateGuard<'_> {
+        StateGuard::new(self.state.lock(), &self.db)
+    }
+
     fn for_each_state(&self, mut apply: impl FnMut(&mut State)) {
         for (_, state, notifier, _) in self.states.live() {
             let changed = {
-                let mut state = state.lock();
+                let mut state = lock_state(&state, &self.db);
                 apply(&mut state);
                 state.take_access_changes()
             };
@@ -858,7 +907,7 @@ impl Core {
         for (_, state, notifier, _) in self.states.live() {
             let mut batch = NotifyBatch::default();
             {
-                let mut state = state.lock();
+                let mut state = lock_state(&state, &self.db);
                 apply(&mut state, &mut batch);
             }
             batch.flush(notifier.get());
@@ -869,12 +918,12 @@ impl Core {
     /// lock is released before notifying the kernel because notifier callbacks
     /// may synchronously provoke more filesystem work.
     fn flush_access_changes(&self) {
-        let changed = self.state.lock().take_access_changes();
+        let changed = self.state().take_access_changes();
         notify_access_changes(self.notifier.get(), &changed);
     }
 
     fn require_writable(&self, ino: u64) -> Result<(), Errno> {
-        self.state.lock().require_writable(ino)
+        self.state().require_writable(ino)
     }
 
     /// Mutation admission point. Persisted and every resident authority must
@@ -888,7 +937,7 @@ impl Core {
     fn require_uid_writable(&self, uid: &NodeUid) -> Result<(), Errno> {
         let mut live_access = Vec::new();
         {
-            let state = self.state.lock();
+            let state = self.state();
             if let Some(access) = state.access_by_uid(uid) {
                 live_access.push(access);
             }
@@ -1255,7 +1304,7 @@ impl Core {
         // Their node rows remain persisted as drain-time access authority, but
         // must not reappear in the mounted namespace after a restart.
         let hidden = self.hidden.lock().clone();
-        let mut st = self.state.lock();
+        let mut st = self.state();
 
         // Pass 1: assign a stable inode to every uid (root is already mapped).
         for sn in &stored {
@@ -1588,7 +1637,7 @@ impl Core {
             match self.rt.block_on(self.client.get_my_files_folder()) {
                 Ok(root) => {
                     {
-                        let mut st = self.state.lock();
+                        let mut st = self.state();
                         if let Some(e) = st.entries.get_mut(&ROOT_INO) {
                             e.node = root.clone();
                         }
@@ -1617,7 +1666,7 @@ impl Core {
     /// Lets a handler decide between answering inline and handing off to a
     /// worker, at the cost of one uncontended map lookup.
     fn children_cached(&self, ino: u64) -> bool {
-        self.state.lock().children.contains_key(&ino)
+        self.state().children.contains_key(&ino)
     }
 
     /// Re-apply the optimistic size of any queued write to `nodes`.
@@ -1693,7 +1742,7 @@ impl Core {
     ) -> Result<(), Errno> {
         let _publication = self.shared_publication.lock();
         let plan = self.prepare_virtual_root(&snapshot.real_names())?;
-        let mut st = self.state.lock();
+        let mut st = self.state();
         // State methods already establish the state -> DB lock order. No path
         // holds the DB connection while acquiring state, including shared event
         // publication, so keeping state locked across this one transaction
@@ -1705,7 +1754,7 @@ impl Core {
     }
 
     fn resident_root_listing_snapshot(&self, ino: u64) -> Result<RootListingSnapshot, Errno> {
-        RootListingSnapshot::capture(&self.state.lock(), ino).ok_or(Errno::EAGAIN)
+        RootListingSnapshot::capture(&self.state(), ino).ok_or(Errno::EAGAIN)
     }
 
     fn shared_folder_freshness_key(uid: &NodeUid) -> String {
@@ -1743,7 +1792,7 @@ impl Core {
 
     fn ensure_shared_children(&self, ino: u64) -> Result<(), Errno> {
         let online = self.online.load(Ordering::Relaxed);
-        let resident = self.state.lock().children.contains_key(&ino);
+        let resident = self.state().children.contains_key(&ino);
         match shared_listing_plan(
             resident,
             online,
@@ -1760,7 +1809,7 @@ impl Core {
                         error!(%error, "loading persisted shared roots failed");
                         Errno::EIO
                     })?;
-                let mut st = self.state.lock();
+                let mut st = self.state();
                 if st.children.contains_key(&ino) {
                     return Ok(());
                 }
@@ -1817,7 +1866,7 @@ impl Core {
             Ok(removed) => removed,
             Err(error) => {
                 error!(%error, "publishing shared-root listing failed");
-                let mut st = self.state.lock();
+                let mut st = self.state();
                 for uid in &accepted.uids {
                     st.downgrade_shared_subtree(uid);
                 }
@@ -1834,7 +1883,7 @@ impl Core {
             .iter()
             .map(|root| (root.node.uid.clone(), root.access))
             .collect();
-        let mut st = self.state.lock();
+        let mut st = self.state();
         for uid in &removed {
             st.hide_shared_root(uid);
         }
@@ -1863,7 +1912,7 @@ impl Core {
     /// held so concurrent metadata reads aren't blocked behind a fetch.
     fn ensure_children(&self, ino: u64) -> Result<(), Errno> {
         let (folder_uid, cached) = {
-            let st = self.state.lock();
+            let st = self.state();
             match st.entries.get(&ino) {
                 Some(e) => (e.uid.clone(), st.children.contains_key(&ino)),
                 None => return Err(Errno::ENOENT),
@@ -1906,7 +1955,7 @@ impl Core {
                 // sealed, which a queued write is ahead of (B11).
                 self.stamp_pending_sizes(&mut nodes);
                 let hidden = self.hidden.lock().clone();
-                let mut st = self.state.lock();
+                let mut st = self.state();
                 if st.children.contains_key(&ino) {
                     return Ok(());
                 }
@@ -2014,7 +2063,7 @@ impl Core {
                 })
                 .map(|node| node.uid.clone())
                 .collect();
-            let mut st = self.state.lock();
+            let mut st = self.state();
             for uid in &removed {
                 st.hide_foreign_subtree(uid);
             }
@@ -2034,7 +2083,7 @@ impl Core {
             return Ok(());
         }
 
-        let mut st = self.state.lock();
+        let mut st = self.state();
         // Lost the race? Another thread already populated it.
         if st.children.contains_key(&ino) {
             return Ok(());
@@ -2098,7 +2147,7 @@ impl Core {
             )
         };
         let (key, mut missing): (u64, Vec<NodeUid>) = {
-            let st = self.state.lock();
+            let st = self.state();
             match st.children.get(&parent) {
                 // The listing is resident: batch the whole folder under its
                 // inode, so the rest of an `ls -l` rides along on this fetch.
@@ -2249,7 +2298,7 @@ impl Core {
     /// A node that vanished counts as resolved; there is nothing left to wait
     /// for, and its caller will find the `ENOENT` for itself.
     fn size_is_real(&self, ino: u64) -> bool {
-        let st = self.state.lock();
+        let st = self.state();
         st.entries.get(&ino).is_none_or(|e| {
             !matches!(
                 &e.node.kind,
@@ -2281,7 +2330,7 @@ impl Core {
             // (B11).
             core.stamp_pending_sizes(&mut nodes);
             let mut changed: Vec<u64> = Vec::new();
-            let mut st = core.state.lock();
+            let mut st = core.state();
             for node in nodes {
                 // Only adopt the size. Re-interning wholesale would also adopt a
                 // name or parent that a rename/move may have changed locally
@@ -2332,7 +2381,7 @@ impl Core {
     /// the parent's listing is cached first.
     fn lookup_child(&self, parent: u64, name: &str) -> Result<(u64, NodeUid), Errno> {
         self.ensure_children(parent)?;
-        let st = self.state.lock();
+        let st = self.state();
         st.children
             .get(&parent)
             .and_then(|kids| {
@@ -2352,7 +2401,7 @@ impl Core {
     fn resolve_path(&self, rel: &Path) -> Result<(u64, NodeUid), Errno> {
         let mut ino = ROOT_INO;
         let mut uid = {
-            let st = self.state.lock();
+            let st = self.state();
             st.entries
                 .get(&ROOT_INO)
                 .map(|e| e.uid.clone())
@@ -2400,7 +2449,7 @@ impl Core {
     }
 
     fn source_parent_uid(&self, ino: u64, rel: &Path) -> CoreResult<NodeUid> {
-        let state = self.state.lock();
+        let state = self.state();
         let entry = state
             .entries
             .get(&ino)
@@ -2758,13 +2807,18 @@ impl Core {
         // Reflect the write in the tree straight away: `ls` must show the new
         // size and mtime even though the remote still holds the old revision.
         let now = now_secs();
-        let recorded = {
-            let mut st = self.state.lock();
-            // The only record that the file is as long as the caller was told.
-            // If it cannot be written the write did not fully take, and saying
-            // so beats acknowledging a `close(2)` and then serving the old size
-            // — the bytes themselves are already staged and queued either way.
+        let updated = {
+            let mut st = self.state();
             st.record_pending_write(ino, len, now)
+        };
+        // The only record that the file is as long as the caller was told. If it
+        // cannot be written the write did not fully take, and saying so beats
+        // acknowledging a `close(2)` and then serving the old size — the bytes
+        // themselves are already staged and queued either way. Written out here
+        // rather than inside `State` so the commit does not hold the inode lock.
+        let recorded = match updated {
+            Some(node) => self.db.upsert_node(&node),
+            None => Ok(()),
         };
         // Cached blobs and open readers describe the superseded revision. Reads
         // come from the staged blob until the op drains, so just drop them.
@@ -2803,7 +2857,7 @@ impl Core {
     ///   base, so it is the drain that has to fetch it.
     fn queue_truncate(&self, ino: u64, size: u64) -> Result<(), Errno> {
         let (uid, base_mtime, base_size, base_revision_id) = {
-            let st = self.state.lock();
+            let st = self.state();
             match st.entries.get(&ino) {
                 Some(e) if e.node.is_file() => (
                     e.uid.clone(),
@@ -3108,7 +3162,7 @@ impl Core {
                     "cannot queue write; bytes kept in staging"
                 );
                 let name = {
-                    let st = self.state.lock();
+                    let st = self.state();
                     st.entries
                         .get(&ino)
                         .map(|e| e.node.name.clone())
@@ -3136,7 +3190,7 @@ impl Core {
                     "write rescue was only partially published; bytes retained"
                 );
                 let name = {
-                    let st = self.state.lock();
+                    let st = self.state();
                     st.entries
                         .get(&ino)
                         .map(|entry| entry.node.name.clone())
@@ -3223,7 +3277,7 @@ impl Core {
     fn pin(&self, rel: &Path) -> CoreResult<String> {
         let (ino, uid) = self.resolve(rel)?;
         let (name, is_folder, mtime, size) = {
-            let st = self.state.lock();
+            let st = self.state();
             let e = st
                 .entries
                 .get(&ino)
@@ -3266,7 +3320,7 @@ impl Core {
         while let Some(dir) = stack.pop() {
             self.ensure_children(dir)
                 .map_err(|e| self.errno_error(e, "enumerate"))?;
-            let st = self.state.lock();
+            let st = self.state();
             if let Some(kids) = st.children.get(&dir) {
                 for &k in kids {
                     if let Some(e) = st.entries.get(&k) {
@@ -3307,7 +3361,7 @@ impl Core {
     /// `Ok(None)` when the node is not a file or has no thumbnail of that type.
     fn thumbnail(&self, ino: u64, ttype: ThumbnailType) -> Result<Option<Vec<u8>>, Errno> {
         let (uid, mtime) = {
-            let st = self.state.lock();
+            let st = self.state();
             match st.entries.get(&ino) {
                 Some(e) if e.node.is_file() => (e.uid.clone(), e.node.modification_time),
                 Some(_) => return Ok(None),
@@ -3356,7 +3410,7 @@ impl Core {
     fn unpin(&self, rel: &Path) -> CoreResult<String> {
         let (ino, uid) = self.resolve(rel)?;
         let (name, is_folder) = {
-            let st = self.state.lock();
+            let st = self.state();
             st.entries
                 .get(&ino)
                 .map(|e| (e.node.name.clone(), e.node.is_folder()))
@@ -3397,7 +3451,7 @@ impl Core {
         // Snapshot the listing, then drop the lock before touching the on-disk
         // pin registry so a slow disk read doesn't block FUSE metadata ops.
         let rows: Vec<(String, bool, u64, i64, NodeUid)> = {
-            let st = self.state.lock();
+            let st = self.state();
             st.children
                 .get(&ino)
                 .map(|kids| {
@@ -3436,31 +3490,47 @@ impl Core {
             .collect())
     }
 
-    /// Return an absolute path through the most specific local location
-    /// covering `uid`. A node may be below several configured roots, so prefer
-    /// the root leaving the shortest descendant path.
+    /// Every uid that is pinned right now, as one set.
+    ///
+    /// `cache.is_pinned` is a direct lookup plus an ancestor walk; asking it per
+    /// candidate was a thousand walks per keystroke. The recursive expansion is
+    /// the same query, run once.
+    fn pinned_set(&self) -> HashSet<String> {
+        self.db
+            .pinned_uids()
+            .unwrap_or_default()
+            .into_iter()
+            .collect()
+    }
+
+    /// The local locations a search result can be opened through, resolved once
+    /// per search rather than once per hit.
     ///
     /// An on-demand folder only answers while its mount is live — without the
     /// mount its `local_path` is an ordinary empty directory. A mirror folder
     /// needs no mount: its files are real local copies the sync loop pushes
     /// back, so it is a valid open target whenever it is configured.
-    fn mounted_search_path(&self, uid: &str) -> Option<String> {
+    ///
+    /// This used to be a per-hit call that re-read the sync-folder list and ran
+    /// an ancestor walk per folder, against a candidate pool of up to a
+    /// thousand: the whole cost of a keystroke was in here.
+    fn search_roots(&self) -> SearchRoots {
         let live_mounts = self.mounts.lock();
-        let folders = self.db.sync_folder_list().ok()?;
-        folders
-            .into_iter()
-            .filter(|folder| match folder.mode.as_str() {
-                "ondemand" => live_mounts.contains_key(&folder.id),
-                "mirror" => true,
-                _ => false,
-            })
-            .filter_map(|folder| {
-                let relative = self.db.path_relative_to(&folder.remote_uid, uid).ok()??;
-                let depth = relative.split('/').count();
-                Some((depth, PathBuf::from(folder.local_path).join(relative)))
-            })
-            .min_by_key(|(depth, _)| *depth)
-            .map(|(_, path)| path.to_string_lossy().into_owned())
+        let folders = self.db.sync_folder_list().unwrap_or_default();
+        SearchRoots {
+            roots: folders
+                .into_iter()
+                .filter(|folder| match folder.mode.as_str() {
+                    "ondemand" => live_mounts.contains_key(&folder.id),
+                    "mirror" => true,
+                    _ => false,
+                })
+                .filter_map(|folder| {
+                    let root = self.db.node_path(&folder.remote_uid).ok().flatten()?;
+                    Some((root, PathBuf::from(folder.local_path)))
+                })
+                .collect(),
+        }
     }
 
     /// Full-text search node names against the local SQLite index, mapping each
@@ -3471,17 +3541,19 @@ impl Core {
             .db
             .search(query, limit)
             .map_err(|e| CoreError::from_api(&e, "search"))?;
+        let roots = self.search_roots();
+        let pinned = self.pinned_set();
         Ok(hits
             .into_iter()
             .map(|h| SearchHit {
                 name: h.node.name.clone(),
-                path: h.path,
                 is_dir: h.node.is_folder(),
                 size: node_size(&h.node),
                 modified: h.node.modification_time,
-                pinned: self.cache.is_pinned(&h.node.uid),
+                pinned: pinned.contains(&h.node.uid.to_string()),
                 uid: h.node.uid.to_string(),
-                mounted_path: self.mounted_search_path(&h.node.uid.to_string()),
+                mounted_path: roots.resolve(&h.path),
+                path: h.path,
                 score: 0,
             })
             .collect())
@@ -3525,6 +3597,8 @@ impl Core {
         // SQLite boundary to `limit` would recreate the old empty-filter bug.
         let candidate_limit = limit.saturating_mul(10).clamp(100, 1_000);
         let mut drive_hits = if filters.sources.contains(&SearchSource::Drive) {
+            let roots = self.search_roots();
+            let pinned = self.pinned_set();
             self.db
                 .search_candidates(query, candidate_limit)
                 .map_err(|e| CoreError::from_api(&e, "search candidates"))?
@@ -3534,18 +3608,19 @@ impl Core {
                     let parent = Path::new(&hit.path)
                         .parent()
                         .map_or_else(String::new, |path| path.display().to_string());
-                    let pinned = self.cache.is_pinned(&hit.node.uid);
+                    let uid = hit.node.uid.to_string();
+                    let is_pinned = pinned.contains(&uid);
                     let score = relevance_score(query, &hit.node.name, &parent)?
-                        + if pinned { 250 } else { 0 };
+                        + if is_pinned { 250 } else { 0 };
                     Some(SearchHit {
                         name: hit.node.name.clone(),
-                        path: hit.path,
                         is_dir: hit.node.is_folder(),
                         size: node_size(&hit.node),
                         modified: hit.node.modification_time,
-                        pinned,
-                        uid: hit.node.uid.to_string(),
-                        mounted_path: self.mounted_search_path(&hit.node.uid.to_string()),
+                        pinned: is_pinned,
+                        uid,
+                        mounted_path: roots.resolve(&hit.path),
+                        path: hit.path,
                         score,
                     })
                 })
@@ -3621,7 +3696,7 @@ impl Core {
     fn open_file(&self, rel: &Path) -> CoreResult<PathBuf> {
         let (ino, uid) = self.resolve(rel)?;
         let (name, mtime, size) = {
-            let st = self.state.lock();
+            let st = self.state();
             let e = st
                 .entries
                 .get(&ino)
@@ -3746,7 +3821,7 @@ impl Core {
     fn invalidate_parent_listing(&self, rel: &Path) {
         let parent = rel.parent().unwrap_or_else(|| Path::new(""));
         if let Ok((pino, _)) = self.resolve_path(parent) {
-            self.state.lock().invalidate_listing(pino);
+            self.state().invalidate_listing(pino);
         }
     }
 
@@ -3805,7 +3880,7 @@ impl Core {
             .map(|(_, n)| n)
             .unwrap_or_default();
         self.invalidate_parent_listing(rel);
-        self.state.lock().invalidate_listing(pino);
+        self.state().invalidate_listing(pino);
         Ok(name)
     }
 
@@ -4096,7 +4171,7 @@ impl Core {
     /// [`CtlRequest::Refresh`] with a [`RefreshScope::Dir`] scope.
     fn refresh_dir(&self, rel: &Path) -> CoreResult<()> {
         let (ino, _uid) = self.resolve(rel)?;
-        self.state.lock().invalidate_listing(ino);
+        self.state().invalidate_listing(ino);
         Ok(())
     }
 
@@ -4262,7 +4337,7 @@ impl Core {
         let node = self
             .fetch_node(&new_uid)
             .map_err(|e| self.errno_error(e, "fetch node"))?;
-        let mut st = self.state.lock();
+        let mut st = self.state();
         let ino = st.intern(pino, node);
         if let Some(kids) = st.children.get_mut(&pino)
             && !kids.contains(&ino)
@@ -5935,7 +6010,7 @@ mod tests {
         let mut persisted_virtual = virtual_node(root_uid.clone(), "Shared with me".into(), 0);
         persisted_virtual.trashed = true;
         state
-            .db
+            .flushed_db()
             .publish_virtual_root(super::SHARED_WITH_ME_NAME, &persisted_virtual)
             .unwrap();
         let mut indexed_descendant = node_helper_in_volume(
@@ -5946,7 +6021,7 @@ mod tests {
             false,
         );
         indexed_descendant.parent_uid = Some(shared_with_me_uid());
-        state.db.upsert_node(&indexed_descendant).unwrap();
+        state.flushed_db().upsert_node(&indexed_descendant).unwrap();
         assert!(
             state
                 .db
@@ -5972,7 +6047,7 @@ mod tests {
             node: stale_node.clone(),
             visible: true,
         };
-        let db = state.db.clone();
+        let db = state.flushed_db();
         let error = publish_virtual_root_in_listing(
             &db,
             &mut state,
@@ -6048,14 +6123,17 @@ mod tests {
             false,
         );
         descendant.parent_uid = Some(shared_with_me_uid());
-        state.db.upsert_node(&descendant).unwrap();
+        state.flushed_db().upsert_node(&descendant).unwrap();
         // A node whose parent row is not cached — the synthetic root is not one
         // until this publication commits — is indexed under the path it can
         // actually be resolved to, which is its bare name. Publication reindexes
         // the subtree beneath the synthetic ancestor, so that path is what the
         // rollback has to restore.
         let path_before = {
-            let hits = state.db.search("AtomicRollbackFindable", 10).unwrap();
+            let hits = state
+                .flushed_db()
+                .search("AtomicRollbackFindable", 10)
+                .unwrap();
             assert_eq!(hits.len(), 1, "the descendant starts out searchable");
             hits[0].path.clone()
         };
@@ -6064,7 +6142,7 @@ mod tests {
         // The pin is the transaction's final statement. Failing it proves the
         // earlier access, node, and descendant FTS work rolls back with it.
         state
-            .db
+            .flushed_db()
             .with_conn(|conn| {
                 conn.execute_batch(
                     "CREATE TRIGGER reject_virtual_root_pin
@@ -6082,7 +6160,7 @@ mod tests {
         let by_uid_before = state.by_uid.len();
         let next_ino_before = state.next_ino;
         let access_before = state.share_access.clone();
-        let db = state.db.clone();
+        let db = state.flushed_db();
         let result = publish_virtual_root_in_listing(
             &db,
             &mut state,
@@ -6110,7 +6188,10 @@ mod tests {
         );
 
         assert_eq!(
-            state.db.state_str(super::SHARED_WITH_ME_NAME).unwrap(),
+            state
+                .flushed_db()
+                .state_str(super::SHARED_WITH_ME_NAME)
+                .unwrap(),
             None
         );
         assert!(
@@ -6120,8 +6201,17 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
-        assert_eq!(state.db.share_access(&shared_with_me_uid()).unwrap(), None);
-        let hits = state.db.search("AtomicRollbackFindable", 10).unwrap();
+        assert_eq!(
+            state
+                .flushed_db()
+                .share_access(&shared_with_me_uid())
+                .unwrap(),
+            None
+        );
+        let hits = state
+            .flushed_db()
+            .search("AtomicRollbackFindable", 10)
+            .unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(
             hits[0].path, path_before,
@@ -6589,7 +6679,7 @@ mod tests {
         let shared = state.intern(root, node_helper("shared", "root", "shared", true));
         state.entries.get_mut(&shared).unwrap().access = Access::Viewer;
         let uid = state.entries[&shared].uid.clone();
-        let db = state.db.clone();
+        let db = state.flushed_db();
         let before = db.pending_ops().unwrap().len();
 
         let preserved = Cell::new(false);
@@ -6629,7 +6719,7 @@ mod tests {
         let root = state.intern(0, node_helper("root", "none", "root", true));
         let node = state.intern(root, node_helper("shared", "root", "shared", true));
         let uid = state.entries[&node].uid.clone();
-        let db = state.db.clone();
+        let db = state.flushed_db();
 
         db.set_share_access(&uid, Access::Viewer).unwrap();
         assert_eq!(
@@ -6713,7 +6803,7 @@ mod tests {
         let mut virtual_node = node_helper("sharedwithme", "root", "Shared with me", true);
         virtual_node.uid = shared_with_me_uid();
         state
-            .db
+            .flushed_db()
             .set_share_access(&virtual_node.uid, Access::Viewer)
             .unwrap();
         state
@@ -6957,18 +7047,7 @@ mod tests {
         std::fs::create_dir_all(&dir_path).unwrap();
         let db = pdfs_core::db::Db::open(&dir_path.join("cache.db")).unwrap();
         let share_access = db.all_share_access().unwrap();
-        let st = crate::state::State {
-            entries: std::collections::HashMap::new(),
-            by_uid: std::collections::HashMap::new(),
-            children: std::collections::HashMap::new(),
-            next_ino: 1,
-            active_writes: std::collections::HashMap::new(),
-            handles: std::collections::HashMap::new(),
-            next_fh: 1,
-            access_changes: std::collections::HashSet::new(),
-            share_access,
-            db: std::sync::Arc::new(db),
-        };
+        let st = crate::state::State::new(std::sync::Arc::new(db), share_access, 1);
         (st, TestDir(dir_path))
     }
 
@@ -7008,7 +7087,7 @@ mod tests {
         // The typed DB operation atomically replaces the old revision with the
         // one intent that must survive the open handle's final release.
         state
-            .db
+            .flushed_db()
             .enqueue_op(&PendingOp {
                 id: 0,
                 kind: OP_REVISION.to_string(),
@@ -7024,45 +7103,64 @@ mod tests {
             })
             .unwrap();
         let (_, blobs) = state
-            .db
+            .flushed_db()
             .replace_ops_with_trash(&uid.to_string(), "dirty.txt", 2)
             .unwrap();
         assert!(blobs.is_empty());
-        let queued_counts = state.db.pending_op_counts().unwrap();
+        let queued_counts = state.flushed_db().pending_op_counts().unwrap();
 
         state.unlink_mem(&uid);
         assert!(state.entries[&ino].unlinked);
         assert!(!state.children[&parent].contains(&ino));
-        assert!(state.db.node_by_uid(&uid.to_string()).unwrap().is_some());
+        assert!(
+            state
+                .flushed_db()
+                .node_by_uid(&uid.to_string())
+                .unwrap()
+                .is_some()
+        );
 
         let released = release_unlinked_entry(&mut state, ino).unwrap();
         assert_eq!(released, uid);
         assert!(!state.by_uid.contains_key(&uid));
         assert!(release_must_retain_queued_trash(&state.db, &uid).unwrap());
         assert!(
-            state.db.node_by_uid(&uid.to_string()).unwrap().is_some(),
+            state
+                .flushed_db()
+                .node_by_uid(&uid.to_string())
+                .unwrap()
+                .is_some(),
             "last release keeps persisted drain authority"
         );
-        let pending = state.db.pending_ops().unwrap();
+        let pending = state.flushed_db().pending_ops().unwrap();
         assert_eq!(pending.len(), 1, "release must not add a revision");
         assert_eq!(pending[0].kind, OP_TRASH);
-        let after_release = state.db.pending_op_counts().unwrap();
+        let after_release = state.flushed_db().pending_op_counts().unwrap();
         assert_eq!(after_release.uploads, 0);
         assert_eq!(after_release.changes, 1);
         assert_eq!(after_release.uploads, queued_counts.uploads);
         assert_eq!(after_release.changes, queued_counts.changes);
 
-        state.db.complete_trash_op(pending[0].id, &uid).unwrap();
-        assert!(state.db.pending_ops().unwrap().is_empty());
-        assert!(state.db.node_by_uid(&uid.to_string()).unwrap().is_none());
+        state
+            .flushed_db()
+            .complete_trash_op(pending[0].id, &uid)
+            .unwrap();
+        assert!(state.flushed_db().pending_ops().unwrap().is_empty());
+        assert!(
+            state
+                .flushed_db()
+                .node_by_uid(&uid.to_string())
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
     fn queued_trash_lookup_failure_conservatively_retains_unlinked_state() {
-        let (state, _dir) = state_test_helper();
+        let (mut state, _dir) = state_test_helper();
         let uid = NodeUid::new(VolumeId::from("vol"), LinkId::from("uncertain-trash"));
         state
-            .db
+            .flushed_db()
             .with_conn(|conn| {
                 conn.execute_batch("DROP TABLE pending_op")?;
                 Ok(())
@@ -7111,5 +7209,74 @@ mod tests {
             album: None,
             verification: Default::default(),
         }
+    }
+}
+
+#[cfg(test)]
+mod search_root_tests {
+    use super::*;
+
+    fn roots(pairs: &[(&str, &str)]) -> SearchRoots {
+        SearchRoots {
+            roots: pairs
+                .iter()
+                .map(|(root, local)| ((*root).to_string(), PathBuf::from(local)))
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn a_hit_below_a_root_resolves_through_it() {
+        let roots = roots(&[("Videos/Anime", "/home/u/anime")]);
+        assert_eq!(
+            roots.resolve("Videos/Anime/s01/e01.mkv").as_deref(),
+            Some("/home/u/anime/s01/e01.mkv")
+        );
+    }
+
+    #[test]
+    fn a_hit_outside_every_root_resolves_nowhere() {
+        let roots = roots(&[("Videos/Anime", "/home/u/anime")]);
+        assert_eq!(roots.resolve("Documents/tax.pdf"), None);
+    }
+
+    #[test]
+    fn a_sibling_sharing_a_name_prefix_is_not_below_the_root() {
+        // `Videos/Anime2` starts with `Videos/Anime` as a string and is a
+        // different folder; only a `/` boundary makes it a descendant.
+        let roots = roots(&[("Videos/Anime", "/home/u/anime")]);
+        assert_eq!(roots.resolve("Videos/Anime2/e01.mkv"), None);
+    }
+
+    #[test]
+    fn the_most_specific_root_wins() {
+        let roots = roots(&[
+            ("Videos", "/home/u/videos"),
+            ("Videos/Anime", "/home/u/anime"),
+        ]);
+        assert_eq!(
+            roots.resolve("Videos/Anime/e01.mkv").as_deref(),
+            Some("/home/u/anime/e01.mkv"),
+            "the root leaving the shortest descendant path is the one the user \
+             configured for this content"
+        );
+    }
+
+    #[test]
+    fn a_root_covering_the_whole_drive_resolves_everything() {
+        let roots = roots(&[("", "/home/u/drive")]);
+        assert_eq!(
+            roots.resolve("Documents/tax.pdf").as_deref(),
+            Some("/home/u/drive/Documents/tax.pdf")
+        );
+    }
+
+    #[test]
+    fn the_root_folder_itself_resolves_to_its_local_directory() {
+        let roots = roots(&[("Videos/Anime", "/home/u/anime")]);
+        assert_eq!(
+            roots.resolve("Videos/Anime").as_deref(),
+            Some("/home/u/anime/")
+        );
     }
 }

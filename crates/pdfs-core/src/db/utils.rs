@@ -1,6 +1,6 @@
 //! Small query helpers shared across the table modules.
 
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::Result;
 
@@ -8,14 +8,19 @@ use crate::Result;
 /// grams), so short queries fall back to a `LIKE` scan over `nodes.name`.
 pub(super) const TRIGRAM_MIN: usize = 3;
 
-pub(super) fn pair(row: &rusqlite::Row) -> rusqlite::Result<(String, String)> {
-    Ok((row.get(0)?, row.get(1)?))
+/// One raw search row: the node's JSON, its uid, and its stored path — `None`
+/// only for a row written before the `path` column existed, which
+/// [`path_of`] repairs by walking.
+pub(super) type HitRow = (String, String, Option<String>);
+
+pub(super) fn hit_row(row: &rusqlite::Row) -> rusqlite::Result<HitRow> {
+    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
 }
 
-/// Drain a `query_map` of [`pair`] rows into a `Vec`, propagating row errors.
-pub(super) fn collect_pairs(
-    rows: impl Iterator<Item = rusqlite::Result<(String, String)>>,
-) -> Result<Vec<(String, String)>> {
+/// Drain a `query_map` of [`hit_row`] rows into a `Vec`, propagating row errors.
+pub(super) fn collect_hits(
+    rows: impl Iterator<Item = rusqlite::Result<HitRow>>,
+) -> Result<Vec<HitRow>> {
     let mut out = Vec::new();
     for r in rows {
         out.push(r?);
@@ -37,16 +42,42 @@ pub(super) fn like_escape(s: &str) -> String {
 /// directly and so never passed through the index's cycle check.
 pub(super) const MAX_PATH_DEPTH: usize = 256;
 
-/// Resolve a node's mountpoint-relative path by walking `parent_uid` to the
-/// root via a recursive CTE. The root (the node with no parent) is excluded, so
-/// a top-level file `report.pdf` yields `"report.pdf"`, not `"My Files/report.pdf"`.
+/// Append `name` to a parent's stored path. An empty parent path is the root,
+/// whose name is the mount and so contributes nothing.
+pub(super) fn join_path(parent_path: &str, name: &str) -> String {
+    if parent_path.is_empty() {
+        name.to_string()
+    } else {
+        format!("{parent_path}/{name}")
+    }
+}
+
+/// Resolve a node's mountpoint-relative path. The root (the node with no
+/// parent) is excluded, so a top-level file `report.pdf` yields
+/// `"report.pdf"`, not `"My Files/report.pdf"`.
+///
+/// Reads the stored `nodes.path`, which the write path maintains (see
+/// `upsert_node_tx`). Falls back to [`walk_path_of`] for a row that predates the
+/// column or was never written through — a search serving a keystroke used to
+/// run that walk once per candidate, which is the reason the column exists.
+pub(super) fn path_of(conn: &Connection, uid: &str) -> Result<String> {
+    let stored: Option<Option<String>> = conn
+        .query_row("SELECT path FROM nodes WHERE uid = ?1", params![uid], |r| {
+            r.get(0)
+        })
+        .optional()?;
+    match stored.flatten() {
+        Some(path) => Ok(path),
+        None => walk_path_of(conn, uid),
+    }
+}
+
+/// Resolve a path by walking `parent_uid` to the root via a recursive CTE.
 ///
 /// A cycle in `parent_uid` is corrupt data the API can still hand us, and
 /// `UNION ALL` over one never terminates — the walk is therefore depth-capped
-/// and returns the truncated path rather than hanging the caller. That caller is
-/// usually a search serving a keystroke, holding the daemon's only SQLite
-/// connection.
-pub(super) fn path_of(conn: &Connection, uid: &str) -> Result<String> {
+/// and returns the truncated path rather than hanging the caller.
+pub(super) fn walk_path_of(conn: &Connection, uid: &str) -> Result<String> {
     let mut stmt = conn.prepare(&format!(
         "WITH RECURSIVE anc(uid, parent_uid, name, depth) AS (
            SELECT uid, parent_uid, name, 0 FROM nodes WHERE uid = ?1

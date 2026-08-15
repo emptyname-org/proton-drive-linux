@@ -39,7 +39,7 @@ impl Db {
     /// The persisted trash listing, folders first then by name — the order the
     /// Trash page shows it in.
     pub fn trash_list(&self) -> Result<Vec<StoredTrash>> {
-        let conn = self.conn.lock();
+        let conn = self.read();
         let mut stmt = conn.prepare(
             "SELECT uid, name, is_dir, size, mtime FROM trash
              ORDER BY is_dir DESC, name COLLATE NOCASE",

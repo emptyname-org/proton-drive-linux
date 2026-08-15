@@ -861,7 +861,7 @@ impl Core {
     /// root yet, which is not where the drain runs; the drain must not panic
     /// over it regardless, since that would stop the queue for good.
     pub(crate) fn root_uid(&self) -> Option<NodeUid> {
-        let st = self.state.lock();
+        let st = self.state();
         st.entries.get(&ROOT_INO).map(|e| e.uid.clone())
     }
 

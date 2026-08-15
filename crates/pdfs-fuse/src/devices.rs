@@ -591,19 +591,8 @@ impl Core {
     pub(crate) fn fork_state(&self) -> Core {
         let mut fork = self.clone();
         fork.primary = false;
-        let share_access = self.state.lock().share_access.clone();
-        fork.state = Arc::new(Mutex::new(State {
-            entries: HashMap::new(),
-            by_uid: HashMap::new(),
-            children: HashMap::new(),
-            next_ino: 2,
-            active_writes: HashMap::new(),
-            handles: HashMap::new(),
-            next_fh: 1,
-            access_changes: std::collections::HashSet::new(),
-            share_access,
-            db: self.db.clone(),
-        }));
+        let share_access = self.state().share_access.clone();
+        fork.state = Arc::new(Mutex::new(State::new(self.db.clone(), share_access, 2)));
         // A fresh inode space needs a fresh notification channel: this fork's
         // session is the only one that knows these inodes, so it must be the one
         // notified about them. Filled in by `spawn_ondemand_mount`.

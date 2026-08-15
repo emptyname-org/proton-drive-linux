@@ -9,7 +9,7 @@ use super::Db;
 use crate::Result;
 
 /// Current schema version. Bump on every forward migration added below.
-pub(super) const SCHEMA_VERSION: i64 = 24;
+pub(super) const SCHEMA_VERSION: i64 = 25;
 
 impl Db {
     pub(super) fn migrate(&self) -> Result<()> {
@@ -148,6 +148,18 @@ impl Db {
         }
         if current < 24 {
             tx.execute_batch(MIGRATION_V24)?;
+        }
+        if current < 25 {
+            // Same guard as V21: an old fixture may not have `nodes` at all,
+            // and there is no path to materialise without it.
+            let has_nodes: bool = tx.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'nodes'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )? > 0;
+            if has_nodes {
+                tx.execute_batch(MIGRATION_V25)?;
+            }
         }
         tx.execute(
             "INSERT INTO sync_state (key, value) VALUES ('schema_version', ?1)
@@ -669,4 +681,47 @@ CREATE TABLE IF NOT EXISTS own_sealed_rev (
   revision_id TEXT NOT NULL,
   sealed_at   INTEGER NOT NULL
 );
+";
+
+/// V25: `nodes.path` — a node's mountpoint-relative path, stored rather than
+/// walked.
+///
+/// `path_of` was a recursive CTE per node, and search ran it once per candidate
+/// (up to a thousand per keystroke) on top of the one the write path already ran
+/// per descendant of every folder upsert. The value only changes when a node's
+/// name or parent changes, which is exactly when the write path is already
+/// walking the subtree — so it belongs in a column.
+///
+/// The backfill is the same walk V21 used for `nodes_fts`, minus the trashed
+/// filter: a trashed node stays out of the index but still has a path. Roots get
+/// `''` (their name is the mount), and a node whose parent is merely uncached
+/// keeps its own name — both matching what `path_of` returned at runtime.
+///
+/// Materialised into a temp table rather than written by a correlated subquery,
+/// so the recursive walk runs once instead of once per row.
+const MIGRATION_V25: &str = "
+ALTER TABLE nodes ADD COLUMN path TEXT;
+
+CREATE TEMP TABLE node_paths (uid TEXT PRIMARY KEY, path TEXT NOT NULL);
+
+INSERT INTO node_paths (uid, path)
+WITH RECURSIVE paths(uid, path, depth) AS (
+  SELECT n.uid, CASE WHEN n.parent_uid IS NULL THEN '' ELSE n.name END, 0
+    FROM nodes n
+   WHERE n.parent_uid IS NULL
+      OR NOT EXISTS (SELECT 1 FROM nodes p WHERE p.uid = n.parent_uid)
+  UNION ALL
+  SELECT n.uid,
+         CASE WHEN paths.path = '' THEN n.name ELSE paths.path || '/' || n.name END,
+         paths.depth + 1
+    FROM nodes n JOIN paths ON n.parent_uid = paths.uid
+   WHERE paths.depth < 256
+)
+SELECT uid, path FROM paths;
+
+UPDATE nodes
+   SET path = (SELECT p.path FROM node_paths p WHERE p.uid = nodes.uid)
+ WHERE EXISTS (SELECT 1 FROM node_paths p WHERE p.uid = nodes.uid);
+
+DROP TABLE node_paths;
 ";

@@ -1509,6 +1509,7 @@ fn migration_v17_adds_share_access_to_a_v16_fixture() {
              DROP TABLE albums;
              DROP INDEX idx_photos_favorite;
              ALTER TABLE photos DROP COLUMN favorite;
+             ALTER TABLE nodes DROP COLUMN path;
              UPDATE sync_state SET value = '16' WHERE key = 'schema_version';",
         )
         .unwrap();
@@ -3281,4 +3282,266 @@ fn clear_state_prefix_takes_only_the_prefixed_keys() {
         Some(3),
         "the listing's own stamp is not a per-album one"
     );
+}
+
+// --- `nodes.path`, and the subtree work it replaces (DB3) -------------------
+
+/// Read the stored path column directly: the point of these tests is that the
+/// column itself is right, not that `path_of` can still fall back to a walk.
+fn stored_path(db: &Db, link: &str) -> Option<String> {
+    use rusqlite::OptionalExtension;
+    db.with_conn(|conn| {
+        Ok(conn
+            .query_row(
+                "SELECT path FROM nodes WHERE uid = ?1",
+                [uid(link).to_string()],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten())
+    })
+    .unwrap()
+}
+
+#[test]
+fn a_node_stores_its_path_when_it_is_written() {
+    let db = Db::open_in_memory().unwrap();
+    db.upsert_node(&folder("root", None, "My Files")).unwrap();
+    db.upsert_node(&folder("docs", Some("root"), "Documents"))
+        .unwrap();
+    db.upsert_node(&file("f1", "docs", "report.pdf", 1))
+        .unwrap();
+
+    // The root's name is the mount, so it contributes nothing.
+    assert_eq!(stored_path(&db, "root").as_deref(), Some(""));
+    assert_eq!(stored_path(&db, "docs").as_deref(), Some("Documents"));
+    assert_eq!(
+        stored_path(&db, "f1").as_deref(),
+        Some("Documents/report.pdf")
+    );
+}
+
+#[test]
+fn a_node_below_an_uncached_parent_starts_its_own_path() {
+    // A device folder's root lives in `device`/`sync_folder` and never gets a
+    // `nodes` row, so its children are the top of the cached chain.
+    let db = Db::open_in_memory().unwrap();
+    db.upsert_node(&folder("orphan", Some("never-cached"), "Work"))
+        .unwrap();
+    db.upsert_node(&file("f1", "orphan", "notes.txt", 1))
+        .unwrap();
+
+    assert_eq!(stored_path(&db, "orphan").as_deref(), Some("Work"));
+    assert_eq!(stored_path(&db, "f1").as_deref(), Some("Work/notes.txt"));
+}
+
+#[test]
+fn renaming_a_folder_rewrites_every_descendant_path() {
+    let db = Db::open_in_memory().unwrap();
+    db.upsert_node(&folder("root", None, "My Files")).unwrap();
+    db.upsert_node(&folder("a", Some("root"), "Before"))
+        .unwrap();
+    db.upsert_node(&folder("b", Some("a"), "Inner")).unwrap();
+    db.upsert_node(&file("f1", "b", "deep.txt", 1)).unwrap();
+    assert_eq!(
+        stored_path(&db, "f1").as_deref(),
+        Some("Before/Inner/deep.txt")
+    );
+
+    db.upsert_node(&folder("a", Some("root"), "After")).unwrap();
+
+    assert_eq!(stored_path(&db, "a").as_deref(), Some("After"));
+    assert_eq!(stored_path(&db, "b").as_deref(), Some("After/Inner"));
+    assert_eq!(
+        stored_path(&db, "f1").as_deref(),
+        Some("After/Inner/deep.txt")
+    );
+    let hit = &db.search("deep.txt", 10).unwrap()[0];
+    assert_eq!(
+        hit.path, "After/Inner/deep.txt",
+        "the search index must carry the rewritten path too"
+    );
+}
+
+#[test]
+fn moving_a_folder_rewrites_every_descendant_path() {
+    let db = Db::open_in_memory().unwrap();
+    db.upsert_node(&folder("root", None, "My Files")).unwrap();
+    db.upsert_node(&folder("old", Some("root"), "Old")).unwrap();
+    db.upsert_node(&folder("new", Some("root"), "New")).unwrap();
+    db.upsert_node(&folder("moved", Some("old"), "Moved"))
+        .unwrap();
+    db.upsert_node(&file("f1", "moved", "deep.txt", 1)).unwrap();
+
+    db.upsert_node(&folder("moved", Some("new"), "Moved"))
+        .unwrap();
+
+    assert_eq!(stored_path(&db, "moved").as_deref(), Some("New/Moved"));
+    assert_eq!(
+        stored_path(&db, "f1").as_deref(),
+        Some("New/Moved/deep.txt")
+    );
+}
+
+#[test]
+fn trashing_a_folder_drops_its_subtree_from_the_index() {
+    let db = Db::open_in_memory().unwrap();
+    db.upsert_node(&folder("root", None, "My Files")).unwrap();
+    db.upsert_node(&folder("a", Some("root"), "Holder"))
+        .unwrap();
+    db.upsert_node(&file("f1", "a", "hidden.txt", 1)).unwrap();
+    assert_eq!(db.search("hidden", 10).unwrap().len(), 1);
+
+    let mut trashed = folder("a", Some("root"), "Holder");
+    trashed.trashed = true;
+    db.upsert_node(&trashed).unwrap();
+
+    assert_eq!(
+        db.search("hidden", 10).unwrap().len(),
+        0,
+        "a file under a trashed folder is not reachable and must not be findable"
+    );
+
+    // …and comes back when the folder does.
+    db.upsert_node(&folder("a", Some("root"), "Holder"))
+        .unwrap();
+    assert_eq!(db.search("hidden", 10).unwrap().len(), 1);
+}
+
+/// The re-listing case, which is most of what the write path actually does: a
+/// folder upserted with the same name and parent must not touch its subtree.
+///
+/// Written as a ratio between two subtree sizes, so it fails on the scaling
+/// regression rather than on a slow machine. Before this, every re-listing paid
+/// a `path_of` walk plus an ancestor walk per descendant.
+#[test]
+fn re_listing_a_folder_does_not_scale_with_its_subtree() {
+    fn elapsed_for(children: usize) -> std::time::Duration {
+        let db = Db::open_in_memory().unwrap();
+        db.upsert_node(&folder("root", None, "My Files")).unwrap();
+        db.upsert_node(&folder("big", Some("root"), "Big")).unwrap();
+        let kids: Vec<Node> = (0..children)
+            .map(|i| file(&format!("k{i}"), "big", &format!("child-{i}.txt"), 1))
+            .collect();
+        db.upsert_nodes(&kids).unwrap();
+
+        let unchanged = folder("big", Some("root"), "Big");
+        let start = std::time::Instant::now();
+        for _ in 0..20 {
+            db.upsert_node(&unchanged).unwrap();
+        }
+        start.elapsed()
+    }
+
+    let small = elapsed_for(100);
+    let large = elapsed_for(2_000);
+    assert!(
+        large < small * 8,
+        "re-listing a folder scaled with its subtree: {small:?} for 100 children, \
+         {large:?} for 2000 (20x the descendants)"
+    );
+}
+
+#[test]
+fn migration_v25_backfills_paths_for_an_existing_tree() {
+    let path = std::env::temp_dir().join(format!(
+        "pdfs-db-v24-fixture-{}-{}.db",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    {
+        let db = Db::open(&path).unwrap();
+        db.upsert_node(&folder("root", None, "My Files")).unwrap();
+        db.upsert_node(&folder("docs", Some("root"), "Documents"))
+            .unwrap();
+        db.upsert_node(&file("f1", "docs", "report.pdf", 1))
+            .unwrap();
+        db.upsert_node(&folder("orphan", Some("never-cached"), "Work"))
+            .unwrap();
+        db.upsert_node(&file("f2", "orphan", "notes.txt", 1))
+            .unwrap();
+    }
+    {
+        // Put the file back in the state a released V24 database was in.
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "ALTER TABLE nodes DROP COLUMN path;
+             UPDATE sync_state SET value = '24' WHERE key = 'schema_version';",
+        )
+        .unwrap();
+    }
+
+    let db = Db::open(&path).unwrap();
+    assert_eq!(stored_path(&db, "root").as_deref(), Some(""));
+    assert_eq!(stored_path(&db, "docs").as_deref(), Some("Documents"));
+    assert_eq!(
+        stored_path(&db, "f1").as_deref(),
+        Some("Documents/report.pdf"),
+        "an existing tree must come out of the migration with the same paths \
+         the walk used to produce"
+    );
+    // A subtree whose top has an uncached parent is ordinary data, not an error.
+    assert_eq!(stored_path(&db, "orphan").as_deref(), Some("Work"));
+    assert_eq!(stored_path(&db, "f2").as_deref(), Some("Work/notes.txt"));
+
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(format!("{}.lock", path.display()));
+}
+
+// --- read-only connection pool (DB2) ---------------------------------------
+
+/// A read must not queue behind whatever happens to be writing.
+///
+/// The write connection is held for the whole measurement — which is what a
+/// large listing's commit does to it — while a reader asks for a search. Before
+/// the pool this was the same mutex, so the read waited for the writer;
+/// `busy_timeout` never entered into it, because the contention was this
+/// process's own lock rather than SQLite's.
+#[test]
+fn a_read_does_not_wait_for_the_write_connection() {
+    let path = std::env::temp_dir().join(format!(
+        "pdfs-db-readpool-{}-{}.db",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let db = std::sync::Arc::new(Db::open(&path).unwrap());
+    db.upsert_node(&folder("root", None, "My Files")).unwrap();
+    db.upsert_node(&file("f1", "root", "findme.txt", 1))
+        .unwrap();
+
+    let held = std::time::Duration::from_millis(500);
+    let (tx, rx) = std::sync::mpsc::channel();
+    let writer = {
+        let db = db.clone();
+        std::thread::spawn(move || {
+            db.with_conn(|_conn| {
+                tx.send(()).unwrap();
+                std::thread::sleep(held);
+                Ok(())
+            })
+            .unwrap();
+        })
+    };
+    rx.recv().unwrap();
+
+    let start = std::time::Instant::now();
+    let hits = db.search("findme", 10).unwrap();
+    let waited = start.elapsed();
+    writer.join().unwrap();
+
+    assert_eq!(hits.len(), 1, "the read must still see committed data");
+    assert!(
+        waited < held / 2,
+        "the read waited {waited:?} for a write connection held {held:?}"
+    );
+
+    drop(db);
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(format!("{}.lock", path.display()));
 }
