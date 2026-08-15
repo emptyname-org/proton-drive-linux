@@ -138,9 +138,9 @@ impl Core {
     /// enumerated every node up front and has been doing network I/O since. Before
     /// touching anything remote this re-reads the node and refuses to act unless
     /// it is *still* the same revision, still untrashed, still unwritten and still
-    /// unopened. Without that, a user edit landing inside the window is destroyed
-    /// — `discard_queued_ops` below drops the queued write *and its staged blob*,
-    /// which may hold the only copy of those bytes (`docs/BUGS.md` B71).
+    /// unopened (`docs/BUGS.md` B71). Nothing on this path discards a queued write
+    /// or its staged blob: a write that arrives after that check is left for the
+    /// drain to resolve against the now-trashed node.
     fn remove_conflict_copy(&self, snapshot: &proton_drive_rs::Node, base: &str) {
         let uid = &snapshot.uid;
         let name = snapshot.name.as_str();
@@ -166,10 +166,13 @@ impl Core {
         self.for_each_state(|st| {
             st.forget_or_unlink(uid);
         });
-        if let Err(error) = self.discard_queued_ops(uid) {
-            warn!(%uid, ?error, "conflict sweep: queued-op cleanup failed");
-            return;
-        }
+        // Deliberately *not* `discard_queued_ops`: `duplicate_still_removable`
+        // proved the queue empty before the trash above, but that proof is stale
+        // the moment `trash_nodes` goes to the network. A `close(2)` landing in
+        // that window stages bytes, and discarding here would unlink the staged
+        // blob holding the only copy of them. Leaving the op queued is the
+        // non-destructive outcome: the drain re-reads the node, sees it trashed,
+        // and `revision_conflict` routes it to `keep_as_conflict_copy`.
         self.cache.evict(uid);
         self.evict_reader(uid);
         if let Err(e) = self.db.delete_node(uid) {
@@ -194,8 +197,8 @@ impl Core {
         let uid = &snapshot.uid;
         let name = snapshot.name.as_str();
 
-        // A queued op means bytes are still owed an upload. `discard_queued_ops`
-        // would throw those away along with the staged blob holding them.
+        // A queued op means bytes are still owed an upload; trashing the node
+        // under them turns an ordinary upload into a conflict fork.
         match self.db.has_any_op(&uid.to_string()) {
             Ok(false) => {}
             Ok(true) => {

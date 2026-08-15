@@ -2628,6 +2628,26 @@ fn non_recursive_folder_pin_does_not_cover_children() {
     assert!(!db.is_pinned(&du("rep")).unwrap());
 }
 
+/// A `parent_uid` cycle is corrupt data the API can hand us, and `is_pinned`'s
+/// ancestor walk is `UNION ALL` — uncapped it never terminates, while holding
+/// the daemon's only SQLite connection, on a path that runs per cached read.
+/// The answer here matters less than the fact that there is one.
+#[test]
+fn is_pinned_terminates_on_a_parent_cycle() {
+    let db = Db::open_in_memory().unwrap();
+    let du = |l: &str| uid(l).to_string();
+    // a -> b -> a, with nothing pinned above either.
+    db.upsert_node(&folder("a", Some("b"), "A")).unwrap();
+    db.upsert_node(&folder("b", Some("a"), "B")).unwrap();
+    db.upsert_node(&file("leaf", "a", "leaf.txt", 1)).unwrap();
+
+    assert!(!db.is_pinned(&du("leaf")).unwrap());
+
+    // And a pin *inside* the cycle is still found rather than walked past.
+    db.pin_add(&du("a"), "A", true).unwrap();
+    assert!(db.is_pinned(&du("leaf")).unwrap());
+}
+
 #[test]
 fn schema_objects_exist() {
     let db = Db::open_in_memory().unwrap();

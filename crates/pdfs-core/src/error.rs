@@ -45,6 +45,27 @@ pub enum Error {
     Other(String),
 }
 
+impl Error {
+    /// Whether this is the local disk being full (`ENOSPC`), as opposed to any
+    /// other I/O failure.
+    ///
+    /// Worth distinguishing because it is the one storage failure the user can
+    /// act on, and because the caller's response differs: a full disk is met by
+    /// evicting cached blobs and answering `ENOSPC`, where `EIO` would read as a
+    /// broken file. `std::io::ErrorKind::StorageFull` is still unstable, so this
+    /// compares the raw code.
+    pub fn is_disk_full(&self) -> bool {
+        match self {
+            Error::Io(e) => e.raw_os_error() == Some(libc::ENOSPC),
+            // SQLite reports it as its own code rather than surfacing the errno.
+            Error::Db(rusqlite::Error::SqliteFailure(e, _)) => {
+                e.code == rusqlite::ErrorCode::DiskFull
+            }
+            _ => false,
+        }
+    }
+}
+
 pub type Result<T> = std::result::Result<T, Error>;
 
 /// A failure on its way to a front-end: prose for the user, plus the

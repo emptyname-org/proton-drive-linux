@@ -3,6 +3,73 @@
 use super::*;
 
 impl Filesystem for ProtonFs {
+    /// Negotiate kernel-side behaviour once, before any other callback.
+    ///
+    /// Everything here is a hint the kernel is free to decline, so each is
+    /// requested and its refusal logged rather than treated as fatal — an older
+    /// kernel that lacks a capability must still mount.
+    ///
+    /// Deliberately *not* requested: `FUSE_ATOMIC_O_TRUNC` and
+    /// `FUSE_DO_READDIRPLUS` change what the kernel sends (truncation folded
+    /// into `open`, `readdirplus` instead of `readdir` + N lookups), so they
+    /// need the matching handlers first; and `FOPEN_KEEP_CACHE` needs the write
+    /// path to invalidate page cache on every locally staged revision, not just
+    /// on remote events.
+    fn init(&mut self, _req: &Request, config: &mut KernelConfig) -> std::io::Result<()> {
+        // Readahead the kernel issues per file. Matching the block size means a
+        // sequential reader's readahead lands inside the block a demand read is
+        // already fetching, instead of one 128 KiB slice at a time.
+        if let Err(nearest) = config.set_max_readahead(BLOCK_SIZE as u32) {
+            debug!(nearest, "kernel capped max_readahead");
+            let _ = config.set_max_readahead(nearest);
+        }
+        if let Err(nearest) = config.set_max_background(MAX_BACKGROUND) {
+            debug!(nearest, "kernel capped max_background");
+        }
+        // Without this the kernel serialises lookups within one directory, so a
+        // cold `ls` of a folder is a chain of round trips rather than a fan-out.
+        if let Err(unsupported) = config.add_capabilities(InitFlags::FUSE_PARALLEL_DIROPS) {
+            debug!(?unsupported, "kernel does not support parallel dirops");
+        }
+        if let Err(unsupported) = config.add_capabilities(InitFlags::FUSE_CACHE_SYMLINKS) {
+            debug!(?unsupported, "kernel does not support symlink caching");
+        }
+        Ok(())
+    }
+
+    /// Free and total space, as `df` and every "will this fit?" preflight ask.
+    ///
+    /// Reported in [`REPORTED_BLKSIZE`] units against the *account* quota, not
+    /// the local cache: what a copy into the mount consumes is Drive storage.
+    /// The default implementation answers all-zeroes, which reads as a full
+    /// filesystem and makes installers and file managers refuse to write.
+    ///
+    /// On a worker, because a cold answer is a round trip
+    /// ([`Core::account_quota_cached`] serves a warm one from memory).
+    fn statfs(&self, _req: &Request, _ino: INodeNo, reply: ReplyStatfs) {
+        let core = self.core.clone();
+        self.core.workers.run(Lane::Meta, move || {
+            let (max_space, used_space) = core.account_quota_cached().unwrap_or((0, 0));
+            let bsize = u64::from(REPORTED_BLKSIZE);
+            let blocks = (max_space.max(0) as u64).div_ceil(bsize);
+            let used = (used_space.max(0) as u64).div_ceil(bsize);
+            let free = blocks.saturating_sub(used);
+            // `files`/`ffree` are unknowable — Drive has no inode budget — so
+            // they are reported as "plenty" rather than as zero, which some
+            // tools read as "no more files may be created".
+            reply.statfs(
+                blocks,
+                free,
+                free,
+                0,
+                u64::MAX,
+                REPORTED_BLKSIZE,
+                MAX_NAME_LEN,
+                REPORTED_BLKSIZE,
+            );
+        });
+    }
+
     fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
         let parent = parent.0;
         let name = match fuse_name(name) {
@@ -109,109 +176,19 @@ impl Filesystem for ProtonFs {
             .run(Lane::Meta, move || fs.serve_readdir(ino, offset, reply));
     }
 
+    /// A read-only open is a map lookup and answers inline; a write open has to
+    /// allocate a scratch file and, when a queued revision is the base, duplicate
+    /// a blob that is the whole file — so it is served from a worker rather than
+    /// stalling every other request on the mount behind it.
     fn open(&self, _req: &Request, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
-        let write_requested = flags.acc_mode() != OpenAccMode::O_RDONLY;
-        let (uid, base_mtime, base_size, base_revision_id) = {
-            let mut st = self.core.state.lock();
-            match st.entries.get_mut(&ino.0) {
-                Some(e) if e.node.is_file() => {
-                    if write_requested && !e.writable() {
-                        reply.error(Errno::EACCES);
-                        return;
-                    }
-                    e.open_count = e.open_count.saturating_add(1);
-                    (
-                        e.uid.clone(),
-                        e.node.modification_time,
-                        node_size(&e.node),
-                        node_revision_id(&e.node),
-                    )
-                }
-                Some(_) => {
-                    reply.error(Errno::EISDIR);
-                    return;
-                }
-                None => {
-                    reply.error(Errno::ENOENT);
-                    return;
-                }
-            }
-        };
-        debug!(ino = ino.0, ?flags, base_size, base_mtime, "open");
-        // Read-only opens stay stateless (fh 0). A write open allocates a
-        // disk-backed handle; bytes are authored into a scratch file and the
-        // untouched remainder is pulled from the base lazily (on read / commit).
         if flags.acc_mode() == OpenAccMode::O_RDONLY {
-            reply.opened(FileHandle(0), FopenFlags::empty());
+            self.serve_open(ino, flags, reply);
             return;
         }
-        // A previous close may already have newer bytes queued locally while
-        // the server still holds the older revision. That staged blob, not the
-        // remote, is the base for this handle. In particular, `truncate file`
-        // opens for writing and then shrinks via setattr; starting its scratch
-        // as a sparse zero file would turn the preserved prefix into zeros.
-        //
-        // Complete pending blobs are the common case and can be copied without
-        // any network access. An incomplete blob still has gaps referring to
-        // the remote base; stacking another write on it cannot be represented
-        // safely by WriteHandle, so fail the open rather than risk corruption.
-        let pending_base = self.core.pending.lock().get(&uid).cloned();
-        if pending_base.as_ref().is_some_and(|p| !p.meta.complete) {
-            if let Some(entry) = self.core.state.lock().entries.get_mut(&ino.0) {
-                entry.open_count = entry.open_count.saturating_sub(1);
-            }
-            error!(%uid, "refusing write over incomplete queued revision");
-            reply.error(Errno::EIO);
-            return;
-        }
-        let (file, path) = match self.core.cache.create_scratch() {
-            Ok(x) => x,
-            Err(e) => {
-                if let Some(entry) = self.core.state.lock().entries.get_mut(&ino.0) {
-                    entry.open_count = entry.open_count.saturating_sub(1);
-                }
-                error!(%uid, error = %e, "create scratch file failed");
-                reply.error(Errno::EIO);
-                return;
-            }
-        };
-        let mut initial_written = Intervals::default();
-        if let Some(pending) = &pending_base {
-            if let Err(e) = std::fs::copy(&pending.path, &path) {
-                if let Some(entry) = self.core.state.lock().entries.get_mut(&ino.0) {
-                    entry.open_count = entry.open_count.saturating_sub(1);
-                }
-                let _ = std::fs::remove_file(&path);
-                error!(%uid, source = %pending.path.display(), error = %e,
-                    "copy queued revision into write scratch failed");
-                reply.error(Errno::EIO);
-                return;
-            }
-            initial_written.add(0, pending.meta.len);
-        }
-        let mut st = self.core.state.lock();
-        let fh = st.next_fh;
-        st.next_fh += 1;
-        let aw = st.active_writes.entry(ino.0).or_insert_with(|| {
-            WriteHandle {
-                ino: ino.0,
-                uid,
-                file: Arc::new(file),
-                path,
-                written: initial_written,
-                // Starts at the current size; reads in [0, base_size) come from
-                // the base until overwritten.
-                len: base_size,
-                base_size,
-                base_mtime,
-                base_revision_id,
-                dirty: false,
-                open_count: 0,
-            }
-        });
-        aw.open_count += 1;
-        st.handles.insert(fh, ino.0);
-        reply.opened(FileHandle(fh), FopenFlags::empty());
+        let fs = self.clone();
+        self.core
+            .workers
+            .run(Lane::Transfer, move || fs.serve_open(ino, flags, reply));
     }
 
     fn read(
@@ -374,7 +351,16 @@ impl Filesystem for ProtonFs {
         };
         if let Err(e) = file.write_all_at(data, offset) {
             error!(ino = ino.0, fh, error = %e, "scratch write failed");
-            reply.error(Errno::EIO);
+            // A full local disk is not a broken file: answer `ENOSPC` so the
+            // application can say so (and so `cp`/editors take their own
+            // out-of-space path), and free what the cache is holding — the
+            // scratch file the next write goes to shares that filesystem.
+            if e.raw_os_error() == Some(libc::ENOSPC) {
+                self.core.cache.emergency_evict();
+                reply.error(Errno::ENOSPC);
+            } else {
+                reply.error(Errno::EIO);
+            }
             return;
         }
         let new_len = {
@@ -566,6 +552,12 @@ impl Filesystem for ProtonFs {
     /// for fsync wants its bytes to survive a crash, and blocking it on an upload
     /// (which offline would never finish) buys nothing the queue does not already
     /// guarantee.
+    ///
+    /// Served on a worker: `sync_all` is a disk barrier and the sidecar write is
+    /// two more file operations, and an application that fsyncs per record would
+    /// otherwise stall every request on the mount at its barrier rate. Nothing
+    /// orders this against other callbacks — the kernel waits for the reply
+    /// either way, which is the whole contract.
     fn fsync(
         &self,
         _req: &Request,
@@ -574,76 +566,10 @@ impl Filesystem for ProtonFs {
         _datasync: bool,
         reply: ReplyEmpty,
     ) {
-        // Everything the durability sidecar needs, copied out so no lock is held
-        // across the sync.
-        let handle = {
-            let st = self.core.state.lock();
-            let ino = st.handles.get(&fh.0).copied();
-            ino.and_then(|i| st.active_writes.get(&i)).map(|aw| {
-                (
-                    aw.file.clone(),
-                    aw.path.clone(),
-                    aw.uid.clone(),
-                    aw.dirty,
-                    aw.written.clone(),
-                    aw.len,
-                    aw.base_size,
-                    aw.base_mtime,
-                    aw.base_revision_id.clone(),
-                )
-            })
-        };
-        let Some((f, path, uid, dirty, written, len, base_size, base_mtime, base_revision_id)) =
-            handle
-        else {
-            reply.error(Errno::EBADF);
-            return;
-        };
-        if let Err(e) = f.sync_all() {
-            error!(fh = fh.0, error = %e, "fsync of scratch file failed");
-            reply.error(Errno::EIO);
-            return;
-        }
-        // A clean handle has nothing on it that the remote does not already
-        // hold, so there is nothing for a crash to lose.
-        if !dirty {
-            reply.ok();
-            return;
-        }
-        // The bytes are on stable storage, but only the scratch file knows that,
-        // and the scratch directory is cleared at open. Record what the blob is
-        // so a restart can hand it to the upload queue instead of deleting it.
-        //
-        // Deliberately *not* the full release path: staging the blob here would
-        // move the file out from under a handle the application still has open,
-        // and queueing an upload per `fsync` would push a revision for every
-        // barrier in a write loop. This only makes the existing file findable.
-        let authored: Vec<(u64, u64)> = written
-            .segments(0, len)
-            .into_iter()
-            .filter(|&(_, _, authored)| authored)
-            .map(|(s, e, _)| (s, e))
-            .collect();
-        let meta = StagedWrite {
-            uid: uid.to_string(),
-            len,
-            base_size,
-            base_mtime,
-            complete: authored == [(0, len)],
-            authored,
-            based_on: self
-                .core
-                .remote_baseline(&uid, base_mtime, base_size, base_revision_id),
-        };
-        // A failed sidecar means the write is not durable, and `fsync` promising
-        // otherwise is the defect this exists to fix — so it is an error, not a
-        // warning.
-        if let Err(e) = self.core.cache.mark_scratch_durable(&path, &meta) {
-            error!(%uid, error = %e, "recording fsync durability failed");
-            reply.error(Errno::EIO);
-            return;
-        }
-        reply.ok();
+        let fs = self.clone();
+        self.core
+            .workers
+            .run(Lane::Transfer, move || fs.serve_fsync(fh, reply));
     }
 
     fn release(
@@ -1146,7 +1072,7 @@ impl ProtonFs {
             uid: self.uid,
             gid: self.gid,
             rdev: 0,
-            blksize: 512,
+            blksize: REPORTED_BLKSIZE,
             flags: 0,
         }
     }
@@ -1154,6 +1080,202 @@ impl ProtonFs {
     /// Trash the child `name` under `parent` on the remote, then drop it from the
     /// local cache. Backs both `unlink` and `rmdir` (Proton trashes whole
     /// subtrees, so an `rmdir` of a non-empty dir behaves the same).
+    /// The body of [`Filesystem::open`], run off the dispatch loop for a write
+    /// open.
+    fn serve_open(&self, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
+        let write_requested = flags.acc_mode() != OpenAccMode::O_RDONLY;
+        let (uid, base_mtime, base_size, base_revision_id) = {
+            let mut st = self.core.state.lock();
+            match st.entries.get_mut(&ino.0) {
+                Some(e) if e.node.is_file() => {
+                    if write_requested && !e.writable() {
+                        reply.error(Errno::EACCES);
+                        return;
+                    }
+                    e.open_count = e.open_count.saturating_add(1);
+                    (
+                        e.uid.clone(),
+                        e.node.modification_time,
+                        node_size(&e.node),
+                        node_revision_id(&e.node),
+                    )
+                }
+                Some(_) => {
+                    reply.error(Errno::EISDIR);
+                    return;
+                }
+                None => {
+                    reply.error(Errno::ENOENT);
+                    return;
+                }
+            }
+        };
+        debug!(ino = ino.0, ?flags, base_size, base_mtime, "open");
+        // Read-only opens stay stateless (fh 0). A write open allocates a
+        // disk-backed handle; bytes are authored into a scratch file and the
+        // untouched remainder is pulled from the base lazily (on read / commit).
+        if flags.acc_mode() == OpenAccMode::O_RDONLY {
+            reply.opened(FileHandle(0), FopenFlags::empty());
+            return;
+        }
+        // A previous close may already have newer bytes queued locally while
+        // the server still holds the older revision. That staged blob, not the
+        // remote, is the base for this handle. In particular, `truncate file`
+        // opens for writing and then shrinks via setattr; starting its scratch
+        // as a sparse zero file would turn the preserved prefix into zeros.
+        //
+        // Complete pending blobs are the common case and can be copied without
+        // any network access. An incomplete blob still has gaps referring to
+        // the remote base; stacking another write on it cannot be represented
+        // safely by WriteHandle, so fail the open rather than risk corruption.
+        let pending_base = self.core.pending.lock().get(&uid).cloned();
+        if pending_base.as_ref().is_some_and(|p| !p.meta.complete) {
+            if let Some(entry) = self.core.state.lock().entries.get_mut(&ino.0) {
+                entry.open_count = entry.open_count.saturating_sub(1);
+            }
+            error!(%uid, "refusing write over incomplete queued revision");
+            reply.error(Errno::EIO);
+            return;
+        }
+        let (file, path) = match self.core.cache.create_scratch() {
+            Ok(x) => x,
+            Err(e) => {
+                if let Some(entry) = self.core.state.lock().entries.get_mut(&ino.0) {
+                    entry.open_count = entry.open_count.saturating_sub(1);
+                }
+                error!(%uid, error = %e, "create scratch file failed");
+                reply.error(Errno::EIO);
+                return;
+            }
+        };
+        let mut initial_written = Intervals::default();
+        if let Some(pending) = &pending_base {
+            // Reflink where the filesystem can: this blob is the whole file, and
+            // a byte-for-byte copy of a multi-GB pending revision is the kind of
+            // work `open` must not do (`ContentCache::clone_or_copy`).
+            if let Err(e) = ContentCache::clone_or_copy(&pending.path, &path) {
+                if let Some(entry) = self.core.state.lock().entries.get_mut(&ino.0) {
+                    entry.open_count = entry.open_count.saturating_sub(1);
+                }
+                let _ = std::fs::remove_file(&path);
+                error!(%uid, source = %pending.path.display(), error = %e,
+                    "copy queued revision into write scratch failed");
+                reply.error(Errno::EIO);
+                return;
+            }
+            initial_written.add(0, pending.meta.len);
+        }
+        let mut st = self.core.state.lock();
+        let fh = st.next_fh;
+        st.next_fh += 1;
+        let aw = st.active_writes.entry(ino.0).or_insert_with(|| {
+            WriteHandle {
+                ino: ino.0,
+                uid,
+                file: Arc::new(file),
+                path,
+                written: initial_written,
+                // Starts at the current size; reads in [0, base_size) come from
+                // the base until overwritten.
+                len: base_size,
+                base_size,
+                base_mtime,
+                base_revision_id,
+                dirty: false,
+                open_count: 0,
+            }
+        });
+        aw.open_count += 1;
+        st.handles.insert(fh, ino.0);
+        reply.opened(FileHandle(fh), FopenFlags::empty());
+    }
+
+    /// The body of [`Filesystem::fsync`], run off the dispatch loop.
+    fn serve_fsync(&self, fh: FileHandle, reply: ReplyEmpty) {
+        // Everything the durability sidecar needs, copied out so no lock is held
+        // across the sync.
+        let handle = {
+            let st = self.core.state.lock();
+            let ino = st.handles.get(&fh.0).copied();
+            ino.and_then(|i| st.active_writes.get(&i)).map(|aw| {
+                (
+                    aw.file.clone(),
+                    aw.path.clone(),
+                    aw.uid.clone(),
+                    aw.dirty,
+                    aw.written.clone(),
+                    aw.len,
+                    aw.base_size,
+                    aw.base_mtime,
+                    aw.base_revision_id.clone(),
+                )
+            })
+        };
+        let Some((f, path, uid, dirty, written, len, base_size, base_mtime, base_revision_id)) =
+            handle
+        else {
+            reply.error(Errno::EBADF);
+            return;
+        };
+        if let Err(e) = f.sync_all() {
+            error!(fh = fh.0, error = %e, "fsync of scratch file failed");
+            // Delayed allocation means a full disk usually surfaces here rather
+            // than at `write(2)`; `ENOSPC` is what an application checks for.
+            if e.raw_os_error() == Some(libc::ENOSPC) {
+                self.core.cache.emergency_evict();
+                reply.error(Errno::ENOSPC);
+            } else {
+                reply.error(Errno::EIO);
+            }
+            return;
+        }
+        // A clean handle has nothing on it that the remote does not already
+        // hold, so there is nothing for a crash to lose.
+        if !dirty {
+            reply.ok();
+            return;
+        }
+        // The bytes are on stable storage, but only the scratch file knows that,
+        // and the scratch directory is cleared at open. Record what the blob is
+        // so a restart can hand it to the upload queue instead of deleting it.
+        //
+        // Deliberately *not* the full release path: staging the blob here would
+        // move the file out from under a handle the application still has open,
+        // and queueing an upload per `fsync` would push a revision for every
+        // barrier in a write loop. This only makes the existing file findable.
+        let authored: Vec<(u64, u64)> = written
+            .segments(0, len)
+            .into_iter()
+            .filter(|&(_, _, authored)| authored)
+            .map(|(s, e, _)| (s, e))
+            .collect();
+        let meta = StagedWrite {
+            uid: uid.to_string(),
+            len,
+            base_size,
+            base_mtime,
+            complete: authored == [(0, len)],
+            authored,
+            based_on: self
+                .core
+                .remote_baseline(&uid, base_mtime, base_size, base_revision_id),
+        };
+        // A failed sidecar means the write is not durable, and `fsync` promising
+        // otherwise is the defect this exists to fix — so it is an error, not a
+        // warning.
+        if let Err(e) = self.core.cache.mark_scratch_durable(&path, &meta) {
+            error!(%uid, error = %e, "recording fsync durability failed");
+            if e.is_disk_full() {
+                self.core.cache.emergency_evict();
+                reply.error(Errno::ENOSPC);
+            } else {
+                reply.error(Errno::EIO);
+            }
+            return;
+        }
+        reply.ok();
+    }
+
     /// The body of [`Filesystem::create`], run off the dispatch loop.
     fn serve_create(&self, parent: u64, name: &str, reply: ReplyCreate) {
         if let Err(error) = self.core.require_writable(parent) {

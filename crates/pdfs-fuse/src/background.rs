@@ -8,35 +8,20 @@ use super::*;
 ///
 /// Returns whether this mount actually held the node, so the caller can evict
 /// its content blob once if *any* mount did.
-fn forget_and_notify(st: &mut State, notifier: Option<&Notifier>, uid: &NodeUid) -> bool {
+fn forget_and_notify(st: &mut State, notify: &mut NotifyBatch, uid: &NodeUid) -> bool {
     // Capture the inode before `forget` clears the uid mapping.
     let child = st.by_uid.get(uid).copied();
     let Some((parent, name)) = st.forget(uid) else {
         return false;
     };
-    if let Some(notifier) = notifier {
-        match child {
-            Some(child) => {
-                let _ = notifier.delete(INodeNo(parent), INodeNo(child), OsStr::new(&name));
-            }
-            None => {
-                let _ = notifier.inval_entry(INodeNo(parent), OsStr::new(&name));
-            }
-        }
+    match child {
+        Some(child) => notify.delete(parent, child, name),
+        None => notify.inval_entry(parent, name),
     }
     true
 }
 
-fn invalidate_access_changes(notifier: Option<&Notifier>, changed: &[u64]) {
-    let Some(notifier) = notifier else {
-        return;
-    };
-    for &ino in changed {
-        let _ = notifier.inval_inode(INodeNo(ino), 0, 0);
-    }
-}
-
-fn hide_foreign_deleted_and_notify(st: &mut State, notifier: Option<&Notifier>, uid: &NodeUid) {
+fn hide_foreign_deleted_and_notify(st: &mut State, notify: &mut NotifyBatch, uid: &NodeUid) {
     let child = st.by_uid.get(uid).copied();
     let dentry = child.and_then(|ino| {
         st.entries
@@ -45,9 +30,9 @@ fn hide_foreign_deleted_and_notify(st: &mut State, notifier: Option<&Notifier>, 
     });
     let changed = st.downgrade_shared_subtree(uid);
     st.hide_foreign_subtree(uid);
-    invalidate_access_changes(notifier, &changed);
-    if let (Some(notifier), Some((parent, name)), Some(child)) = (notifier, dentry, child) {
-        let _ = notifier.delete(INodeNo(parent), INodeNo(child), OsStr::new(&name));
+    notify.extend_inodes(&changed);
+    if let (Some((parent, name)), Some(child)) = (dentry, child) {
+        notify.delete(parent, child, name);
     }
 }
 
@@ -132,18 +117,18 @@ fn apply_event(core: &Core, event: &DriveEvent, dirty: &mut DirtyParents) -> pdf
         && foreign_delete
     {
         apply_foreign_delete(&core.db, node_uid, |uid| {
-            core.for_each_mount(|st, notifier| {
-                hide_foreign_deleted_and_notify(st, notifier, uid);
+            core.for_each_mount(|st, notify| {
+                hide_foreign_deleted_and_notify(st, notify, uid);
             });
         })
     } else {
         apply_access_downgrade(&core.db, event, |root| {
-            core.for_each_mount(|st, notifier| {
+            core.for_each_mount(|st, notify| {
                 let changed = match root {
                     Some(uid) => st.downgrade_shared_subtree(uid),
                     None => st.downgrade_known_shared_access(),
                 };
-                invalidate_access_changes(notifier, &changed);
+                notify.extend_inodes(&changed);
             });
         })
     };
@@ -173,19 +158,17 @@ fn apply_event(core: &Core, event: &DriveEvent, dirty: &mut DirtyParents) -> pdf
                 debug!(uid = %node_uid, "ignoring remote event for a node with a queued write");
             }
             let mut had_node = false;
-            core.for_each_mount(|st, notifier| {
+            core.for_each_mount(|st, notify| {
                 if *is_trashed {
                     // Trashing makes a node vanish from its parent listing.
-                    had_node |= forget_and_notify(st, notifier, node_uid);
+                    had_node |= forget_and_notify(st, notify, node_uid);
                 } else if !ours && let Some(&ino) = st.by_uid.get(node_uid) {
                     // Known node changed: drop its cached attrs/data (and
                     // listing if it is a directory) so the next access
                     // re-fetches. Its content blob may now be stale too.
                     had_node = true;
                     st.invalidate_listing(ino);
-                    if let Some(notifier) = notifier {
-                        let _ = notifier.inval_inode(INodeNo(ino), 0, 0);
-                    }
+                    notify.inval_inode(ino);
                 }
             });
             // Once, not once per mount: the content cache is per-daemon.
@@ -209,8 +192,8 @@ fn apply_event(core: &Core, event: &DriveEvent, dirty: &mut DirtyParents) -> pdf
         DriveEvent::NodeDeleted { node_uid, .. } => {
             core.cache.evict(node_uid);
             if !foreign_delete {
-                core.for_each_mount(|st, notifier| {
-                    forget_and_notify(st, notifier, node_uid);
+                core.for_each_mount(|st, notify| {
+                    forget_and_notify(st, notify, node_uid);
                 });
             }
         }
@@ -223,13 +206,11 @@ fn apply_event(core: &Core, event: &DriveEvent, dirty: &mut DirtyParents) -> pdf
         | DriveEvent::SharedWithMeUpdated { .. } => {
             warn!("event access continuity lost; downgrading shared trees and resyncing lazily");
             apply_result = apply_result.and(core.db.clear_state(SHARED_WITH_ME_SYNCED_MS));
-            core.for_each_mount(|st, notifier| {
+            core.for_each_mount(|st, notify| {
                 let dirs: Vec<u64> = st.children.keys().copied().collect();
                 for &ino in &dirs {
                     st.invalidate_listing(ino);
-                    if let Some(notifier) = notifier {
-                        let _ = notifier.inval_inode(INodeNo(ino), 0, 0);
-                    }
+                    notify.inval_inode(ino);
                 }
             });
         }
@@ -303,18 +284,16 @@ fn flush_dirty_parents(core: &Core, dirty: &DirtyParents) {
     if dirty.foreign.is_empty() && dirty.ours.is_empty() {
         return;
     }
-    core.for_each_mount(|st, notifier| {
-        let drop_listing = |st: &mut State, parent_uid: &NodeUid| {
-            let Some(&parent) = st.by_uid.get(parent_uid) else {
-                return;
-            };
-            st.invalidate_listing(parent);
-            if let Some(notifier) = notifier {
-                let _ = notifier.inval_inode(INodeNo(parent), 0, 0);
-            }
+    fn drop_listing(st: &mut State, notify: &mut NotifyBatch, parent_uid: &NodeUid) {
+        let Some(&parent) = st.by_uid.get(parent_uid) else {
+            return;
         };
+        st.invalidate_listing(parent);
+        notify.inval_inode(parent);
+    }
+    core.for_each_mount(|st, notify| {
         for parent_uid in &dirty.foreign {
-            drop_listing(st, parent_uid);
+            drop_listing(st, notify, parent_uid);
         }
         for (parent_uid, children) in &dirty.ours {
             if dirty.foreign.contains(parent_uid) {
@@ -328,7 +307,7 @@ fn flush_dirty_parents(core: &Core, dirty: &DirtyParents) {
             {
                 continue;
             }
-            drop_listing(st, parent_uid);
+            drop_listing(st, notify, parent_uid);
         }
     });
 }

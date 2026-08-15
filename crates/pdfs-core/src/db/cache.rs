@@ -42,6 +42,30 @@ impl Db {
         Ok(())
     }
 
+    /// Bump `last_accessed` for many keys in one transaction.
+    ///
+    /// The read path touches a key per 128 KiB the kernel asks for — 32 times
+    /// per 4 MiB block — and each of those was its own write transaction under
+    /// the single connection mutex, contending with every `lookup` and
+    /// `readdir`. Callers accumulate touches in memory and flush them here.
+    pub fn cache_accessed_batch(&self, touches: &[(String, i64)]) -> Result<()> {
+        if touches.is_empty() {
+            return Ok(());
+        }
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
+        {
+            let mut stmt = tx.prepare_cached(
+                "UPDATE cache_entries SET last_accessed = ?2 WHERE cache_key = ?1",
+            )?;
+            for (key, at) in touches {
+                stmt.execute(params![key, at])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Drop a single cache-entry row (one evicted blob or block).
     pub fn cache_remove(&self, key: &str) -> Result<()> {
         let conn = self.conn.lock();

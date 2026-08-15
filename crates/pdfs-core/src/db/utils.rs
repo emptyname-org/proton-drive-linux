@@ -35,7 +35,7 @@ pub(super) fn like_escape(s: &str) -> String {
 /// nowhere near this; a parent *cycle* is unbounded, and this query is on the
 /// path of every search result, including the `LIKE` lane that reads `nodes`
 /// directly and so never passed through the index's cycle check.
-const MAX_PATH_DEPTH: usize = 256;
+pub(super) const MAX_PATH_DEPTH: usize = 256;
 
 /// Resolve a node's mountpoint-relative path by walking `parent_uid` to the
 /// root via a recursive CTE. The root (the node with no parent) is excluded, so

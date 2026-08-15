@@ -66,6 +66,20 @@ const WAL_SIZE_LIMIT: i64 = 64 * 1024 * 1024;
 /// genuinely stuck holder surfaces as an error rather than an apparent hang.
 const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// Page cache, in KiB (applied negated, which is how SQLite reads a size in KiB
+/// rather than in pages). 32 MiB against a database that is typically tens of
+/// MiB: large enough to hold the working set of a listing-heavy session, small
+/// enough to be unremarkable in a desktop daemon's RSS.
+const CACHE_SIZE_KIB: i64 = 32 * 1024;
+
+/// Ceiling on the memory-mapped window over the database file. 256 MiB covers
+/// any realistic index while keeping the mapping bounded.
+const MMAP_SIZE: i64 = 256 * 1024 * 1024;
+
+/// WAL pages between automatic checkpoints (default 1000, i.e. ~4 MiB). Halved
+/// so the synchronous checkpoint a committing thread inherits stays short.
+const WAL_AUTOCHECKPOINT_PAGES: i64 = 500;
+
 /// Handle to the unified metadata database.
 ///
 /// Cheap to wrap in an `Arc`; clone the `Arc`, not this. All access goes through
@@ -102,6 +116,24 @@ impl Db {
         // (Bare SQLite does default to 0, which is where the belief that this
         // was unset came from. That default is not what we get.)
         conn.busy_timeout(BUSY_TIMEOUT)?;
+        // Page cache. The default is 2 MiB, against a schema whose hot table
+        // stores a JSON blob per node — a listing of a few thousand files
+        // evicts itself while it is being read.
+        conn.pragma_update(None, "cache_size", -CACHE_SIZE_KIB)?;
+        // Sorts and recursive CTEs materialise their intermediate results.
+        // Every `ORDER BY … COLLATE NOCASE` listing and every ancestor walk
+        // spills those to a file in `/tmp` by default; they are small and
+        // short-lived, so memory is both faster and less surprising.
+        conn.pragma_update(None, "temp_store", "MEMORY")?;
+        // Read the database through the page cache of the OS rather than
+        // `pread` per page. Bounded rather than unlimited so the daemon's RSS
+        // does not track the database size.
+        conn.pragma_update(None, "mmap_size", MMAP_SIZE)?;
+        // Checkpointing is synchronous in whichever thread happens to commit
+        // the transaction that crosses the threshold — often a FUSE callback.
+        // A smaller autocheckpoint makes that debt smaller and more frequent
+        // rather than rare and multi-second.
+        conn.pragma_update(None, "wal_autocheckpoint", WAL_AUTOCHECKPOINT_PAGES)?;
 
         let db = Self {
             conn: Mutex::new(conn),

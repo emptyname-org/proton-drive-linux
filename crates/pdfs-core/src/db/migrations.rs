@@ -9,7 +9,7 @@ use super::Db;
 use crate::Result;
 
 /// Current schema version. Bump on every forward migration added below.
-pub(super) const SCHEMA_VERSION: i64 = 21;
+pub(super) const SCHEMA_VERSION: i64 = 22;
 
 impl Db {
     pub(super) fn migrate(&self) -> Result<()> {
@@ -112,6 +112,24 @@ impl Db {
             if has_nodes {
                 tx.execute_batch(MIGRATION_V21)?;
             }
+        }
+        if current < 22 {
+            // Older fixtures (and a database that never grew a table because
+            // its feature was never used) may be missing any of these, and an
+            // index on an absent table is a hard error rather than a no-op.
+            for (table, sql) in MIGRATION_V22 {
+                let present: bool = tx.query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                    [table],
+                    |row| row.get::<_, i64>(0),
+                )? > 0;
+                if present {
+                    tx.execute_batch(sql)?;
+                }
+            }
+            // `activity_time` indexes `time DESC` while both activity queries
+            // order by `id`: it has only ever cost writes.
+            tx.execute_batch("DROP INDEX IF EXISTS activity_time;")?;
         }
         tx.execute(
             "INSERT INTO sync_state (key, value) VALUES ('schema_version', ?1)
@@ -583,3 +601,35 @@ SELECT n.rowid, n.name, paths.path
   FROM nodes n JOIN paths ON paths.rowid = n.rowid
  WHERE paths.trashed = 0;
 ";
+
+/// V22: indexes for the lookups that were scanning, each paired with the table
+/// it needs to exist for.
+///
+/// Each backs a query on a hot path that had no index to use:
+///
+/// - `sync_entry(remote_uid)` — the reconcile resolves a remote uid to its
+///   local entry once per node, per pass.
+/// - `local_files(scan_gen)` — the sweep that retires the previous generation
+///   after a local index scan.
+/// - `nodes(parent_uid) WHERE trashed = 0` — every listing, with the partial
+///   index keeping it to the live rows a listing actually wants.
+///
+/// Deliberately *not* here: an index on `pending_op(next_attempt_at, id)`.
+/// `next_due_op` orders by `id`, which is the rowid, so it already stops at the
+/// first due row; offering the planner a `next_attempt_at` index makes it scan
+/// that index and then sort the matches by `id` instead —
+/// `next_due_op_does_not_scale_with_queue_length` measures the regression.
+const MIGRATION_V22: [(&str, &str); 3] = [
+    (
+        "sync_entry",
+        "CREATE INDEX IF NOT EXISTS idx_sync_entry_remote_uid ON sync_entry(remote_uid);",
+    ),
+    (
+        "local_files",
+        "CREATE INDEX IF NOT EXISTS idx_local_files_scan_gen ON local_files(scan_gen);",
+    ),
+    (
+        "nodes",
+        "CREATE INDEX IF NOT EXISTS idx_nodes_parent_live ON nodes(parent_uid) WHERE trashed = 0;",
+    ),
+];

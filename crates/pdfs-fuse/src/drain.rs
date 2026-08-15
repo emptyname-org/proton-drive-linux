@@ -136,6 +136,10 @@ impl Core {
             let due = self.db.next_due_op(now).unwrap_or_default();
 
             let Some(op) = due.filter(|_| self.online.load(Ordering::Relaxed)) else {
+                // Nothing to upload is exactly when the connection is free, so
+                // this is where the read path's buffered LRU touches get written
+                // (`ContentCache::flush_touches`). Cheap and a no-op when empty.
+                self.cache.flush_touches();
                 self.recover_fsynced_writes();
                 // A debounced or backed-off op may be waiting: sleep only
                 // until it becomes due rather than the full idle-poll.
@@ -709,8 +713,9 @@ impl Core {
         self.db.delete_op(op.id)?;
         // Dropping the pending entry hands the node back to the remote's truth:
         // reads stop coming from the staged blob, and the event sync stops
-        // skipping it as "ahead of the server" (offline.md Phase 3a).
-        self.pending.lock().remove(uid);
+        // skipping it as "ahead of the server" (offline.md Phase 3a). Only if it
+        // is still *this* write's entry — see [`Core::release_pending`].
+        self.release_pending(uid, blob);
         self.cache.discard_staged(blob);
         self.cache.evict(uid);
         self.evict_reader(uid);
@@ -748,7 +753,7 @@ impl Core {
         error!(%uid, name, reason, staged = %blob.display(),
                "cannot place a conflicted write; bytes kept in staging");
         self.db.delete_op(op.id)?;
-        self.pending.lock().remove(uid);
+        self.release_pending(uid, blob);
         self.cache.evict(uid);
         self.evict_reader(uid);
         self.log_activity(
@@ -758,6 +763,24 @@ impl Core {
             false,
         );
         Ok(())
+    }
+
+    /// Drop `uid`'s pending entry, but only while it still names `blob`.
+    ///
+    /// A supersede can replace the entry while the op that owned it is in
+    /// flight, so an unconditional `remove` retires a *newer* write's staged
+    /// blob: reads fall back to a stale remote, the next `remote_baseline` forks
+    /// a spurious `(sync-conflict)` copy of bytes that were never in conflict,
+    /// and the incomplete-write interlock — which keys off the pending entry —
+    /// is disarmed, letting a gap-fill read from a revision that no longer
+    /// describes the file.
+    pub(crate) fn release_pending(&self, uid: &NodeUid, blob: &Path) {
+        let mut pending = self.pending.lock();
+        if let Some(current) = pending.get(uid)
+            && current.path == blob
+        {
+            pending.remove(uid);
+        }
     }
 
     /// Whether a folder a queued op targets has stopped being a place a node can
@@ -886,14 +909,7 @@ impl Core {
         // an orphaned file (harmless), whereas the reverse would leave a queued
         // op pointing at nothing.
         self.db.delete_op(op.id)?;
-        {
-            let mut p = self.pending.lock();
-            if let Some(op_in_mem) = p.get(&uid)
-                && op_in_mem.path == blob
-            {
-                p.remove(&uid);
-            }
-        }
+        self.release_pending(&uid, &blob);
 
         // The staged blob now matches the sealed revision, so a pinned file keeps
         // it as its cached content rather than re-downloading what we just sent.

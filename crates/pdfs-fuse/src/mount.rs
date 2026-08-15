@@ -255,6 +255,14 @@ pub(super) fn spawn_session(
     root: Node,
 ) -> std::io::Result<BackgroundSession> {
     let mut config = Config::default();
+    // `n_threads` stays at fuser's default of 1 (with `clone_fd` off) on
+    // purpose, for now. A concurrent dispatch loop is worth having, but
+    // `release` currently relies on being serialised against the `open`+`read`
+    // an application issues right after `close(2)` — see the comment on
+    // `Filesystem::release`. Raising it before that ordering is made explicit
+    // (a per-node staging-in-flight barrier) reintroduces the acceptance
+    // suite's "concurrent file 1 mismatch". Kernel-side caps that do *not*
+    // depend on that ordering are negotiated in `ProtonFs::init`.
     config.mount_options = vec![
         MountOption::FSName("protondrive".to_string()),
         MountOption::Subtype("protondrive".to_string()),
@@ -385,6 +393,7 @@ pub fn mount(
         self_changes: Arc::new(Mutex::new(HashMap::new())),
         thumb_gen: Arc::new(Mutex::new(HashSet::new())),
         no_thumbnail: Arc::new(Mutex::new(HashMap::new())),
+        quota: Arc::new(Mutex::new(None)),
         size_upgrades: Arc::new(Mutex::new(HashMap::new())),
         notifier: Arc::new(OnceLock::new()),
         session_live: Arc::new(AtomicBool::new(false)),

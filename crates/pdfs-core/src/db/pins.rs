@@ -4,6 +4,7 @@
 use rusqlite::{OptionalExtension, params};
 
 use super::Db;
+use super::utils::MAX_PATH_DEPTH;
 use crate::Result;
 
 /// One row of [`Db::pin_list`]. `recursive` is pin *policy* — whether the whole
@@ -66,6 +67,11 @@ impl Db {
     /// is pinned recursively. The ancestor check walks `parent_uid` to the root
     /// via a CTE; a direct pin is honoured even when the node has no `nodes` row
     /// yet (e.g. a CLI that never hydrates the node cache).
+    ///
+    /// The walk is depth-capped like [`super::utils::path_of`]: a `parent_uid`
+    /// cycle is corrupt data the API can hand us, and `UNION ALL` over one never
+    /// terminates — while holding the daemon's only SQLite connection, on a path
+    /// that runs per cached read.
     pub fn is_pinned(&self, uid: &str) -> Result<bool> {
         let conn = self.conn.lock();
         let direct: Option<i64> = conn
@@ -78,14 +84,18 @@ impl Db {
         }
         let anc: Option<i64> = conn
             .query_row(
-                "WITH RECURSIVE anc(uid, parent_uid) AS (
-                   SELECT uid, parent_uid FROM nodes WHERE uid = ?1
-                   UNION ALL
-                   SELECT n.uid, n.parent_uid FROM nodes n JOIN anc ON n.uid = anc.parent_uid
-                 )
-                 SELECT 1 FROM anc a JOIN pins p ON p.uid = a.uid
-                 WHERE a.uid != ?1 AND p.recursive = 1
-                 LIMIT 1",
+                &format!(
+                    "WITH RECURSIVE anc(uid, parent_uid, depth) AS (
+                       SELECT uid, parent_uid, 0 FROM nodes WHERE uid = ?1
+                       UNION ALL
+                       SELECT n.uid, n.parent_uid, anc.depth + 1
+                       FROM nodes n JOIN anc ON n.uid = anc.parent_uid
+                       WHERE anc.depth < {MAX_PATH_DEPTH}
+                     )
+                     SELECT 1 FROM anc a JOIN pins p ON p.uid = a.uid
+                     WHERE a.uid != ?1 AND p.recursive = 1
+                     LIMIT 1"
+                ),
                 params![uid],
                 |r| r.get(0),
             )

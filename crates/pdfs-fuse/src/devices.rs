@@ -536,7 +536,14 @@ impl Core {
         // folder the daemon no longer tracks, and nothing would ever unmount it.
         // Tear it down first — including before trashing the remote tree it
         // serves, which would otherwise leave it answering for deleted nodes.
-        if let Some(mount) = self.mounts.lock().remove(&id)
+        // Taken in its own statement so the registry lock is released before the
+        // teardown: an edition-2024 `if let` chain holds the guard for the whole
+        // body, and `teardown` unmounts and joins the session thread — which can
+        // be inside a multi-second transfer. The shutdown path takes the same
+        // lock, so holding it here risks systemd's stop timeout landing mid-
+        // unmount and stranding the endpoint.
+        let taken = self.mounts.lock().remove(&id);
+        if let Some(mount) = taken
             && let Err(error) = commit_after_teardown(mount.teardown(), || ())
         {
             let _ = self.db.sync_folder_set_state(id, "error", now_secs());
@@ -866,8 +873,11 @@ impl Core {
                 Ok(format!("{} is now on-demand", local.display()))
             }
             ApplicableMountMode::Mirror => {
-                // ondemand→mirror: tear down the secondary mount first.
-                if let Some(mount) = self.mounts.lock().remove(&id)
+                // ondemand→mirror: tear down the secondary mount first. Taken
+                // before the teardown so the registry lock is not held across
+                // the unmount and thread join (see `remove_sync_folder`).
+                let taken = self.mounts.lock().remove(&id);
+                if let Some(mount) = taken
                     && let Err(error) = commit_after_teardown(mount.teardown(), || ())
                 {
                     let _ = self.db.sync_folder_set_state(id, "error", now_secs());

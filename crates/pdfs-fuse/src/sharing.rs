@@ -12,6 +12,9 @@ use pdfs_core::control::{
     BookmarkInfo, DirEntry, InvitationInfo, PublicLinkInfo, ShareEntry, ShareEntryKind, SharedItem,
 };
 use pdfs_core::{CoreError, CoreResult};
+use tracing::debug;
+
+use crate::QUOTA_TTL;
 use proton_drive_rs::proton_sdk::ids::NodeUid;
 use proton_drive_rs::{MemberRole, NodeKind};
 
@@ -533,7 +536,31 @@ impl Core {
             .rt
             .block_on(self.client.quota())
             .map_err(|e| CoreError::from_api(&e, "account quota"))?;
+        *self.quota.lock() = Some((std::time::Instant::now(), q.max_space, q.used_space));
         Ok((q.max_space, q.used_space))
+    }
+
+    /// The account quota as `statfs(2)` needs it: cached for [`QUOTA_TTL`],
+    /// refetched after that, and `None` when there is no usable answer at all —
+    /// offline with nothing cached.
+    ///
+    /// Never blocks on the network for a *fresh* value when a recent one exists,
+    /// because the callers are `df` and every "is there room?" preflight, and a
+    /// stale byte count is worth more to them than a stalled syscall. Offline,
+    /// the last known figures keep being served rather than degrading to zero.
+    pub(crate) fn account_quota_cached(&self) -> Option<(i64, i64)> {
+        if let Some((at, max_space, used_space)) = *self.quota.lock()
+            && at.elapsed() < QUOTA_TTL
+        {
+            return Some((max_space, used_space));
+        }
+        match self.account_quota() {
+            Ok(q) => Some(q),
+            Err(error) => {
+                debug!(%error, "account quota refresh failed; serving the last known figures");
+                self.quota.lock().map(|(_, max, used)| (max, used))
+            }
+        }
     }
 
     // ---- shared by me -----------------------------------------------------

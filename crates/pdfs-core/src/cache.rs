@@ -16,7 +16,7 @@
 //! [`AppDirs::cache_dir`]: crate::config::AppDirs::cache_dir
 //! [`Node`]: proton_drive_rs::Node
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -27,6 +27,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use proton_drive_rs::proton_sdk::ids::NodeUid;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use tracing::debug;
+
+use parking_lot::Mutex;
 
 use crate::db::{CacheEntryInput, Db};
 use crate::error::{Error, Result};
@@ -73,6 +76,18 @@ fn now_millis() -> i64 {
 /// (`DEFAULT_BLOCK_SIZE`, 4 MiB) so each cached block maps to exactly one
 /// `download_range` fetch with no straddling.
 pub const BLOCK_SIZE: u64 = 1 << 22;
+
+/// Buffered LRU touches that trigger a flush. Sized so a sequential read of a
+/// large file flushes a few times rather than per block, while an idle cache
+/// never holds more than a few hundred pending keys.
+const TOUCH_FLUSH_AT: usize = 256;
+
+/// How long block `idx` of a file of `size` bytes must be: a full
+/// [`BLOCK_SIZE`] except for the last one, which holds the remainder.
+fn block_len(size: u64, idx: u64) -> u64 {
+    let start = idx.saturating_mul(BLOCK_SIZE);
+    size.saturating_sub(start).min(BLOCK_SIZE)
+}
 
 /// How many eviction candidates to pull per batch when a pool is over budget.
 /// Large enough that a normal overshoot (a store or two past the cap) is settled
@@ -263,6 +278,15 @@ pub struct ContentCache {
     /// store/read/evict updates it, and the budget enforcers query it instead of
     /// scanning the cache directories (plan.md P4).
     db: Arc<Db>,
+    /// LRU touches not yet written to `cache_entries`, keyed by cache key.
+    ///
+    /// A cache hit only reorders eviction candidates, so it does not have to be
+    /// durable — but as one write transaction per hit it was 32 transactions per
+    /// 4 MiB block delivered, taken on the read path, under the connection mutex
+    /// every `lookup` also needs. Buffered here and flushed in one transaction
+    /// once [`TOUCH_FLUSH_AT`] have accumulated, and always before an eviction
+    /// pass reads the ordering these describe.
+    touches: Mutex<HashMap<String, i64>>,
 }
 
 impl ContentCache {
@@ -325,6 +349,7 @@ impl ContentCache {
             block_bytes: AtomicU64::new(0),
             thumb_bytes: AtomicU64::new(0),
             db,
+            touches: Mutex::new(HashMap::new()),
         };
         cache.reconcile()?;
         // After reconcile, so the totals describe the index that now describes
@@ -473,7 +498,7 @@ impl ContentCache {
         let blob = self.valid_blob(uid, mtime, size)?;
         // Record the access for LRU in the cache index. Best effort — a failed
         // update only makes eviction order slightly less accurate.
-        let _ = self.db.cache_accessed(&Self::key(uid), now_millis());
+        self.touch(Self::key(uid));
         let mut f = std::fs::File::open(&blob).ok()?;
         if offset >= size {
             return Some(Vec::new());
@@ -575,10 +600,15 @@ impl ContentCache {
             return None;
         }
         let mut f = std::fs::File::open(self.block_blob(uid, idx)).ok()?;
-        // LRU touch in the cache index (best effort).
-        let _ = self
-            .db
-            .cache_accessed(&self.block_key(uid, idx), now_millis());
+        // The blob is not fsynced on the way in (see `store_block`), so a crash
+        // can leave a short one behind the sidecar that describes it. Length is
+        // what makes that detectable, the same check `valid_blob` applies to a
+        // whole-file blob.
+        if f.metadata().ok()?.len() != block_len(size, idx) {
+            return None;
+        }
+        // LRU touch, buffered rather than written (see `touch`).
+        self.touch(self.block_key(uid, idx));
         let mut buf = Vec::new();
         f.read_to_end(&mut buf).ok()?;
         Some(buf)
@@ -603,7 +633,10 @@ impl ContentCache {
             let mut f = std::fs::File::create(&tmp)?;
             use std::io::Write;
             f.write_all(bytes)?;
-            f.sync_all()?;
+            // Deliberately not fsynced. This runs inline on the thread a kernel
+            // read is waiting on, and the block cache is disposable: the worst a
+            // crash can do is leave a short blob, which `cached_block` rejects
+            // on length and refetches.
         }
         std::fs::rename(&tmp, &blob)?;
         std::fs::write(
@@ -620,6 +653,40 @@ impl ContentCache {
             .fetch_add(bytes.len() as u64, Ordering::Relaxed);
         self.enforce_block_budget();
         Ok(())
+    }
+
+    /// Record a cache hit for LRU ordering, without touching the database.
+    ///
+    /// Later touches of the same key overwrite earlier ones — only the most
+    /// recent matters — so a hot file costs one map entry however many times it
+    /// is read.
+    fn touch(&self, key: String) {
+        let flush = {
+            let mut touches = self.touches.lock();
+            touches.insert(key, now_millis());
+            touches.len() >= TOUCH_FLUSH_AT
+        };
+        if flush {
+            self.flush_touches();
+        }
+    }
+
+    /// Write the buffered LRU touches out. Best effort: losing them costs
+    /// eviction accuracy, nothing else.
+    ///
+    /// Public because eviction ordering is only as good as what has been
+    /// flushed, and the daemon flushes on its idle passes as well as here.
+    pub fn flush_touches(&self) {
+        let batch: Vec<(String, i64)> = {
+            let mut touches = self.touches.lock();
+            if touches.is_empty() {
+                return;
+            }
+            touches.drain().collect()
+        };
+        if let Err(error) = self.db.cache_accessed_batch(&batch) {
+            debug!(?error, "flushing cache LRU touches failed");
+        }
     }
 
     /// Re-read every pool total from the cache index, which is authoritative.
@@ -689,7 +756,10 @@ impl ContentCache {
             return; // the common case: one atomic load, no query
         }
 
-        // Over budget by the running count — now do the accurate work.
+        // Over budget by the running count — now do the accurate work. The
+        // buffered hits are what say which entries are cold, so they have to
+        // reach the index before it is asked.
+        self.flush_touches();
         let mut running = match self.db.cache_total_bytes(kind) {
             Ok(n) => n,
             Err(_) => return,
@@ -725,6 +795,70 @@ impl ContentCache {
         }
         // The index is the truth; realign the fast path with it.
         self.reseed_totals();
+    }
+
+    /// Duplicate `src` onto `dst`, preferring a reflink.
+    ///
+    /// The caller is copying a staged revision — a whole file, up to whatever
+    /// the user stores — so the difference between the three strategies is the
+    /// difference between instant and minutes:
+    ///
+    /// 1. `FICLONE` shares the extents copy-on-write. On btrfs, XFS with
+    ///    `reflink=1`, and bcachefs this is O(1) and consumes no extra space.
+    /// 2. `copy_file_range` still copies, but entirely inside the kernel — no
+    ///    round trip through a user-space buffer.
+    /// 3. `std::fs::copy` is the portable fallback, and what this used to
+    ///    always do.
+    ///
+    /// `dst` is truncated. Returns the number of bytes the destination ends up
+    /// holding.
+    pub fn clone_or_copy(src: &Path, dst: &Path) -> Result<u64> {
+        use std::os::fd::AsRawFd as _;
+
+        // `_IOW(0x94, 9, int)` — the whole-file reflink ioctl.
+        const FICLONE: libc::c_ulong = 0x4004_9409;
+
+        let source = std::fs::File::open(src)?;
+        let len = source.metadata()?.len();
+        let target = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(dst)?;
+
+        // SAFETY: both descriptors are owned and open; FICLONE takes the source
+        // fd by value and writes nothing back through the pointer-shaped arg.
+        if unsafe { libc::ioctl(target.as_raw_fd(), FICLONE, source.as_raw_fd()) } == 0 {
+            return Ok(len);
+        }
+
+        let mut copied = 0u64;
+        while copied < len {
+            let want = (len - copied) as usize;
+            // SAFETY: owned descriptors; null offsets advance the file offsets,
+            // which is what a whole-file copy wants.
+            let n = unsafe {
+                libc::copy_file_range(
+                    source.as_raw_fd(),
+                    std::ptr::null_mut(),
+                    target.as_raw_fd(),
+                    std::ptr::null_mut(),
+                    want,
+                    0,
+                )
+            };
+            if n <= 0 {
+                break;
+            }
+            copied += n as u64;
+        }
+        if copied == len {
+            return Ok(len);
+        }
+        // A short or refused `copy_file_range` (cross-filesystem on older
+        // kernels, an unsupported fs) leaves a partial destination; the
+        // portable copy truncates and rewrites it from scratch.
+        Ok(std::fs::copy(src, dst)?)
     }
 
     /// Create a fresh, empty read-write scratch file for a disk-backed write
@@ -806,8 +940,9 @@ impl ContentCache {
         let _ = std::fs::remove_file(Self::scratch_sidecar(scratch));
     }
 
-    /// Move every scratch file that carries a readable sidecar into `recovery`,
-    /// before the caller empties the scratch directory.
+    /// Move every scratch file that carries a sidecar into `recovery`, before the
+    /// caller empties the scratch directory. A sidecar that does not parse is
+    /// dropped and its blob moved anyway, unaccompanied — see below.
     ///
     /// Blob first, then sidecar: a blob in recovery without its sidecar is
     /// dropped on the next open (indistinguishable from rubbish), whereas a
@@ -828,41 +963,26 @@ impl ContentCache {
                 // Not marked durable, or durability marker was explicitly cleared on release
                 continue;
             }
-            // Parsed if valid; if sidecar exists but is corrupted, build synthetic StagedWrite
+            // A sidecar that does not parse describes nothing, and inventing one
+            // is worse than having none: a fabricated uid parses, so recovery
+            // would queue an op against a node that does not exist and retry it
+            // forever, while a fabricated `complete: true` claims the blob is the
+            // whole file and stops any gap-fill. The blob still moves to
+            // recovery — sidecar-less, which `recovered_writes` skips and so
+            // leaves on disk for a human, the right outcome for bytes we cannot
+            // describe.
             let has_valid_sidecar = std::fs::read(&side)
                 .ok()
                 .and_then(|b| serde_json::from_slice::<StagedWrite>(&b).ok())
                 .is_some();
-            if !has_valid_sidecar {
-                if let Ok(meta) = std::fs::metadata(&blob)
-                    && meta.len() > 0
-                {
-                    let blob_name = blob
-                        .file_name()
-                        .map(|n| n.to_string_lossy().to_string())
-                        .unwrap_or_default();
-                    let synthetic = StagedWrite {
-                        uid: format!("recovered~{blob_name}"),
-                        len: meta.len(),
-                        base_size: meta.len(),
-                        base_mtime: 0,
-                        authored: vec![(0, meta.len())],
-                        complete: true,
-                        based_on: None,
-                    };
-                    if let Ok(data) = serde_json::to_vec(&synthetic) {
-                        let _ = std::fs::write(&side, data);
-                    } else {
-                        continue;
-                    }
-                } else {
-                    continue;
-                }
-            }
             let Some(name) = blob.file_name() else {
                 continue;
             };
             if std::fs::rename(&blob, recovery_dir.join(name)).is_err() {
+                continue;
+            }
+            if !has_valid_sidecar {
+                let _ = std::fs::remove_file(&side);
                 continue;
             }
             let Some(side_name) = side.file_name() else {
@@ -1210,9 +1330,7 @@ impl ContentCache {
         // Record the access for LRU, as the blob and block readers do. Without
         // it the pool evicts in insertion order, so scrolling back up a gallery
         // would drop exactly the tiles being looked at.
-        let _ = self
-            .db
-            .cache_accessed(&self.thumb_key(uid, ttype), now_millis());
+        self.touch(self.thumb_key(uid, ttype));
         Some(bytes)
     }
 
@@ -1243,9 +1361,7 @@ impl ContentCache {
         if !blob.exists() {
             return None;
         }
-        let _ = self
-            .db
-            .cache_accessed(&self.thumb_key(uid, ttype), now_millis());
+        self.touch(self.thumb_key(uid, ttype));
         Some(blob)
     }
 
@@ -2004,45 +2120,63 @@ mod tests {
     fn block_store_then_read() {
         let (c, _d) = cache();
         let u = uid("a");
-        c.store_block(&u, 100, 4096, 0, b"block-zero").unwrap();
-        assert_eq!(c.cached_block(&u, 100, 4096, 0).unwrap(), b"block-zero");
+        // A 10-byte file is one block of 10 bytes: the length a reader expects
+        // is derived from the file size, so the fixture has to be geometrically
+        // real or the torn-write check rejects it.
+        c.store_block(&u, 100, 10, 0, b"block-zero").unwrap();
+        assert_eq!(c.cached_block(&u, 100, 10, 0).unwrap(), b"block-zero");
         // A different index is a separate cache entry, absent here.
-        assert!(c.cached_block(&u, 100, 4096, 1).is_none());
+        assert!(c.cached_block(&u, 100, 10, 1).is_none());
         // A new revision (mtime/size bump) invalidates the block.
-        assert!(c.cached_block(&u, 101, 4096, 0).is_none());
+        assert!(c.cached_block(&u, 101, 10, 0).is_none());
         assert!(c.cached_block(&u, 100, 5000, 0).is_none());
+    }
+
+    /// The block cache is written without an fsync, so a crash can leave a blob
+    /// shorter than the sidecar beside it claims. Serving that as content would
+    /// hand the reader a hole; it has to read as a miss.
+    #[test]
+    fn a_truncated_block_reads_as_a_miss() {
+        let (c, _d) = cache();
+        let u = uid("a");
+        c.store_block(&u, 100, 10, 0, b"block-zero").unwrap();
+        std::fs::write(c.block_blob(&u, 0), b"block").unwrap();
+        assert!(c.cached_block(&u, 100, 10, 0).is_none());
     }
 
     #[test]
     fn evict_drops_blocks() {
         let (c, _d) = cache();
         let u = uid("a");
-        c.store_block(&u, 1, 8, 0, b"aaaa").unwrap();
-        c.store_block(&u, 1, 8, 1, b"bbbb").unwrap();
+        // Both blocks are stored at their real geometry (a 4-byte file is one
+        // block), so this fails if `evict` misses them rather than because the
+        // fixture was unreadable to begin with.
+        c.store_block(&u, 1, 4, 0, b"aaaa").unwrap();
+        assert!(c.cached_block(&u, 1, 4, 0).is_some());
         c.evict(&u);
-        assert!(c.cached_block(&u, 1, 8, 0).is_none());
-        assert!(c.cached_block(&u, 1, 8, 1).is_none());
+        assert!(c.cached_block(&u, 1, 4, 0).is_none());
     }
 
     #[test]
     fn block_budget_evicts_lru() {
-        // Block pool fits two 4-byte blocks but not three.
+        // Block pool fits two 4-byte blocks but not three. One block per file,
+        // so each fixture is a geometrically real single-block file.
         let (c, _d) = cache_with_pool_cap(KIND_BLOCK, 8);
-        let u = uid("a");
-        c.store_block(&u, 1, 12, 0, b"aaaa").unwrap();
+        let (a, b, d) = (uid("a"), uid("b"), uid("d"));
+        c.store_block(&a, 1, 4, 0, b"aaaa").unwrap();
         std::thread::sleep(std::time::Duration::from_millis(10));
-        c.store_block(&u, 1, 12, 1, b"bbbb").unwrap();
-        // Touch block 0 so block 1 is the least-recently-used.
+        c.store_block(&b, 1, 4, 0, b"bbbb").unwrap();
+        // Touch a's block so b's is the least-recently-used.
         std::thread::sleep(std::time::Duration::from_millis(10));
-        assert!(c.cached_block(&u, 1, 12, 0).is_some());
+        assert!(c.cached_block(&a, 1, 4, 0).is_some());
         std::thread::sleep(std::time::Duration::from_millis(10));
-        c.store_block(&u, 1, 12, 2, b"cccc").unwrap();
+        c.store_block(&d, 1, 4, 0, b"cccc").unwrap();
         assert!(
-            c.cached_block(&u, 1, 12, 0).is_some(),
+            c.cached_block(&a, 1, 4, 0).is_some(),
             "recently-read survives"
         );
-        assert!(c.cached_block(&u, 1, 12, 1).is_none(), "LRU block evicted");
-        assert!(c.cached_block(&u, 1, 12, 2).is_some(), "newest survives");
+        assert!(c.cached_block(&b, 1, 4, 0).is_none(), "LRU block evicted");
+        assert!(c.cached_block(&d, 1, 4, 0).is_some(), "newest survives");
     }
 
     /// A failed upload must never cost the user their bytes (offline.md Phase 2):
@@ -2183,6 +2317,39 @@ mod tests {
         );
         assert_eq!(recovered[0].1.uid, preservation_meta().uid);
         drop(reopened);
+    }
+
+    /// `clone_or_copy` has three strategies and only the last one is portable,
+    /// so what matters is that the destination is byte-identical whichever the
+    /// filesystem under `/tmp` happens to take — including when it already held
+    /// longer content, which a reflink or a short `copy_file_range` must not
+    /// leave a tail of.
+    #[test]
+    fn clone_or_copy_reproduces_the_source_over_any_existing_destination() {
+        let dir = TempDir::new();
+        let src = dir.path().join("src");
+        let dst = dir.path().join("dst");
+        std::fs::write(&src, b"the new content").unwrap();
+        std::fs::write(&dst, vec![b'x'; 4096]).unwrap();
+
+        let len = ContentCache::clone_or_copy(&src, &dst).unwrap();
+
+        assert_eq!(len, 15);
+        assert_eq!(std::fs::read(&dst).unwrap(), b"the new content");
+    }
+
+    /// An empty staged blob is a real case — a file truncated to zero and
+    /// closed — and `FICLONE` of a zero-length source is a documented `EINVAL`.
+    #[test]
+    fn clone_or_copy_handles_an_empty_source() {
+        let dir = TempDir::new();
+        let src = dir.path().join("empty");
+        let dst = dir.path().join("dst");
+        std::fs::write(&src, b"").unwrap();
+        std::fs::write(&dst, b"stale").unwrap();
+
+        assert_eq!(ContentCache::clone_or_copy(&src, &dst).unwrap(), 0);
+        assert!(std::fs::read(&dst).unwrap().is_empty());
     }
 
     /// A2: `fsync(2)` promises the bytes survive a crash, but queueing happens

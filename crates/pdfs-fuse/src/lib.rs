@@ -48,10 +48,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use fuser::ReplyXattr;
 use fuser::{
     AccessFlags, BackgroundSession, BsdFileFlags, Config, CopyFileRangeFlags, Errno, FileAttr,
-    FileHandle, FileType, Filesystem, FopenFlags, Generation, INodeNo, IoctlFlags, LockOwner,
-    MountOption, Notifier, OpenAccMode, OpenFlags, RenameFlags, ReplyAttr, ReplyCreate, ReplyData,
-    ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyIoctl, ReplyLseek, ReplyOpen, ReplyWrite, Request,
-    Session, TimeOrNow, WriteFlags,
+    FileHandle, FileType, Filesystem, FopenFlags, Generation, INodeNo, InitFlags, IoctlFlags,
+    KernelConfig, LockOwner, MountOption, Notifier, OpenAccMode, OpenFlags, RenameFlags, ReplyAttr,
+    ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyIoctl, ReplyLseek,
+    ReplyOpen, ReplyStatfs, ReplyWrite, Request, Session, TimeOrNow, WriteFlags,
 };
 use futures::StreamExt as _;
 use pdfs_core::batch;
@@ -120,6 +120,27 @@ use workers::{FUSE_WORKERS, Lane, Workers};
 /// Phase 2 event poller actively invalidates changed inodes; without a remote
 /// change this is how long the kernel may serve stale metadata.
 const TTL: Duration = Duration::from_secs(30);
+
+/// How long a `statfs(2)` answer is served from [`Core::quota`] before the
+/// account figures are refetched. See [`Core::account_quota_cached`].
+const QUOTA_TTL: Duration = Duration::from_secs(60);
+
+/// Block size reported to the kernel and to `statfs(2)`.
+///
+/// coreutils and most copy tools size their I/O buffers from `st_blksize`, and
+/// the fuser default of 512 makes them issue reads two orders of magnitude
+/// smaller than the [`BLOCK_SIZE`] this filesystem actually fetches in. 1 MiB is
+/// the largest value that stays well inside the kernel's per-request limit.
+const REPORTED_BLKSIZE: u32 = 1 << 20;
+
+/// Ceiling on in-flight background requests (readahead, writeback). The kernel
+/// default of 16 caps how much of a sequential read the kernel will run ahead of
+/// the application, which on a high-latency link is the whole ballgame.
+const MAX_BACKGROUND: u16 = 64;
+
+/// Longest single path component, as reported by `statfs(2)`. The kernel's own
+/// dirent limit; Proton's is not lower.
+const MAX_NAME_LEN: u32 = 255;
 
 /// How often the background task polls the remote event cursor.
 const POLL_INTERVAL: Duration = Duration::from_secs(10);
@@ -396,6 +417,14 @@ struct Core {
     /// is the validity tag — a new revision may well have a thumbnail — matching
     /// how [`ContentCache::read_thumbnail`] validates the positive side.
     no_thumbnail: Arc<Mutex<HashMap<(NodeUid, i32), i64>>>,
+    /// Last account quota answer and when it was learned, for `statfs(2)`.
+    ///
+    /// `df` and the free-space preflight of every file manager and installer ask
+    /// for this, and the answer costs a round trip — so it is served from here
+    /// for [`QUOTA_TTL`] and refreshed on a worker afterwards. Total account
+    /// storage moves slowly enough that a minute-old number is a better answer
+    /// than either a stall or the zeroes the default implementation returns.
+    quota: Arc<Mutex<Option<(std::time::Instant, i64, i64)>>>,
     /// Folders whose listing was enumerated cheaply and is having its file sizes
     /// filled in right now, so a burst of `stat`s over a fresh listing starts one
     /// upgrade rather than one per entry. See [`Core::spawn_size_upgrade`].
@@ -701,11 +730,18 @@ impl Core {
     /// notification channel, so work that invalidates cached metadata reaches
     /// the session that actually minted the inodes it is naming.
     ///
-    /// `None` for a mount whose session has not been spawned yet — there is
-    /// nothing to invalidate in a kernel that has never been told about it.
-    fn for_each_mount(&self, mut apply: impl FnMut(&mut State, Option<&Notifier>)) {
+    /// The closure records what the kernel needs told into a [`NotifyBatch`]
+    /// rather than sending it: notifications are flushed after this mount's
+    /// State lock is released, the same rule [`Core::for_each_state`] and
+    /// [`Core::flush_access_changes`] follow.
+    fn for_each_mount(&self, mut apply: impl FnMut(&mut State, &mut NotifyBatch)) {
         for (_, state, notifier, _) in self.states.live() {
-            apply(&mut state.lock(), notifier.get());
+            let mut batch = NotifyBatch::default();
+            {
+                let mut state = state.lock();
+                apply(&mut state, &mut batch);
+            }
+            batch.flush(notifier.get());
         }
     }
 
@@ -761,6 +797,75 @@ fn require_uid_access(db: &Db, uid: &NodeUid, live_access: &[Access]) -> Result<
     (persisted.writable() && live_access.iter().all(|access| access.writable()))
         .then_some(())
         .ok_or(Errno::EACCES)
+}
+
+/// One kernel notification, recorded while the State lock is held so it can be
+/// sent once it is not.
+///
+/// `inval_inode` calls into `invalidate_inode_pages2`, which can block waiting
+/// on pages that this daemon's own workers have to fill — and those workers take
+/// the State lock. Sending from inside the lock is that deadlock's shape; a
+/// batch is the smallest way to keep the inode/mount pairing while moving the
+/// send outside it.
+enum KernelNotice {
+    InvalInode(u64),
+    InvalEntry {
+        parent: u64,
+        name: String,
+    },
+    Delete {
+        parent: u64,
+        child: u64,
+        name: String,
+    },
+}
+
+/// Notifications accumulated under one mount's State lock. Flushed by
+/// [`Core::for_each_mount`] against that mount's own channel — inode numbers are
+/// per-mount, so the pairing has to survive the deferral.
+#[derive(Default)]
+struct NotifyBatch(Vec<KernelNotice>);
+
+impl NotifyBatch {
+    fn inval_inode(&mut self, ino: u64) {
+        self.0.push(KernelNotice::InvalInode(ino));
+    }
+
+    fn inval_entry(&mut self, parent: u64, name: String) {
+        self.0.push(KernelNotice::InvalEntry { parent, name });
+    }
+
+    fn delete(&mut self, parent: u64, child: u64, name: String) {
+        self.0.push(KernelNotice::Delete {
+            parent,
+            child,
+            name,
+        });
+    }
+
+    fn extend_inodes(&mut self, inodes: &[u64]) {
+        self.0
+            .extend(inodes.iter().map(|&ino| KernelNotice::InvalInode(ino)));
+    }
+
+    /// Send everything recorded. A mount whose session has not been spawned has
+    /// nothing to tell the kernel, so the batch is simply dropped.
+    fn flush(self, notifier: Option<&Notifier>) {
+        let Some(notifier) = notifier else { return };
+        for notice in self.0 {
+            let _ = match notice {
+                KernelNotice::InvalInode(ino) => notifier.inval_inode(INodeNo(ino), 0, 0),
+                KernelNotice::InvalEntry { parent, name } => {
+                    notifier.inval_entry(INodeNo(parent), OsStr::new(&name))
+                }
+                KernelNotice::Delete {
+                    parent,
+                    child,
+                    name,
+                } => notifier.delete(INodeNo(parent), INodeNo(child), OsStr::new(&name)),
+            };
+        }
+    }
 }
 
 fn notify_access_changes(notifier: Option<&Notifier>, changed: &[u64]) {
@@ -2256,7 +2361,23 @@ impl Core {
         }
         let path = self.cache.stage_write(&meta, src).map_err(|e| {
             error!(%uid, error = %e, "staging write failed");
-            Errno::EIO
+            // The scratch file is still the only copy of these bytes, and the
+            // caller is releasing the handle it belongs to — without a
+            // durability sidecar `discard_unmarked_scratch` deletes it at the
+            // next mount, the one place the "never delete on a failure path"
+            // invariant would break. Mark it first, whatever went wrong.
+            if let Err(mark) = self.cache.mark_scratch_durable(src, &meta) {
+                error!(%uid, error = %mark,
+                       "could not mark an unstageable write durable; bytes at risk");
+            }
+            if e.is_disk_full() {
+                // Free cached blobs so the retry has somewhere to land, and tell
+                // the caller what is actually wrong.
+                self.cache.emergency_evict();
+                Errno::ENOSPC
+            } else {
+                Errno::EIO
+            }
         })?;
         let meta_json = serde_json::to_string(&meta).unwrap_or_default();
         let superseded = if is_local_uid(uid) {
@@ -2310,15 +2431,29 @@ impl Core {
         // Reflect the write in the tree straight away: `ls` must show the new
         // size and mtime even though the remote still holds the old revision.
         let now = now_secs();
-        {
+        let recorded = {
             let mut st = self.state.lock();
-            st.record_pending_write(ino, len, now);
-        }
+            // The only record that the file is as long as the caller was told.
+            // If it cannot be written the write did not fully take, and saying
+            // so beats acknowledging a `close(2)` and then serving the old size
+            // — the bytes themselves are already staged and queued either way.
+            st.record_pending_write(ino, len, now)
+        };
         // Cached blobs and open readers describe the superseded revision. Reads
         // come from the staged blob until the op drains, so just drop them.
+        // Done even when the row above failed: the staged blob is the file's
+        // content now either way, and leaving a stale one cached would serve it.
         self.cache.evict(uid);
         self.evict_reader(uid);
         self.wake_drain();
+        if let Err(e) = recorded {
+            error!(%uid, error = %e, "recording a queued write's size failed");
+            return Err(if e.is_disk_full() {
+                Errno::ENOSPC
+            } else {
+                Errno::EIO
+            });
+        }
         Ok(())
     }
 

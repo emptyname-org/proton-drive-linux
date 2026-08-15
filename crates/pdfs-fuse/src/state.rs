@@ -920,14 +920,24 @@ impl State {
     /// file is as long as the caller was told it is. Without it a restart serves
     /// the stale size and the file reads as truncated — or empty — while its
     /// bytes sit safely in staging (offline.md Phase 3).
-    pub(crate) fn record_pending_write(&mut self, ino: u64, size: u64, mtime: i64) {
+    /// Failure is reported rather than logged: dropping the row silently means
+    /// the daemon acknowledged a write and then serves the old size for it, so
+    /// the caller has to be able to turn it into a failed `release`.
+    pub(crate) fn record_pending_write(
+        &mut self,
+        ino: u64,
+        size: u64,
+        mtime: i64,
+    ) -> pdfs_core::Result<()> {
         self.set_size(ino, size);
         self.touch_mtime(ino, mtime);
-        if let Some(e) = self.entries.get(&ino)
-            && let Err(err) = self.db.upsert_node(&e.node)
-        {
-            warn!(uid = %e.uid, error = %err, "db upsert_node failed for a queued write");
+        if let Some(e) = self.entries.get(&ino) {
+            self.db.upsert_node(&e.node).map_err(|err| {
+                warn!(uid = %e.uid, error = %err, "db upsert_node failed for a queued write");
+                err
+            })?;
         }
+        Ok(())
     }
 }
 

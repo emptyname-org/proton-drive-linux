@@ -29,7 +29,23 @@ use super::{Core, count_noun, human_bytes, human_duration, parse_uid};
 
 const MAX_CONTROL_REQUEST_BYTES: u64 = 1024 * 1024;
 const CONTROL_READ_TIMEOUT: Duration = Duration::from_secs(10);
+/// A client that connects, sends a request and then never reads its reply used
+/// to park a handler thread forever in `write_all`; 64 of those exhaust
+/// [`MAX_CONTROL_HANDLERS`] permanently. Generous enough for the largest
+/// responses (photo bytes) over a local socket, finite so a wedged peer can't
+/// hold a permit.
+const CONTROL_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_CONTROL_HANDLERS: usize = 64;
+/// Ceiling on any client-supplied row `limit`. Every in-tree caller asks for far
+/// less (200 for activity, 60 for a photo page), but the value goes straight
+/// into `SQL LIMIT ?` under the daemon's single connection — an unclamped one
+/// materialises the whole account, and then serialises it into one JSON line.
+const MAX_ROW_LIMIT: usize = 1000;
+
+/// Clamp a client-supplied row limit to [`MAX_ROW_LIMIT`].
+fn clamp_limit(limit: usize) -> usize {
+    limit.min(MAX_ROW_LIMIT)
+}
 static ACTIVE_CONTROL_HANDLERS: AtomicUsize = AtomicUsize::new(0);
 
 struct ControlHandlerPermit;
@@ -107,6 +123,10 @@ fn rel_to_mount(mountpoint: &Path, path: &str) -> CoreResult<PathBuf> {
 fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: UnixStream) {
     if let Err(e) = stream.set_read_timeout(Some(CONTROL_READ_TIMEOUT)) {
         warn!(error = %e, "control: could not set request timeout");
+        return;
+    }
+    if let Err(e) = stream.set_write_timeout(Some(CONTROL_WRITE_TIMEOUT)) {
+        warn!(error = %e, "control: could not set response timeout");
         return;
     }
     let mut reader = BufReader::new(match stream.try_clone() {
@@ -204,7 +224,7 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
             kind,
             range,
             favorites,
-        }) => match core.photos_timeline(offset, limit, kind, range, favorites) {
+        }) => match core.photos_timeline(offset, clamp_limit(limit), kind, range, favorites) {
             Ok(Some(items)) => CtlResponse::Photos {
                 available: true,
                 items,
@@ -245,7 +265,7 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
             // An album page is a timeline page as far as the front-end is
             // concerned, so it comes back in the same reply — with `counts`
             // unset, which describe the whole timeline rather than this album.
-            Some(album) => match core.album_photos(&album, offset, limit) {
+            Some(album) => match core.album_photos(&album, offset, clamp_limit(limit)) {
                 Ok(items) => CtlResponse::Photos {
                     available: true,
                     items,
@@ -346,22 +366,24 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
                 Err(e) => CtlResponse::error(e),
             }
         }
-        Ok(CtlRequest::Search { query, limit }) => match core.search(&query, limit) {
+        Ok(CtlRequest::Search { query, limit }) => match core.search(&query, clamp_limit(limit)) {
             Ok(hits) => CtlResponse::SearchResults { hits },
             Err(e) => CtlResponse::error(e),
         },
-        Ok(CtlRequest::SearchLocal { query, limit }) => match core.search_local(&query, limit) {
-            Ok(hits) => CtlResponse::LocalResults {
-                hits,
-                indexing: core.indexing.load(Ordering::Relaxed),
-            },
-            Err(e) => CtlResponse::error(e),
-        },
+        Ok(CtlRequest::SearchLocal { query, limit }) => {
+            match core.search_local(&query, clamp_limit(limit)) {
+                Ok(hits) => CtlResponse::LocalResults {
+                    hits,
+                    indexing: core.indexing.load(Ordering::Relaxed),
+                },
+                Err(e) => CtlResponse::error(e),
+            }
+        }
         Ok(CtlRequest::SearchV2 {
             query,
             limit,
             filters,
-        }) => match core.search_v2(&query, limit, &filters) {
+        }) => match core.search_v2(&query, clamp_limit(limit), &filters) {
             Ok((drive_hits, local_hits)) => CtlResponse::SearchResultsV2 {
                 drive_hits,
                 local_hits,
@@ -1023,7 +1045,7 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
             Err(e) => CtlResponse::error(e),
         },
         Ok(CtlRequest::ListActivity { limit }) => CtlResponse::Activity {
-            items: core.list_activity(limit),
+            items: core.list_activity(clamp_limit(limit)),
         },
         // The request did not parse: the caller sent something malformed.
         Err(e) => CtlResponse::error(CoreError::invalid(format!("bad request: {e}"))),
