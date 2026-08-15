@@ -136,23 +136,30 @@ impl Filesystem for ProtonFs {
         // single upgrade. This is why B12's split is still worth having — the
         // plain listing never comes here at all.
         //
-        // Off the dispatch loop, because it goes to the network: blocking there
-        // would stall every other operation on the mount (the B5 lesson).
+        // Starting the batch is local work — a `state` read and a thread spawn —
+        // so it happens here; what goes to the network is the batch itself, and
+        // this reply is parked on it rather than waiting on any thread of the
+        // mount's (audit F4).
+        let ino = ino.0;
         let fs = self.clone();
-        self.core.workers.run(Lane::Meta, move || {
-            fs.core.upgrade_sizes_for_parent(ino.0, &uid, parent);
+        let respond = move || {
             // Re-read: the upgrade writes through `state`, and on timeout or
             // failure this is simply the provisional attr we already had.
             let attr = {
                 let st = fs.core.state.lock();
-                match st.entries.get(&ino.0) {
-                    Some(e) => fs.attr(ino.0, &e.node, e.access),
+                match st.entries.get(&ino) {
+                    Some(e) => fs.attr(ino, &e.node, e.access),
                     // Forgotten while we waited.
                     None => attr,
                 }
             };
             reply.attr(&TTL, &attr);
-        });
+        };
+        match self.core.upgrade_sizes_for_parent(ino, &uid, parent) {
+            Some(slot) => self.core.await_size(ino, slot, respond),
+            // Nothing to upgrade, so nothing to wait for.
+            None => respond(),
+        }
     }
 
     fn readdir(
@@ -606,10 +613,11 @@ impl Filesystem for ProtonFs {
         // acceptance suite's concurrency case failed with "concurrent file 1
         // mismatch" on all three runs the moment this moved.
         //
-        // The cost is real — `queue_revision` gap-fills a partial write from the
-        // remote — so moving it off still wants doing, but it needs the ordering
-        // made explicit first (a per-node "staging in flight" barrier that reads
-        // wait on) rather than inherited from the dispatch loop.
+        // That inherited ordering is now affordable because the network came out
+        // of this path: `queue_revision` no longer downloads the ranges an edit
+        // did not touch, it stages an incomplete blob and lets the drain thread
+        // finish it (audit F1). What is left is a rename, two fsyncs, a database
+        // insert, and at most a bounded copy out of the local cache.
         self.finish_release(handle, unlinked_uid, reply);
     }
 
@@ -1000,16 +1008,22 @@ impl ProtonFs {
             });
             return;
         }
-        self.core.upgrade_sizes_for_parent(ino, &uid, grandparent);
-        // Re-read: on timeout or failure this is the provisional attr again,
-        // which is no worse than what this path used to always send.
-        let attr = {
-            let st = self.core.state.lock();
-            st.entries
-                .get(&ino)
-                .map_or(attr, |e| self.attr(ino, &e.node, e.access))
+        let fs = self.clone();
+        let respond = move || {
+            // Re-read: on timeout or failure this is the provisional attr again,
+            // which is no worse than what this path used to always send.
+            let attr = {
+                let st = fs.core.state.lock();
+                st.entries
+                    .get(&ino)
+                    .map_or(attr, |e| fs.attr(ino, &e.node, e.access))
+            };
+            reply.entry(&TTL, &attr, Generation(0));
         };
-        reply.entry(&TTL, &attr, Generation(0));
+        match self.core.upgrade_sizes_for_parent(ino, &uid, grandparent) {
+            Some(slot) => self.core.await_size(ino, slot, respond),
+            None => respond(),
+        }
     }
 
     /// The body of [`Filesystem::readdir`], on whichever thread ends up serving it.

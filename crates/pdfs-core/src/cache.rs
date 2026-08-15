@@ -611,15 +611,26 @@ impl ContentCache {
             .join(format!("{}.b{idx}.meta", Self::key(uid)))
     }
 
+    /// Whether block `idx` of `uid` is cached and fresh for `(mtime, size)`,
+    /// without reading it. For a caller deciding whether a block is worth
+    /// *fetching* — reading 4 MiB to answer that would defeat the point.
+    pub fn has_block(&self, uid: &NodeUid, mtime: i64, size: u64, idx: u64) -> bool {
+        self.block_tag(uid, idx) == Some(Meta { mtime, size })
+            && std::fs::metadata(self.block_blob(uid, idx))
+                .is_ok_and(|m| m.len() == block_len(size, idx))
+    }
+
+    /// The `(mtime, size)` a cached block claims to belong to, from its sidecar.
+    fn block_tag(&self, uid: &NodeUid, idx: u64) -> Option<Meta> {
+        serde_json::from_slice(&std::fs::read(self.block_meta(uid, idx)).ok()?).ok()
+    }
+
     /// Serve cached block `idx` (a [`BLOCK_SIZE`]-aligned chunk) of `uid`, or
     /// `None` on miss/stale. Validated against `(mtime, size)` like a whole-file
     /// blob, so a new revision (which bumps the mtime) is detected. Bumps the
     /// block's mtime for LRU, best effort.
     pub fn cached_block(&self, uid: &NodeUid, mtime: i64, size: u64, idx: u64) -> Option<Vec<u8>> {
-        let want = Meta { mtime, size };
-        let meta: Meta =
-            serde_json::from_slice(&std::fs::read(self.block_meta(uid, idx)).ok()?).ok()?;
-        if meta != want {
+        if self.block_tag(uid, idx)? != (Meta { mtime, size }) {
             return None;
         }
         let mut f = std::fs::File::open(self.block_blob(uid, idx)).ok()?;

@@ -105,7 +105,7 @@ pub use mount::{MountOptions, MountOutcome, mount};
 use mount::{
     SecondaryInsertRejection, SecondaryMount, clear_stale_mount, fuse_connection_id, spawn_session,
 };
-use reads::{ReaderSlot, STREAM_BYPASS_MIN, StreamRing};
+use reads::{BlockFlight, BlockRing, PREFETCH_BUDGET, Prefetch, ReaderSlot, STREAM_BYPASS_MIN};
 use state::{Entry, Intervals, PendingRevision, State, WriteHandle};
 use tracing::{debug, error, info, warn};
 use transfers::{CountingWriter, JobGuard, OwnedCountingReader, TransferRegistry};
@@ -253,6 +253,15 @@ const MAX_THUMBNAIL_MISSES: usize = 8192;
 /// delay the waiters this chunking exists to release (bugs.md B14).
 const SIZE_UPGRADE_CHUNK: usize = 150;
 
+/// How many folders may have a size upgrade in flight at once.
+///
+/// Each one owns a thread and an API request stream, and the single-flight only
+/// deduplicates *within* a folder — so without this a recursive listing scaled
+/// both with the number of folders it walked. Eight keeps an interactive `ls -l`
+/// (one folder, sometimes a couple) entirely unaffected while putting a ceiling
+/// on the recursive case.
+const MAX_SIZE_UPGRADES: usize = 8;
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct RootListingSnapshot {
     children: Vec<RootListingChild>,
@@ -330,10 +339,19 @@ struct Core {
     /// Validated by `(mtime, size)` exactly like the content cache, and bounded
     /// by [`MAX_OPEN_READERS`].
     readers: Arc<Mutex<HashMap<NodeUid, ReaderSlot>>>,
-    /// Blocks of files streaming past the on-disk cache, held in memory so a
-    /// player's small sequential reads are served from the last few 4 MiB blocks
-    /// instead of re-downloading each one. See [`StreamRing`].
-    stream_ring: Arc<Mutex<StreamRing>>,
+    /// Decrypted blocks held in memory, so the ~32 kernel reads a 4 MiB block is
+    /// delivered in cost the block once — a download for a streaming file, a
+    /// disk read for a cached one. See [`BlockRing`].
+    block_ring: Arc<Mutex<BlockRing>>,
+    /// Block fetches in flight, so concurrent readers of one block (demand read,
+    /// kernel read-ahead, our own prefetch) share a single download and decrypt.
+    /// See [`BlockFlight`].
+    block_flight: Arc<BlockFlight>,
+    /// Per-file sequential-read detection driving [`Core::prefetch`].
+    prefetch: Arc<Prefetch>,
+    /// Permits bounding speculative block fetches, so prefetch cannot queue in
+    /// front of a read someone is waiting on.
+    prefetch_budget: Arc<tokio::sync::Semaphore>,
     /// Threads that serve the FUSE handlers which touch the network, so the
     /// session's dispatch loop stays free to answer cheap metadata calls while a
     /// cold read is on the wire. See [`Workers`].
@@ -441,6 +459,9 @@ struct Core {
     /// `ls -l` of a folder is one `getattr` per file, and they must collapse
     /// onto a single batch (bugs.md B14).
     size_upgrades: Arc<Mutex<HashMap<u64, Arc<SizeUpgrade>>>>,
+    /// Replies parked on those upgrades. Shared across every mount for the same
+    /// reason the pool is: the bound that matters is per daemon.
+    size_waiters: Arc<SizeWaitQueue>,
     /// This mount's kernel notification channel, for telling the kernel to drop
     /// metadata it has cached. Set once the session exists — which is *after*
     /// the `Core` it is built from, hence the cell.
@@ -1006,6 +1027,59 @@ fn preserve_on_access_denied(
         }
         return Err(error);
     }
+    Ok(())
+}
+
+/// Fold the staged blob of an undrained write into the blob at `src` that is
+/// about to supersede it, so the newer write inherits the older one's bytes
+/// instead of losing them.
+///
+/// Only the ranges the older write authored and the newer one did not are
+/// copied, so a small edit over a small edit moves almost nothing. What neither
+/// wrote is untouched remote content, which is why `base_size`, `base_mtime` and
+/// the baseline all come from the write being superseded: that is the revision
+/// those ranges were last observed against, and the one the drain must gap-fill
+/// and conflict-check them against.
+fn merge_over_pending(
+    meta: &mut StagedWrite,
+    src: &Path,
+    previous: &PendingRevision,
+) -> std::io::Result<()> {
+    let mut written = Intervals::default();
+    for &(s, e) in &meta.authored {
+        written.add(s, e);
+    }
+    let mut earlier = Intervals::default();
+    for &(s, e) in &previous.meta.authored {
+        earlier.add(s, e);
+    }
+    let blob = File::open(&previous.path)?;
+    let dst = std::fs::OpenOptions::new().write(true).open(src)?;
+    for (s, e, authored) in written.clone().segments(0, meta.len) {
+        if authored {
+            continue;
+        }
+        for (ps, pe, have) in earlier.segments(s, e.min(previous.meta.len)) {
+            if !have {
+                continue;
+            }
+            let mut buf = vec![0u8; (pe - ps) as usize];
+            blob.read_exact_at(&mut buf, ps)?;
+            dst.write_all_at(&buf, ps)?;
+            written.add(ps, pe);
+        }
+    }
+    dst.sync_all()?;
+    meta.base_size = previous.meta.base_size;
+    meta.base_mtime = previous.meta.base_mtime;
+    meta.based_on = previous.meta.based_on.clone();
+    meta.authored = written
+        .segments(0, meta.len)
+        .into_iter()
+        .filter(|&(_, _, authored)| authored)
+        .map(|(s, e, _)| (s, e))
+        .collect();
+    meta.complete = meta.authored == [(0, meta.len)];
     Ok(())
 }
 
@@ -2008,7 +2082,12 @@ impl Core {
     /// an earlier upgrade had a chance to run. Gathers the whole folder rather
     /// than the one file asked for, because a `stat` of one entry in a listing
     /// almost always means a `stat` of all of them.
-    fn upgrade_sizes_for_parent(&self, ino: u64, uid: &NodeUid, parent: u64) {
+    fn upgrade_sizes_for_parent(
+        &self,
+        ino: u64,
+        uid: &NodeUid,
+        parent: u64,
+    ) -> Option<Arc<SizeUpgrade>> {
         let provisional = |e: &Entry| {
             matches!(
                 &e.node.kind,
@@ -2046,9 +2125,10 @@ impl Core {
         if !missing.iter().any(|u| u == uid) {
             missing.push(uid.clone());
         }
-        // Blocking, not spawning: the caller is a `getattr` that must not answer
-        // with a provisional size (bugs.md B14).
-        self.upgrade_sizes(key, missing, Some(ino));
+        // Returned, not awaited here: the caller is a `getattr` that must not
+        // answer with a provisional size (bugs.md B14), and it parks its reply
+        // on this batch rather than holding a thread until it lands.
+        self.upgrade_sizes(key, missing)
     }
 
     /// Fill in the true sizes of files a `Light` enumeration returned without
@@ -2069,11 +2149,11 @@ impl Core {
     /// Single-flight per folder: a `stat` of every entry in a fresh listing is
     /// the normal case, and each one must not start its own upgrade.
     fn spawn_size_upgrade(&self, folder_ino: u64, uids: Vec<NodeUid>) {
-        self.upgrade_sizes(folder_ino, uids, None);
+        self.upgrade_sizes(folder_ino, uids);
     }
 
-    /// Start (or join) the size upgrade for `key`, and — when `waiting_for` names
-    /// an inode — block until that node's real size has landed.
+    /// Start (or join) the size upgrade for `key`, returning the batch a caller
+    /// can wait on — `None` when there was nothing to upgrade.
     ///
     /// Single-flight per `key`. The fetch runs on its own thread rather than on
     /// the [`Workers`] pool: callers wait on `Lane::Meta`, so a batch queued onto
@@ -2081,9 +2161,9 @@ impl Core {
     /// for a job that can never be scheduled. `Lane::Transfer` would swap that
     /// for starvation behind bulk reads. One short-lived thread per folder,
     /// bounded by the single-flight, avoids both.
-    fn upgrade_sizes(&self, key: u64, uids: Vec<NodeUid>, waiting_for: Option<u64>) {
+    fn upgrade_sizes(&self, key: u64, uids: Vec<NodeUid>) -> Option<Arc<SizeUpgrade>> {
         if uids.is_empty() {
-            return;
+            return None;
         }
         let slot = {
             let mut in_flight = self.size_upgrades.lock();
@@ -2091,6 +2171,13 @@ impl Core {
                 // Someone else is already fetching this folder; their batch
                 // covers us, so just wait on it.
                 Some(existing) => existing.clone(),
+                // Nothing bounded how many of these could be in flight: the
+                // single-flight is per folder, so a recursive listing across
+                // hundreds of cold folders started a thread and a batch for
+                // each (audit F4). Past the cap, answer with the provisional
+                // size — the same fallback the deadline already takes, and the
+                // upgrade is retried by the next `stat` once a slot frees.
+                None if in_flight.len() >= MAX_SIZE_UPGRADES => return None,
                 None => {
                     let slot = Arc::new(SizeUpgrade::default());
                     in_flight.insert(key, slot.clone());
@@ -2103,10 +2190,41 @@ impl Core {
                 }
             }
         };
-        let Some(ino) = waiting_for else {
-            return;
+        Some(slot)
+    }
+
+    /// Hold `respond` back until `ino` has a real size, `slot`'s batch ends, or
+    /// [`SizeUpgrade::WAIT`] elapses — then run it, on the queue's thread.
+    ///
+    /// The caller returns immediately. That is the whole point: the thread it
+    /// was running on is a FUSE dispatch thread or a [`Workers`] one, and both
+    /// are needed by everything else on the mount (audit F4).
+    fn await_size(
+        &self,
+        ino: u64,
+        slot: Arc<SizeUpgrade>,
+        respond: impl FnOnce() + Send + 'static,
+    ) {
+        let core = self.clone();
+        let waiter = SizeWaiter {
+            slot,
+            resolved: Box::new(move || core.size_is_real(ino)),
+            deadline: Instant::now() + SizeUpgrade::WAIT,
+            respond: Box::new(respond),
         };
-        slot.wait_for(|| self.size_is_real(ino));
+        if !self.size_waiters.park(waiter) {
+            return;
+        }
+        let queue = self.size_waiters.clone();
+        if let Err(error) = std::thread::Builder::new()
+            .name("pdfs-size-waiters".into())
+            .spawn(move || queue.serve())
+        {
+            // Without a thread nothing would ever answer these. A provisional
+            // size is wrong; a `stat` that never returns wedges the caller.
+            warn!(%error, "no thread for parked size waiters; answering provisionally");
+            self.size_waiters.answer_all();
+        }
     }
 
     /// Fetch `uids` in chunks, applying and announcing each one as it lands.
@@ -2393,41 +2511,47 @@ impl Core {
             let _ = std::fs::remove_file(&h.path);
             return Ok(());
         }
-        // Materialize the full content now if we can. A complete blob is
-        // uploadable without the network and, crucially, lets a later write to
-        // the same file supersede this one safely.
+        // Materialize as much of the full content as is free to materialize. A
+        // complete blob is uploadable without the network and lets a later write
+        // to the same file supersede this one without any reconstruction at all.
+        //
+        // What is deliberately *not* done here is fetching the untouched ranges
+        // from the remote: that is a download of everything the edit did not
+        // touch, and this runs on the FUSE dispatch loop, so closing a large
+        // file after a small edit stopped every other request on the mount for
+        // the length of it (audit F1). An incomplete blob is first-class —
+        // `read_pending` resolves its gaps against the base, and `drain_revision`
+        // fills them on the drain thread — so the network half of the fill
+        // belongs there, and only there.
         //
         // A node that exists only locally has no remote base to fill from: its
-        // untouched ranges live in the blob queued by an earlier write, not on
-        // any server. Filling is only safe — and only needed — while it is still
-        // empty, which is exactly when `fill_gaps` skips the network anyway.
-        let filled = if is_local_uid(&h.uid) && h.base_size > 0 {
-            if let Err(e) = h.file.set_len(h.len) {
-                error!(uid = %h.uid, error = %e, "resize scratch file failed");
-                return Err(Errno::EIO);
-            }
-            false
-        } else {
-            self.fill_gaps(
+        // untouched ranges live in the blob queued by an earlier write, which
+        // `merge_over_pending` folds in below.
+        if let Err(e) = h.file.set_len(h.len) {
+            error!(uid = %h.uid, error = %e, "resize scratch file failed");
+            return Err(Errno::EIO);
+        }
+        let mut written = h.written.clone();
+        if !(is_local_uid(&h.uid) && h.base_size > 0) {
+            // A local node has no remote base, so nothing of it can be fetched
+            // or cached: passing zero says so, and leaves the fill doing only
+            // the part that still applies — claiming the zeroed tail.
+            let base_size = if is_local_uid(&h.uid) { 0 } else { h.base_size };
+            self.fill_gaps_cached(
                 &h.uid,
                 &h.file,
                 h.len,
                 h.base_mtime,
-                h.base_size,
-                &h.written,
-            )
-            .is_ok()
-        };
-        let authored: Vec<(u64, u64)> = if filled {
-            vec![(0, h.len)]
-        } else {
-            h.written
-                .segments(0, h.len)
-                .into_iter()
-                .filter(|&(_, _, authored)| authored)
-                .map(|(s, e, _)| (s, e))
-                .collect()
-        };
+                base_size,
+                &mut written,
+            );
+        }
+        let authored: Vec<(u64, u64)> = written
+            .segments(0, h.len)
+            .into_iter()
+            .filter(|&(_, _, authored)| authored)
+            .map(|(s, e, _)| (s, e))
+            .collect();
         let meta = StagedWrite {
             uid: h.uid.to_string(),
             len: h.len,
@@ -2442,8 +2566,9 @@ impl Core {
                 h.base_revision_id.clone(),
             ),
         };
+        let complete = meta.complete;
         self.enqueue_staged_write(&h.uid, h.ino, &h.path, meta)?;
-        debug!(uid = %h.uid, len = h.len, complete = filled, "queued revision upload");
+        debug!(uid = %h.uid, len = h.len, complete, "queued revision upload");
         Ok(())
     }
 
@@ -2524,7 +2649,7 @@ impl Core {
         uid: &NodeUid,
         ino: u64,
         src: &Path,
-        meta: StagedWrite,
+        mut meta: StagedWrite,
     ) -> Result<(), Errno> {
         preserve_on_access_denied(self.require_uid_writable(uid), true, || {
             self.stage_orphaned_write(
@@ -2537,12 +2662,21 @@ impl Core {
         })?;
         // An incomplete blob's gaps refer to the *remote* base. If an earlier
         // write to this file is still queued, the remote no longer holds that
-        // base — the previous staged blob does — so superseding it would fill
-        // those gaps from the wrong revision. Rather than corrupt the file,
-        // refuse the write and keep the bytes recoverable (Phase 2 behaviour).
-        // Only reachable offline, editing in place a file whose previous edit
-        // has not drained and whose base is not cached.
-        if !meta.complete && self.pending.lock().contains_key(uid) {
+        // base — the previous staged blob does — so taking those gaps at face
+        // value would fill them from the wrong revision. Fold the blob being
+        // superseded into this one instead: its authored bytes are a local copy
+        // of exactly the ranges this write did not touch, and what neither wrote
+        // is still the remote content that the earlier write was based on, which
+        // is why the baseline is inherited along with them.
+        let previous = self.pending.lock().get(uid).cloned();
+        if !meta.complete
+            && let Some(previous) = previous
+            && let Err(error) = merge_over_pending(&mut meta, src, &previous)
+        {
+            // Without the earlier bytes the gaps cannot be resolved against
+            // anything, so this is where the write stops being uploadable.
+            // Keep it recoverable rather than corrupting the file.
+            warn!(%uid, %error, "folding in the undrained edit failed");
             self.stage_orphaned_write(
                 uid,
                 ino,
@@ -4619,37 +4753,10 @@ impl SizeUpgrade {
     /// wedging whatever is listing the directory.
     const WAIT: Duration = Duration::from_secs(10);
 
-    /// Block until `resolved` reports the caller's own node has a real size, the
-    /// batch finishes without producing one, or [`SizeUpgrade::WAIT`] elapses.
-    ///
-    /// `resolved` is called with **no lock of ours held**. It reaches into
-    /// `state`, and the thread applying a chunk holds `state` before it signals
-    /// here — taking them in the other order would close the cycle.
-    fn wait_for(&self, resolved: impl Fn() -> bool) {
-        let deadline = Instant::now() + Self::WAIT;
-        loop {
-            let seen = {
-                let progress = self.inner.lock();
-                if progress.done {
-                    return;
-                }
-                progress.generation
-            };
-            if resolved() {
-                return;
-            }
-            let mut progress = self.inner.lock();
-            if progress.done {
-                return;
-            }
-            // A chunk landed while we were checking, so re-check rather than
-            // sleeping through the answer we were waiting for.
-            if progress.generation == seen
-                && self.ready.wait_until(&mut progress, deadline).timed_out()
-            {
-                return;
-            }
-        }
+    /// Whether the batch has ended, however it ended. A waiter that sees this
+    /// has nothing left to wait for.
+    fn is_finished(&self) -> bool {
+        self.inner.lock().done
     }
 
     /// Announce that a chunk has been applied. Every waiter re-checks its own
@@ -4666,6 +4773,121 @@ impl SizeUpgrade {
         progress.generation += 1;
         drop(progress);
         self.ready.notify_all();
+    }
+}
+
+/// How often [`SizeWaitQueue::serve`] re-tests its parked waiters.
+///
+/// The predicates read `state`, which the applying thread writes under its own
+/// lock, so this polls rather than waiting on each slot's condvar: one thread
+/// cannot wait on a hundred condvars, and the whole point of the queue is that
+/// there is only one thread. Twenty milliseconds is far below the round trip a
+/// waiter is waiting on and only ticks while something is actually parked.
+const SIZE_WAIT_POLL: Duration = Duration::from_millis(20);
+
+/// A reply held back until a size upgrade resolves the node it describes.
+struct SizeWaiter {
+    /// The batch this reply is waiting on. When it ends, so does the wait.
+    slot: Arc<SizeUpgrade>,
+    /// Whether *this* waiter's node now has a real size.
+    ///
+    /// Called with no queue lock held: it reaches into `state`, and the thread
+    /// applying a chunk holds `state` before it announces the chunk — taking
+    /// them in the other order would close the cycle.
+    resolved: Box<dyn Fn() -> bool + Send>,
+    /// When to answer with the provisional size anyway. A `stat` that never
+    /// returns is far worse than one that is briefly wrong.
+    deadline: Instant,
+    /// Sends the FUSE reply. Runs on the serving thread.
+    respond: Box<dyn FnOnce() + Send>,
+}
+
+#[derive(Default)]
+struct Parked {
+    waiters: Vec<SizeWaiter>,
+    /// Whether a thread is currently serving `waiters`. The thread clears this
+    /// as it retires, so the next park starts a new one.
+    running: bool,
+}
+
+/// Every reply parked on a size upgrade, served by at most one thread.
+///
+/// This exists because waiting used to happen on the [`Workers`] pool. Sizes
+/// are single-flighted per folder, so an `ls -l` across N cold folders parks a
+/// waiter per entry — and each of those held a pool thread asleep on a condvar
+/// for up to [`SizeUpgrade::WAIT`]. With enough folders that is every thread in
+/// both lanes, including the ones reserved for metadata precisely so that this
+/// could not happen (audit F4). Parking the `Reply` instead costs one thread
+/// for the whole mount, and only while something is parked.
+#[derive(Default)]
+struct SizeWaitQueue {
+    parked: Mutex<Parked>,
+    /// Woken when a waiter is added, so a serving thread re-computes how long
+    /// it may sleep.
+    added: Condvar,
+}
+
+impl SizeWaitQueue {
+    /// Park `waiter`. Returns whether the caller must start a serving thread.
+    fn park(&self, waiter: SizeWaiter) -> bool {
+        let mut parked = self.parked.lock();
+        parked.waiters.push(waiter);
+        if parked.running {
+            drop(parked);
+            self.added.notify_all();
+            return false;
+        }
+        parked.running = true;
+        true
+    }
+
+    /// Answer every waiter whose node has resolved, whose batch has ended, or
+    /// whose deadline has passed; sleep until the next one might. Returns when
+    /// nothing is parked any more.
+    fn serve(&self) {
+        loop {
+            // Taken out of the lock wholesale: the predicates and the replies
+            // both take locks of their own, and none of them may be called
+            // while this one is held.
+            let taken = std::mem::take(&mut self.parked.lock().waiters);
+            let now = Instant::now();
+            let mut keep = Vec::with_capacity(taken.len());
+            for waiter in taken {
+                if now >= waiter.deadline || waiter.slot.is_finished() || (waiter.resolved)() {
+                    (waiter.respond)();
+                } else {
+                    keep.push(waiter);
+                }
+            }
+            let mut parked = self.parked.lock();
+            parked.waiters.append(&mut keep);
+            if parked.waiters.is_empty() {
+                parked.running = false;
+                return;
+            }
+            let until = parked
+                .waiters
+                .iter()
+                .map(|w| w.deadline)
+                .min()
+                .unwrap_or(now)
+                .min(Instant::now() + SIZE_WAIT_POLL);
+            self.added.wait_until(&mut parked, until);
+        }
+    }
+
+    /// Answer everything parked, immediately, and retire the serving thread.
+    /// Used when there is no thread to serve with: a provisional size now beats
+    /// a reply that never comes.
+    fn answer_all(&self) {
+        let taken = {
+            let mut parked = self.parked.lock();
+            parked.running = false;
+            std::mem::take(&mut parked.waiters)
+        };
+        for waiter in taken {
+            (waiter.respond)();
+        }
     }
 }
 
@@ -4828,18 +5050,219 @@ fn unix_secs(secs: i64) -> SystemTime {
 }
 
 #[cfg(test)]
+mod merge_over_pending_tests {
+    use super::{PendingRevision, merge_over_pending};
+    use pdfs_core::cache::{Baseline, StagedWrite};
+    use std::io::Write as _;
+    use std::path::PathBuf;
+
+    /// A unique temp directory removed on drop; avoids a dev-dependency, as in
+    /// `state.rs`.
+    struct TempDir(PathBuf);
+    impl TempDir {
+        fn new() -> Self {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static N: AtomicU64 = AtomicU64::new(0);
+            let p = std::env::temp_dir().join(format!(
+                "pdfs-merge-{}-{}",
+                std::process::id(),
+                N.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir_all(&p).unwrap();
+            TempDir(p)
+        }
+    }
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn staged(len: u64, base_size: u64, authored: &[(u64, u64)]) -> StagedWrite {
+        StagedWrite {
+            uid: "vol~link".into(),
+            len,
+            base_size,
+            base_mtime: 100,
+            complete: authored == [(0, len)],
+            authored: authored.to_vec(),
+            based_on: Some(Baseline {
+                mtime: 100,
+                size: base_size,
+                hash: None,
+                revision_id: Some("r1".into()),
+            }),
+        }
+    }
+
+    /// Write a file of `len` bytes with `fill` at every offset in `ranges`.
+    fn blob(
+        dir: &std::path::Path,
+        name: &str,
+        len: u64,
+        ranges: &[(u64, u64)],
+        fill: u8,
+    ) -> std::path::PathBuf {
+        let path = dir.join(name);
+        let mut bytes = vec![0u8; len as usize];
+        for &(s, e) in ranges {
+            bytes[s as usize..e as usize].fill(fill);
+        }
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(&bytes).unwrap();
+        path
+    }
+
+    /// The case the merge exists for: two small edits to different parts of a
+    /// file, the second closing before the first has drained. The second blob
+    /// must come out holding both, or the first edit is silently lost.
+    #[test]
+    fn the_superseding_write_inherits_the_earlier_ones_bytes() {
+        let dir = TempDir::new();
+        let previous = PendingRevision {
+            path: blob(&dir.0, "old", 64, &[(0, 16)], 0xAA),
+            meta: staged(64, 64, &[(0, 16)]),
+        };
+        let src = blob(&dir.0, "new", 64, &[(32, 48)], 0xBB);
+        let mut meta = staged(64, 64, &[(32, 48)]);
+
+        merge_over_pending(&mut meta, &src, &previous).unwrap();
+
+        assert_eq!(meta.authored, vec![(0, 16), (32, 48)]);
+        assert!(
+            !meta.complete,
+            "the untouched middle still comes from the base"
+        );
+        let merged = std::fs::read(&src).unwrap();
+        assert!(
+            merged[0..16].iter().all(|&b| b == 0xAA),
+            "earlier edit kept"
+        );
+        assert!(merged[32..48].iter().all(|&b| b == 0xBB), "newer edit kept");
+    }
+
+    /// Where they overlap, the newer write wins — it is the later state of the
+    /// file, and the older bytes were never visible to anyone after it landed.
+    #[test]
+    fn the_newer_write_wins_the_ranges_it_authored() {
+        let dir = TempDir::new();
+        let previous = PendingRevision {
+            path: blob(&dir.0, "old", 32, &[(0, 32)], 0xAA),
+            meta: staged(32, 32, &[(0, 32)]),
+        };
+        let src = blob(&dir.0, "new", 32, &[(8, 16)], 0xBB);
+        let mut meta = staged(32, 32, &[(8, 16)]);
+
+        merge_over_pending(&mut meta, &src, &previous).unwrap();
+
+        assert_eq!(meta.authored, vec![(0, 32)]);
+        assert!(meta.complete, "between them they cover the file");
+        let merged = std::fs::read(&src).unwrap();
+        assert!(
+            merged[8..16].iter().all(|&b| b == 0xBB),
+            "newer edit survives"
+        );
+        assert!(merged[16..32].iter().all(|&b| b == 0xAA));
+    }
+
+    /// The baseline has to come from the write being superseded. This one's own
+    /// "base" is the earlier *staged blob*, whose size and mtime are ours, not
+    /// the server's — filling or conflict-checking against that would compare
+    /// the remote to a revision it never had.
+    #[test]
+    fn the_baseline_is_inherited_from_the_write_being_superseded() {
+        let dir = TempDir::new();
+        let mut earlier = staged(64, 64, &[(0, 16)]);
+        earlier.base_mtime = 42;
+        earlier.base_size = 50;
+        earlier.based_on = Some(Baseline {
+            mtime: 42,
+            size: 50,
+            hash: None,
+            revision_id: Some("original".into()),
+        });
+        let previous = PendingRevision {
+            path: blob(&dir.0, "old", 64, &[(0, 16)], 0xAA),
+            meta: earlier,
+        };
+        let src = blob(&dir.0, "new", 64, &[(32, 48)], 0xBB);
+        // Opened over the staged blob, so this write thinks its base is 64/100.
+        let mut meta = staged(64, 64, &[(32, 48)]);
+
+        merge_over_pending(&mut meta, &src, &previous).unwrap();
+
+        assert_eq!(meta.base_mtime, 42);
+        assert_eq!(meta.base_size, 50);
+        assert_eq!(
+            meta.based_on.unwrap().revision_id.as_deref(),
+            Some("original")
+        );
+    }
+
+    /// A shrink must not drag the earlier write's tail back in.
+    #[test]
+    fn a_truncating_write_does_not_inherit_past_its_own_length() {
+        let dir = TempDir::new();
+        let previous = PendingRevision {
+            path: blob(&dir.0, "old", 64, &[(0, 64)], 0xAA),
+            meta: staged(64, 64, &[(0, 64)]),
+        };
+        let src = blob(&dir.0, "new", 16, &[(8, 16)], 0xBB);
+        let mut meta = staged(16, 64, &[(8, 16)]);
+
+        merge_over_pending(&mut meta, &src, &previous).unwrap();
+
+        assert_eq!(meta.authored, vec![(0, 16)]);
+        assert!(meta.complete);
+        assert_eq!(std::fs::metadata(&src).unwrap().len(), 16);
+    }
+}
+
+#[cfg(test)]
 mod size_upgrade_tests {
-    use super::SizeUpgrade;
+    use super::{SizeUpgrade, SizeWaitQueue, SizeWaiter};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::mpsc;
     use std::time::{Duration, Instant};
 
-    /// The point of the per-chunk design: a waiter returns as soon as *its own*
-    /// file is resolved, without waiting for the rest of the folder. A single
-    /// batch over 793 nodes took ~80 s, which outran the timeout and handed back
-    /// the provisional size this is all meant to prevent.
+    /// Park a waiter the way [`Core::await_size`] does, and hand back the
+    /// channel its reply is sent down, so a test can time the release.
+    fn park(
+        queue: &Arc<SizeWaitQueue>,
+        slot: Arc<SizeUpgrade>,
+        resolved: impl Fn() -> bool + Send + 'static,
+        deadline: Instant,
+    ) -> mpsc::Receiver<()> {
+        let (tx, rx) = mpsc::channel();
+        let waiter = SizeWaiter {
+            slot,
+            resolved: Box::new(resolved),
+            deadline,
+            respond: Box::new(move || {
+                let _ = tx.send(());
+            }),
+        };
+        if queue.park(waiter) {
+            let queue = queue.clone();
+            std::thread::spawn(move || queue.serve());
+        }
+        rx
+    }
+
+    /// Long enough that a test never trips the deadline by accident, short
+    /// enough that one which is *meant* to does not take ten seconds.
+    fn far_off() -> Instant {
+        Instant::now() + Duration::from_secs(30)
+    }
+
+    /// The point of the per-chunk design: a waiter is answered as soon as *its
+    /// own* file is resolved, without waiting for the rest of the folder. A
+    /// single batch over 793 nodes took ~80 s, which outran the timeout and
+    /// handed back the provisional size this is all meant to prevent.
     #[test]
     fn a_waiter_returns_on_the_chunk_that_resolves_it() {
+        let queue = Arc::new(SizeWaitQueue::default());
         let slot = Arc::new(SizeUpgrade::default());
         let mine = Arc::new(AtomicBool::new(false));
         let worker = slot.clone();
@@ -4849,39 +5272,43 @@ mod size_upgrade_tests {
             std::thread::sleep(Duration::from_millis(30));
             flag.store(true, Ordering::SeqCst);
             worker.chunk_done();
-            std::thread::sleep(Duration::from_millis(200));
+            std::thread::sleep(Duration::from_millis(300));
             worker.chunk_done();
             worker.finish();
         });
         let started = Instant::now();
-        slot.wait_for(|| mine.load(Ordering::SeqCst));
+        let rx = park(&queue, slot, move || mine.load(Ordering::SeqCst), far_off());
+        rx.recv().expect("the waiter is answered");
         // Released by the first chunk, not the last.
-        assert!(started.elapsed() < Duration::from_millis(150));
+        assert!(started.elapsed() < Duration::from_millis(200));
         t.join().unwrap();
     }
 
-    /// A chunk that does not resolve this waiter must not wake it for good.
+    /// A chunk that does not resolve this waiter must not answer it.
     #[test]
     fn an_unrelated_chunk_does_not_release_a_waiter() {
+        let queue = Arc::new(SizeWaitQueue::default());
         let slot = Arc::new(SizeUpgrade::default());
         let worker = slot.clone();
         let t = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(30));
             worker.chunk_done();
-            std::thread::sleep(Duration::from_millis(60));
+            std::thread::sleep(Duration::from_millis(120));
             worker.finish();
         });
         let started = Instant::now();
         // Never resolved: only `finish` can end this wait.
-        slot.wait_for(|| false);
-        assert!(started.elapsed() >= Duration::from_millis(80));
+        let rx = park(&queue, slot, || false, far_off());
+        rx.recv().expect("the waiter is answered");
+        assert!(started.elapsed() >= Duration::from_millis(140));
         t.join().unwrap();
     }
 
     /// A batch that ends without resolving the node — a failed fetch — still
-    /// releases its waiters, who fall back to the provisional size.
+    /// answers its waiters, who fall back to the provisional size.
     #[test]
     fn finish_releases_a_waiter_that_was_never_resolved() {
+        let queue = Arc::new(SizeWaitQueue::default());
         let slot = Arc::new(SizeUpgrade::default());
         let worker = slot.clone();
         let t = std::thread::spawn(move || {
@@ -4889,59 +5316,101 @@ mod size_upgrade_tests {
             worker.finish();
         });
         let started = Instant::now();
-        slot.wait_for(|| false);
+        let rx = park(&queue, slot, || false, far_off());
+        rx.recv().expect("the waiter is answered");
         assert!(started.elapsed() < SizeUpgrade::WAIT);
         t.join().unwrap();
     }
 
-    /// Already resolved before waiting: must not block at all. This is the
+    /// Already resolved before parking: answered on the first pass. This is the
     /// follower that arrives after the chunk it needed has landed.
     #[test]
     fn an_already_resolved_waiter_does_not_block() {
-        let slot = SizeUpgrade::default();
+        let queue = Arc::new(SizeWaitQueue::default());
         let started = Instant::now();
-        slot.wait_for(|| true);
+        let rx = park(&queue, Arc::new(SizeUpgrade::default()), || true, far_off());
+        rx.recv().expect("the waiter is answered");
         assert!(started.elapsed() < Duration::from_millis(100));
     }
 
-    /// Finishing before anyone waits must not strand the late arrival — the
+    /// Finishing before anyone parks must not strand the late arrival — the
     /// flag is what is checked, not the notification, which it would miss.
     #[test]
     fn waiting_after_finish_returns_at_once() {
-        let slot = SizeUpgrade::default();
+        let queue = Arc::new(SizeWaitQueue::default());
+        let slot = Arc::new(SizeUpgrade::default());
         slot.finish();
         let started = Instant::now();
-        slot.wait_for(|| false);
+        let rx = park(&queue, slot, || false, far_off());
+        rx.recv().expect("the waiter is answered");
         assert!(started.elapsed() < Duration::from_millis(100));
     }
 
-    /// Every waiter is released, not just the first: one `ls -l` puts one
+    /// Every waiter is answered, not just the first: one `ls -l` puts one
     /// waiter per file on the same folder.
     #[test]
     fn all_waiters_are_released() {
+        let queue = Arc::new(SizeWaitQueue::default());
         let slot = Arc::new(SizeUpgrade::default());
         let waiters: Vec<_> = (0..8)
-            .map(|_| {
-                let slot = slot.clone();
-                std::thread::spawn(move || slot.wait_for(|| false))
-            })
+            .map(|_| park(&queue, slot.clone(), || false, far_off()))
             .collect();
         std::thread::sleep(Duration::from_millis(20));
         slot.finish();
-        for w in waiters {
-            w.join().expect("every waiter returns");
+        for rx in waiters {
+            rx.recv().expect("every waiter is answered");
         }
     }
 
-    /// The timeout is the backstop: a batch that never finishes must not wedge
+    /// The deadline is the backstop: a batch that never finishes must not wedge
     /// the caller's `stat` forever.
     #[test]
-    fn a_waiter_gives_up_at_the_timeout() {
-        let slot = SizeUpgrade::default();
+    fn a_waiter_gives_up_at_the_deadline() {
+        let queue = Arc::new(SizeWaitQueue::default());
         let started = Instant::now();
         // Nothing will ever resolve or finish this.
-        slot.wait_for(|| false);
-        assert!(started.elapsed() >= SizeUpgrade::WAIT);
+        let rx = park(
+            &queue,
+            Arc::new(SizeUpgrade::default()),
+            || false,
+            Instant::now() + Duration::from_millis(120),
+        );
+        rx.recv().expect("the waiter is answered");
+        assert!(started.elapsed() >= Duration::from_millis(120));
+    }
+
+    /// The serving thread retires when nothing is parked, and a later park
+    /// starts a new one — otherwise the second `ls -l` of the session would
+    /// hang forever.
+    #[test]
+    fn the_queue_serves_again_after_it_has_drained() {
+        let queue = Arc::new(SizeWaitQueue::default());
+        for _ in 0..3 {
+            let rx = park(&queue, Arc::new(SizeUpgrade::default()), || true, far_off());
+            rx.recv().expect("the waiter is answered");
+        }
+    }
+
+    /// With no thread to serve them, waiters are answered on the spot rather
+    /// than never: a provisional size beats a `stat` that does not return.
+    #[test]
+    fn answer_all_releases_everything_parked() {
+        let queue = SizeWaitQueue::default();
+        let (tx, rx) = mpsc::channel();
+        for _ in 0..4 {
+            let tx = tx.clone();
+            queue.park(SizeWaiter {
+                slot: Arc::new(SizeUpgrade::default()),
+                resolved: Box::new(|| false),
+                deadline: far_off(),
+                respond: Box::new(move || {
+                    let _ = tx.send(());
+                }),
+            });
+        }
+        drop(tx);
+        queue.answer_all();
+        assert_eq!(rx.into_iter().count(), 4);
     }
 }
 

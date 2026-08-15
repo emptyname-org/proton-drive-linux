@@ -10,18 +10,30 @@ use super::*;
 /// usual.
 pub(super) const STREAM_BYPASS_MIN: u64 = 256 * 1024 * 1024;
 
-/// How many bytes of streamed blocks the in-memory ring keeps. Bypassing the
-/// on-disk cache must not mean re-fetching: the kernel asks for a streamed file
-/// in reads far smaller than [`BLOCK_SIZE`], so without a ring every 128 KiB the
-/// player consumes would download and decrypt a whole 4 MiB block again. Sized
-/// for a handful of blocks per concurrently-streamed file.
-const STREAM_RING_BYTES: u64 = 128 * 1024 * 1024;
+/// How many bytes of decrypted blocks the in-memory ring keeps.
+///
+/// The kernel asks for a file in reads far smaller than [`BLOCK_SIZE`], so
+/// without a ring every 128 KiB it consumes costs a whole 4 MiB block again —
+/// downloaded and decrypted for a streaming file, or re-read off disk and
+/// re-allocated for a cached one (audit T3: 128 MiB of I/O to deliver 4 MiB).
+/// Sized for a handful of blocks per concurrently-read file. Bounded and only
+/// ever filled by active reads.
+const RING_BYTES: u64 = 128 * 1024 * 1024;
 
-/// Blocks fetched *past* the one a sequential streaming read needed, warmed into
-/// the ring in the background so the player's next read is already in memory
-/// instead of waiting a round-trip. Kept small so it cannot crowd out the
-/// in-flight block governor.
-const STREAM_READAHEAD: u64 = 4;
+/// Deepest read-ahead window, in blocks, for a read that has proved sequential.
+const PREFETCH_MAX: u64 = 8;
+
+/// Window a sequential read starts at, and returns to after a seek.
+const PREFETCH_MIN: u64 = 2;
+
+/// Blocks that may be prefetching at once, across every file. Prefetch takes a
+/// permit and gives up rather than queueing, so it can never sit in front of a
+/// demand read in the SDK's flat block semaphore.
+pub(super) const PREFETCH_BUDGET: usize = 8;
+
+/// Cap on tracked sequential streams. Only reads in progress matter, so the map
+/// is cleared wholesale rather than aged — losing the ramp costs one read.
+const MAX_PREFETCH_STREAMS: usize = 256;
 
 /// How many [`RevisionReader`]s stay open at once.
 ///
@@ -76,35 +88,39 @@ pub(super) struct PendingOpen {
 /// does; ids are never compared for order.
 static NEXT_OPEN_ID: AtomicU64 = AtomicU64::new(0);
 
-/// Drive client, a Tokio handle to bridge the synchronous FUSE/socket threads
-/// to the async SDK, the inode bookkeeping, and the on-disk content cache.
-///
-/// Cheaply cloneable (every field is a handle/`Arc`), so the control-socket task
-/// gets its own copy while the FUSE session keeps another.
-/// In-memory LRU of blocks belonging to a file streaming past the on-disk cache
-/// (see [`STREAM_BYPASS_MIN`]). Bypassing the disk stops one film evicting the
-/// block LRU; it must not also mean the same 4 MiB block is downloaded once per
-/// 128 KiB the player reads out of it.
+/// In-memory LRU of decrypted 4 MiB blocks, in front of both block paths: the
+/// on-disk block cache, and the disk-bypassing stream of a large unpinned video
+/// (see [`STREAM_BYPASS_MIN`], which stops one film evicting the whole disk
+/// LRU). Either way the point is the same — the kernel reads a block out in ~32
+/// pieces, and none of them should cost the block again.
 ///
 /// Validated by the same `(mtime, size)` pair the on-disk caches use: a node
 /// whose tag no longer matches has its blocks dropped rather than served, so a
 /// new revision can never be stitched together from the old one.
 #[derive(Default)]
-pub(super) struct StreamRing {
+pub(super) struct BlockRing {
     blocks: HashMap<(NodeUid, u64), Arc<Vec<u8>>>,
-    /// Keys oldest-first, for eviction.
+    /// Keys least-recently-used first, for eviction.
     order: VecDeque<(NodeUid, u64)>,
     /// Per-node validity tag, `(mtime, size)`.
     tags: HashMap<NodeUid, (i64, u64)>,
     bytes: u64,
 }
 
-impl StreamRing {
+impl BlockRing {
     fn get(&mut self, uid: &NodeUid, mtime: i64, size: u64, idx: u64) -> Option<Arc<Vec<u8>>> {
         if self.tags.get(uid) != Some(&(mtime, size)) {
             return None;
         }
-        self.blocks.get(&(uid.clone(), idx)).cloned()
+        let key = (uid.clone(), idx);
+        let hit = self.blocks.get(&key).cloned()?;
+        // Move to the young end: a block being read repeatedly (the whole reason
+        // this exists) must not age out under a sequential read passing through.
+        if let Some(at) = self.order.iter().position(|k| *k == key) {
+            self.order.remove(at);
+            self.order.push_back(key);
+        }
+        Some(hit)
     }
 
     fn insert(&mut self, uid: &NodeUid, mtime: i64, size: u64, idx: u64, bytes: Arc<Vec<u8>>) {
@@ -121,12 +137,17 @@ impl StreamRing {
         self.bytes += bytes.len() as u64;
         self.blocks.insert(key.clone(), bytes);
         self.order.push_back(key);
-        while self.bytes > STREAM_RING_BYTES {
+        while self.bytes > RING_BYTES {
             let Some(victim) = self.order.pop_front() else {
                 break;
             };
             if let Some(dropped) = self.blocks.remove(&victim) {
                 self.bytes -= dropped.len() as u64;
+            }
+            // A node whose last block just aged out keeps no tag: otherwise the
+            // tag map is the one thing here that grows with every file ever read.
+            if !self.blocks.keys().any(|(u, _)| *u == victim.0) {
+                self.tags.remove(&victim.0);
             }
         }
     }
@@ -144,6 +165,87 @@ impl StreamRing {
         });
         self.bytes -= freed;
         self.tags.remove(uid);
+    }
+}
+
+/// The result of fetching one block, shared between everyone who wanted it.
+type BlockResult = Result<Arc<Vec<u8>>, Errno>;
+
+/// Identifies a block *of a revision*: node, validity tag, index.
+type BlockKey = (NodeUid, i64, u64, u64);
+
+/// A claim on a block key: who owns the fetch, and where its result is published.
+type Claim = (u64, tokio::sync::watch::Receiver<Option<BlockResult>>);
+
+/// Block fetches in flight, so a block is downloaded and decrypted once however
+/// many readers want it at that moment (audit T1).
+///
+/// With `FUSE_ASYNC_READ` the demand read and the kernel's read-ahead land in
+/// the same 4 MiB block for 31 of every 32 reads, and read-ahead of our own
+/// (see [`Core::prefetch`]) aims at blocks a demand read may be about to ask
+/// for. Without this each of them pays the full round-trip and decrypt and all
+/// but one result is discarded — roughly double the bandwidth and CPU in steady
+/// state. Same shape as [`ReaderSlot::Pending`] one level up.
+#[derive(Default)]
+pub(super) struct BlockFlight {
+    inflight: Mutex<HashMap<BlockKey, Claim>>,
+}
+
+/// Distinguishes attempts at the same key, so a leader only retires its own.
+static NEXT_FLIGHT_ID: AtomicU64 = AtomicU64::new(0);
+
+/// The leader's claim on a key. Retires it on drop — including when the task is
+/// cancelled mid-fetch, which is what keeps a dropped `JoinSet` from leaving a
+/// key nobody will ever publish.
+struct Flight {
+    flight: Arc<BlockFlight>,
+    key: BlockKey,
+    id: u64,
+}
+
+impl Drop for Flight {
+    fn drop(&mut self) {
+        let mut inflight = self.flight.inflight.lock();
+        if inflight
+            .get(&self.key)
+            .is_some_and(|(id, _)| *id == self.id)
+        {
+            inflight.remove(&self.key);
+        }
+    }
+}
+
+/// Where each file's reader is expected to read next, so sequential reads can be
+/// told from random ones and only the former prefetched (audit T2).
+#[derive(Default)]
+pub(super) struct Prefetch {
+    /// Per node: the block index a sequential reader should ask for next, and
+    /// the window depth it has earned.
+    streams: Mutex<HashMap<NodeUid, (u64, u64)>>,
+}
+
+impl Prefetch {
+    /// How far past `last` to read ahead for a read of blocks `[first, last]`,
+    /// and record where that read leaves the file's cursor.
+    ///
+    /// A read that starts where the last one stopped doubles the window (from
+    /// [`PREFETCH_MIN`], up to [`PREFETCH_MAX`]); anything else is a seek and
+    /// earns nothing, so random access — a database file, a linker — never pays
+    /// for speculative blocks it will not read. The first read of a file counts
+    /// as sequential: `(0, 0)` is both the initial cursor and block zero.
+    fn window(&self, uid: &NodeUid, first: u64, last: u64) -> u64 {
+        let mut streams = self.streams.lock();
+        if streams.len() > MAX_PREFETCH_STREAMS {
+            streams.clear();
+        }
+        let stream = streams.entry(uid.clone()).or_insert((0, 0));
+        let depth = if stream.0 == first {
+            (stream.1 * 2).clamp(PREFETCH_MIN, PREFETCH_MAX)
+        } else {
+            0
+        };
+        *stream = (last + 1, depth);
+        depth
     }
 }
 
@@ -304,6 +406,10 @@ impl Core {
     /// revision is no longer the truth.
     pub(super) fn evict_reader(&self, uid: &NodeUid) {
         self.readers.lock().remove(uid);
+        // The ring holds decrypted bytes of the same revision, and an eviction is
+        // exactly the statement that those are no longer the file's content.
+        self.block_ring.lock().drop_node(uid);
+        self.prefetch.streams.lock().remove(uid);
     }
 
     /// Serve bytes `[offset, offset + len)` of `uid`'s active revision, hitting
@@ -389,20 +495,141 @@ impl Core {
         Ok(out)
     }
 
-    /// Warm the [`STREAM_READAHEAD`] blocks after `last` into the ring, in the
-    /// background, so a player reading forward finds its next block already in
-    /// memory rather than paying a fetch + decrypt round-trip at each boundary.
+    /// Fetch block `bidx`, joining a fetch already in flight for it rather than
+    /// issuing a second one, and publish the result to everyone who joined.
     ///
-    /// Fire-and-forget: a failure here is not an error, it only means the read
-    /// that needs those bytes will fetch them itself.
-    fn stream_readahead(&self, uid: &NodeUid, mtime: i64, fsize: u64, last: u64) {
-        let last_block = (fsize.saturating_sub(1)) / BLOCK_SIZE;
-        let wanted: Vec<u64> = ((last + 1)..=(last + STREAM_READAHEAD).min(last_block))
+    /// See [`BlockFlight`]. A follower whose leader disappears (a panic, or a
+    /// cancelled `JoinSet`) fetches the block itself rather than failing — the
+    /// leader's claim is gone by then, so this cannot recurse.
+    async fn fetch_block(
+        &self,
+        reader: &Arc<RevisionReader>,
+        uid: &NodeUid,
+        mtime: i64,
+        fsize: u64,
+        bidx: u64,
+        cache_blocks: bool,
+    ) -> BlockResult {
+        let key: BlockKey = (uid.clone(), mtime, fsize, bidx);
+        let claim = {
+            let mut inflight = self.block_flight.inflight.lock();
+            match inflight.get(&key) {
+                Some((_, rx)) => Err(rx.clone()),
+                None => {
+                    let id = NEXT_FLIGHT_ID.fetch_add(1, Ordering::Relaxed);
+                    let (tx, rx) = tokio::sync::watch::channel(None);
+                    inflight.insert(key.clone(), (id, rx));
+                    Ok((
+                        tx,
+                        Flight {
+                            flight: self.block_flight.clone(),
+                            key: key.clone(),
+                            id,
+                        },
+                    ))
+                }
+            }
+        };
+        let (tx, flight) = match claim {
+            Ok(lead) => lead,
+            Err(mut rx) => {
+                loop {
+                    if let Some(result) = rx.borrow_and_update().clone() {
+                        return result;
+                    }
+                    if rx.changed().await.is_err() {
+                        break;
+                    }
+                }
+                return self
+                    .read_block(reader, uid, mtime, fsize, bidx, cache_blocks)
+                    .await;
+            }
+        };
+        let result = self
+            .read_block(reader, uid, mtime, fsize, bidx, cache_blocks)
+            .await;
+        // Retire the claim before publishing, so a racer that wakes and re-enters
+        // finds no stale entry to join.
+        drop(flight);
+        let _ = tx.send(Some(result.clone()));
+        result
+    }
+
+    /// Download and decrypt one block, then put it where the next reader will
+    /// find it: the in-memory ring always, the on-disk block cache too unless
+    /// this is a disk-bypassing stream.
+    ///
+    /// The disk store is handed to a blocking thread — it is a 4 MiB write plus
+    /// a cache-index update, and neither the reactor nor the kernel read waiting
+    /// on these bytes should be held up by it.
+    async fn read_block(
+        &self,
+        reader: &Arc<RevisionReader>,
+        uid: &NodeUid,
+        mtime: i64,
+        fsize: u64,
+        bidx: u64,
+        cache_blocks: bool,
+    ) -> BlockResult {
+        let bstart = bidx * BLOCK_SIZE;
+        let blen = BLOCK_SIZE.min(fsize - bstart);
+        let bytes = reader.read_at(bstart, blen).await.map_err(|e| {
+            warn!(%uid, bstart, blen, error = %e, "block read failed");
+            Errno::EIO
+        })?;
+        let bytes = Arc::new(bytes);
+        if cache_blocks {
+            let cache = self.cache.clone();
+            let uid = uid.clone();
+            let bytes = bytes.clone();
+            tokio::task::spawn_blocking(move || {
+                let _ = cache.store_block(&uid, mtime, fsize, bidx, &bytes);
+            });
+        }
+        self.block_ring
+            .lock()
+            .insert(uid, mtime, fsize, bidx, bytes.clone());
+        Ok(bytes)
+    }
+
+    /// Warm the blocks after a sequential read into the caches, in the
+    /// background, so the next read finds them instead of paying a round-trip.
+    ///
+    /// A read that continues where the last one stopped doubles the window, up
+    /// to [`PREFETCH_MAX`]; a seek drops it back to nothing and one more
+    /// sequential read is needed to earn it again. Without this every read is a
+    /// serial fetch/serve/stall chain: on a 100 ms link that ceilings a file at
+    /// ~24 MB/s of the ~125 MB/s available, and the SDK's block concurrency is
+    /// never exercised at all.
+    ///
+    /// Fire-and-forget, and permit-bounded ([`PREFETCH_BUDGET`]) so speculative
+    /// work never sits in front of a read someone is waiting on. A failure here
+    /// is not an error: the read that needs those bytes will fetch them itself.
+    fn prefetch_ahead(
+        &self,
+        uid: &NodeUid,
+        mtime: i64,
+        fsize: u64,
+        first: u64,
+        last: u64,
+        cache_blocks: bool,
+    ) {
+        let depth = self.prefetch.window(uid, first, last);
+        if depth == 0 {
+            return;
+        }
+        let last_block = fsize.saturating_sub(1) / BLOCK_SIZE;
+        let wanted: Vec<u64> = ((last + 1)..=(last + depth).min(last_block))
             .filter(|&bidx| {
-                self.stream_ring
+                // Blocks already in memory need nothing; blocks already on disk
+                // are cheap enough to serve that spending a round-trip to move
+                // them into the ring would be the wrong trade.
+                self.block_ring
                     .lock()
                     .get(uid, mtime, fsize, bidx)
                     .is_none()
+                    && !(cache_blocks && self.cache.has_block(uid, mtime, fsize, bidx))
             })
             .collect();
         if wanted.is_empty() {
@@ -416,26 +643,25 @@ impl Core {
             };
             // Concurrently, for the same reason the demand path fetches its
             // misses concurrently: serially awaited blocks cost the sum of their
-            // round-trips, and the player catches up with the readahead before it
-            // finishes. The SDK's in-flight block governor bounds the fan-out.
+            // round-trips, and the reader catches up with the window before it
+            // finishes.
             let mut set = tokio::task::JoinSet::new();
             for bidx in wanted {
-                let reader = reader.clone();
-                let bstart = bidx * BLOCK_SIZE;
-                let blen = BLOCK_SIZE.min(fsize - bstart);
-                set.spawn(async move { (bidx, reader.read_at(bstart, blen).await) });
-            }
-            while let Some(joined) = set.join_next().await {
-                let Ok((bidx, read)) = joined else { continue };
-                match read {
-                    Ok(bytes) => {
-                        core.stream_ring
-                            .lock()
-                            .insert(&uid, mtime, fsize, bidx, Arc::new(bytes))
+                let Ok(permit) = core.prefetch_budget.clone().try_acquire_owned() else {
+                    break; // the budget is spent; the demand path can have it
+                };
+                let (core, reader, uid) = (core.clone(), reader.clone(), uid.clone());
+                set.spawn(async move {
+                    let _permit = permit;
+                    if let Err(error) = core
+                        .fetch_block(&reader, &uid, mtime, fsize, bidx, cache_blocks)
+                        .await
+                    {
+                        debug!(%uid, bidx, ?error, "prefetch failed");
                     }
-                    Err(e) => debug!(%uid, bidx, error = %e, "stream readahead failed"),
-                }
+                });
             }
+            while set.join_next().await.is_some() {}
         });
     }
 
@@ -473,17 +699,23 @@ impl Core {
         let mut blocks: Vec<Option<Arc<Vec<u8>>>> = Vec::with_capacity((last - first + 1) as usize);
         let mut misses: Vec<u64> = Vec::new();
         for bidx in first..=last {
-            // A streaming read keeps its blocks only in memory, so the ring is
-            // the only cache it has — check it before the disk (which will not
-            // hold them) and before the network (which would refetch the same
-            // 4 MiB block for every 128 KiB the player consumes).
-            let hit = if cache_blocks {
-                self.cache
-                    .cached_block(uid, mtime, fsize, bidx)
-                    .map(Arc::new)
-            } else {
-                self.stream_ring.lock().get(uid, mtime, fsize, bidx)
-            };
+            // The in-memory ring comes first on both paths: a streaming read has
+            // no other cache at all, and a cached one would otherwise pay two
+            // opens, a JSON parse and a 4 MiB read+alloc for every 128 KiB the
+            // kernel asks for (audit T3).
+            let hit = self.block_ring.lock().get(uid, mtime, fsize, bidx);
+            let hit = hit.or_else(|| {
+                if !cache_blocks {
+                    return None;
+                }
+                let bytes = Arc::new(self.cache.cached_block(uid, mtime, fsize, bidx)?);
+                // Promote it, so the other ~31 reads of this block are answered
+                // from memory.
+                self.block_ring
+                    .lock()
+                    .insert(uid, mtime, fsize, bidx, bytes.clone());
+                Some(bytes)
+            });
             match hit {
                 Some(b) => blocks.push(Some(b)),
                 None => {
@@ -502,19 +734,11 @@ impl Core {
 
                 let mut set = tokio::task::JoinSet::new();
                 for &bidx in &misses {
-                    let reader = reader.clone();
-                    let uid = uid.clone();
-                    let bstart = bidx * BLOCK_SIZE;
-                    let blen = BLOCK_SIZE.min(fsize - bstart);
+                    let (core, reader, uid) = (self.clone(), reader.clone(), uid.clone());
                     set.spawn(async move {
-                        reader
-                            .read_at(bstart, blen)
+                        core.fetch_block(&reader, &uid, mtime, fsize, bidx, cache_blocks)
                             .await
                             .map(|bytes| (bidx, bytes))
-                            .map_err(|e| {
-                                warn!(%uid, bstart, blen, error = %e, "block read failed");
-                                Errno::EIO
-                            })
                     });
                 }
                 let mut out = Vec::with_capacity(misses.len());
@@ -525,23 +749,12 @@ impl Core {
                 Ok::<_, Errno>(out)
             })?;
             for (bidx, bytes) in fetched {
-                // A streaming read (large unpinned video) skips the on-disk cache
-                // so it can't evict the rest of it; it keeps the block in the
-                // in-memory ring instead, which is bounded and dies with the read.
-                let bytes = Arc::new(bytes);
-                if cache_blocks {
-                    let _ = self.cache.store_block(uid, mtime, fsize, bidx, &bytes);
-                } else {
-                    self.stream_ring
-                        .lock()
-                        .insert(uid, mtime, fsize, bidx, bytes.clone());
-                }
                 blocks[(bidx - first) as usize] = Some(bytes);
             }
-            if !cache_blocks {
-                self.stream_readahead(uid, mtime, fsize, last);
-            }
         }
+        // Also after a wholly-cached read: that is what keeps the window sliding
+        // ahead of a sequential reader instead of stalling once it catches up.
+        self.prefetch_ahead(uid, mtime, fsize, first, last, cache_blocks);
 
         for (i, block) in blocks.into_iter().enumerate() {
             let bidx = first + i as u64;
@@ -605,6 +818,106 @@ impl Core {
         Ok(out)
     }
 
+    /// The largest amount [`Core::fill_gaps_cached`] will copy out of the local
+    /// caches while a `release(2)` is in progress.
+    ///
+    /// The point of the cached fill is that editing a file the mount already
+    /// holds costs nothing extra; it is not to reconstruct arbitrarily large
+    /// files on the dispatch loop. Past this budget the blob stays incomplete
+    /// and the drain finishes it, which is the same work in a place where it
+    /// blocks nobody.
+    const CACHED_FILL_BUDGET: u64 = 64 * 1024 * 1024;
+
+    /// Bytes `[offset, offset + len)` of `uid`'s base revision, but only if the
+    /// local caches can answer in full — the whole-file blob first, then every
+    /// overlapping block. `None` the moment anything would have to be fetched.
+    fn cached_range(
+        &self,
+        uid: &NodeUid,
+        mtime: i64,
+        fsize: u64,
+        offset: u64,
+        len: u64,
+    ) -> Option<Vec<u8>> {
+        if len == 0 {
+            return Some(Vec::new());
+        }
+        if let Some(bytes) = self.cache.read_range(uid, mtime, fsize, offset, len) {
+            return Some(bytes);
+        }
+        let end = offset.checked_add(len)?.min(fsize);
+        if offset >= end {
+            return None;
+        }
+        let mut out = Vec::with_capacity((end - offset) as usize);
+        for bidx in (offset / BLOCK_SIZE)..=((end - 1) / BLOCK_SIZE) {
+            let ring = self.block_ring.lock().get(uid, mtime, fsize, bidx);
+            let block = match ring {
+                Some(bytes) => bytes,
+                None => Arc::new(self.cache.cached_block(uid, mtime, fsize, bidx)?),
+            };
+            let bstart = bidx * BLOCK_SIZE;
+            let s = (offset.max(bstart) - bstart) as usize;
+            let e = (end.min(bstart + block.len() as u64) - bstart) as usize;
+            if s >= e {
+                return None;
+            }
+            out.extend_from_slice(&block[s..e]);
+        }
+        (out.len() as u64 == end - offset).then_some(out)
+    }
+
+    /// Fill what [`Core::fill_gaps`] would, but only from bytes already on this
+    /// machine, and only up to [`Core::CACHED_FILL_BUDGET`]. Ranges past the
+    /// base are zeros the caller's `set_len` already wrote, so they count as
+    /// filled. `written` is extended with everything that ends up resolved.
+    ///
+    /// This is the release-time half of gap filling. Doing the network half
+    /// there as well is what froze the whole mount for the length of a download
+    /// (audit F1): the closing file's untouched ranges are allowed to stay
+    /// unresolved in the staged blob — `StagedWrite::complete` is false, reads
+    /// resolve the gaps against the base, and `drain_revision` fills them on the
+    /// drain thread before it uploads. What is left here is the case where
+    /// filling is free, which is also the common one: a file that was read
+    /// before it was edited.
+    pub(super) fn fill_gaps_cached(
+        &self,
+        uid: &NodeUid,
+        file: &File,
+        len: u64,
+        base_mtime: i64,
+        base_size: u64,
+        written: &mut Intervals,
+    ) {
+        let mut budget = Self::CACHED_FILL_BUDGET;
+        for (s, e, authored) in written.clone().segments(0, len) {
+            if authored {
+                continue;
+            }
+            let bend = e.min(base_size);
+            if s < bend {
+                let want = bend - s;
+                if want > budget {
+                    continue;
+                }
+                let Some(bytes) = self.cached_range(uid, base_mtime, base_size, s, want) else {
+                    continue;
+                };
+                if let Err(error) = file.write_all_at(&bytes, s) {
+                    warn!(%uid, %error, "cached gap-fill write failed");
+                    continue;
+                }
+                budget -= want;
+                written.add(s, bend);
+            }
+            // Past the base there is nothing to fetch: the resize zeroed it, so
+            // those bytes are already the file's content.
+            if e > base_size {
+                written.add(s.max(base_size), e);
+            }
+        }
+    }
+
     /// Fill every unauthored range of a scratch/staged file that overlaps its
     /// base with the base's bytes, so the file becomes the complete new content.
     ///
@@ -641,5 +954,147 @@ impl Core {
             })?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod block_ring_tests {
+    use super::*;
+
+    fn uid(link: &str) -> NodeUid {
+        NodeUid::new(VolumeId::from("vol"), LinkId::from(link))
+    }
+
+    /// One block's worth of bytes, so byte accounting is exercised at the scale
+    /// the ring actually sees.
+    fn block(byte: u8) -> Arc<Vec<u8>> {
+        Arc::new(vec![byte; BLOCK_SIZE as usize])
+    }
+
+    /// How many whole blocks fit before the ring starts evicting.
+    fn capacity() -> u64 {
+        RING_BYTES / BLOCK_SIZE
+    }
+
+    #[test]
+    fn a_stored_block_is_served_back() {
+        let mut ring = BlockRing::default();
+        let node = uid("a");
+        ring.insert(&node, 7, 100, 3, block(0xab));
+        assert_eq!(ring.get(&node, 7, 100, 3).map(|b| b[0]), Some(0xab));
+    }
+
+    #[test]
+    fn a_block_of_another_revision_is_never_served() {
+        let mut ring = BlockRing::default();
+        let node = uid("a");
+        ring.insert(&node, 7, 100, 0, block(1));
+        // Same node, newer revision: the tag moved, so the old bytes go.
+        assert!(ring.get(&node, 8, 100, 0).is_none());
+        assert!(ring.get(&node, 7, 101, 0).is_none());
+    }
+
+    #[test]
+    fn a_new_revision_drops_what_the_old_one_left() {
+        let mut ring = BlockRing::default();
+        let node = uid("a");
+        ring.insert(&node, 7, 100, 0, block(1));
+        ring.insert(&node, 8, 100, 0, block(2));
+        assert_eq!(ring.get(&node, 8, 100, 0).map(|b| b[0]), Some(2));
+        assert_eq!(ring.bytes, BLOCK_SIZE);
+    }
+
+    #[test]
+    fn the_ring_evicts_the_least_recently_used_block() {
+        let mut ring = BlockRing::default();
+        let node = uid("a");
+        for idx in 0..capacity() {
+            ring.insert(&node, 1, u64::MAX, idx, block(idx as u8));
+        }
+        // Re-reading block 0 makes block 1 the oldest instead.
+        assert!(ring.get(&node, 1, u64::MAX, 0).is_some());
+        ring.insert(&node, 1, u64::MAX, capacity(), block(0xff));
+        assert!(ring.get(&node, 1, u64::MAX, 0).is_some());
+        assert!(ring.get(&node, 1, u64::MAX, 1).is_none());
+        assert_eq!(ring.bytes, RING_BYTES);
+    }
+
+    #[test]
+    fn a_node_whose_last_block_ages_out_keeps_no_tag() {
+        let mut ring = BlockRing::default();
+        let (old, new) = (uid("old"), uid("new"));
+        ring.insert(&old, 1, u64::MAX, 0, block(1));
+        for idx in 0..capacity() {
+            ring.insert(&new, 1, u64::MAX, idx, block(2));
+        }
+        assert!(!ring.tags.contains_key(&old));
+        assert!(ring.tags.contains_key(&new));
+    }
+
+    #[test]
+    fn dropping_a_node_frees_only_its_own_bytes() {
+        let mut ring = BlockRing::default();
+        let (a, b) = (uid("a"), uid("b"));
+        ring.insert(&a, 1, 100, 0, block(1));
+        ring.insert(&b, 1, 100, 0, block(2));
+        ring.drop_node(&a);
+        assert!(ring.get(&a, 1, 100, 0).is_none());
+        assert_eq!(ring.get(&b, 1, 100, 0).map(|x| x[0]), Some(2));
+        assert_eq!(ring.bytes, BLOCK_SIZE);
+    }
+}
+
+#[cfg(test)]
+mod prefetch_tests {
+    use super::*;
+
+    fn uid(link: &str) -> NodeUid {
+        NodeUid::new(VolumeId::from("vol"), LinkId::from(link))
+    }
+
+    #[test]
+    fn a_sequential_reader_ramps_up_to_the_cap() {
+        let prefetch = Prefetch::default();
+        let node = uid("a");
+        let depths: Vec<u64> = (0..6)
+            .map(|next| prefetch.window(&node, next, next))
+            .collect();
+        assert_eq!(depths, vec![2, 4, 8, 8, 8, 8]);
+    }
+
+    #[test]
+    fn a_seek_forfeits_the_window() {
+        let prefetch = Prefetch::default();
+        let node = uid("a");
+        assert_eq!(prefetch.window(&node, 0, 0), PREFETCH_MIN);
+        assert_eq!(prefetch.window(&node, 40, 40), 0);
+        // And has to be earned again from the bottom.
+        assert_eq!(prefetch.window(&node, 41, 41), PREFETCH_MIN);
+    }
+
+    #[test]
+    fn a_multi_block_read_advances_the_cursor_past_all_of_it() {
+        let prefetch = Prefetch::default();
+        let node = uid("a");
+        assert_eq!(prefetch.window(&node, 0, 3), PREFETCH_MIN);
+        assert_eq!(prefetch.window(&node, 4, 7), 4);
+    }
+
+    #[test]
+    fn files_are_tracked_independently() {
+        let prefetch = Prefetch::default();
+        let (a, b) = (uid("a"), uid("b"));
+        assert_eq!(prefetch.window(&a, 0, 0), PREFETCH_MIN);
+        assert_eq!(prefetch.window(&b, 9, 9), 0);
+        assert_eq!(prefetch.window(&a, 1, 1), 4);
+    }
+
+    #[test]
+    fn the_stream_map_cannot_grow_without_bound() {
+        let prefetch = Prefetch::default();
+        for n in 0..=MAX_PREFETCH_STREAMS + 1 {
+            prefetch.window(&uid(&n.to_string()), 0, 0);
+        }
+        assert!(prefetch.streams.lock().len() <= MAX_PREFETCH_STREAMS + 1);
     }
 }
