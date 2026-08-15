@@ -867,6 +867,67 @@ fn shared_root_pinned_name_survives_database_reopen() {
     let _ = std::fs::remove_file(path);
 }
 
+/// Two writers on one database is the failure mode the single-instance lock
+/// exists to prevent — a hand-run `pdfs mount` next to the systemd unit gives
+/// two daemons the same inode space, content cache, and drain queue. The second
+/// open has to fail, and it has to stop failing once the first handle is gone.
+#[test]
+fn a_second_writer_is_refused_while_the_first_holds_the_database() {
+    let path = std::env::temp_dir().join(format!(
+        "pdfs-single-writer-{}-{}.db",
+        std::process::id(),
+        now_test_id()
+    ));
+    let first = Db::open(&path).unwrap();
+    let second = Db::open(&path);
+    assert!(second.is_err(), "a second writer was allowed in");
+
+    drop(first);
+    // The lock lives in the kernel and dies with the descriptor, so nothing has
+    // to be cleaned up for the next daemon to start.
+    Db::open(&path).expect("reopen after the first handle is dropped");
+
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(path.with_extension("db.lock"));
+}
+
+/// `cache.db` is derived state — every row can be re-fetched or re-scanned — so
+/// a file that is not a database at all must not stop the daemon starting. It
+/// is moved aside (not deleted: it is the only evidence) and rebuilt.
+#[test]
+fn a_corrupt_database_is_moved_aside_and_rebuilt() {
+    let path = std::env::temp_dir().join(format!(
+        "pdfs-corrupt-{}-{}.db",
+        std::process::id(),
+        now_test_id()
+    ));
+    std::fs::write(&path, b"this is not an SQLite database").unwrap();
+
+    let db = Db::open(&path).unwrap();
+    db.set_state_str("shared_with_me_name", "rebuilt").unwrap();
+    assert_eq!(
+        db.state_str("shared_with_me_name").unwrap().as_deref(),
+        Some("rebuilt")
+    );
+    drop(db);
+
+    let dir = path.parent().unwrap();
+    let stem = path.file_name().unwrap().to_string_lossy().to_string();
+    let quarantined: Vec<_> = std::fs::read_dir(dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .filter(|name| name.starts_with(&format!("{stem}.corrupt-")))
+        .collect();
+    assert_eq!(quarantined.len(), 1, "the damaged file was not kept");
+
+    for name in quarantined {
+        let _ = std::fs::remove_file(dir.join(name));
+    }
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(path.with_extension("db.lock"));
+}
+
 fn local(path: &str, name: &str, is_dir: bool) -> LocalEntry {
     LocalEntry {
         path: path.into(),
@@ -909,6 +970,25 @@ fn local_scan_indexes_then_prunes_stale_paths() {
     assert_eq!(db.local_finish_scan(gen2, 2_000).unwrap(), 1);
     assert!(db.search_local("report", 10).unwrap().is_empty());
     assert_eq!(db.search_local("notes", 10).unwrap().len(), 1);
+}
+
+/// The index is maintained incrementally rather than rebuilt at the end of a
+/// scan, so the case that used to be covered for free — a file the scan sees
+/// again — needs its own test: a re-scan must neither lose the entry nor
+/// duplicate it.
+#[test]
+fn rescanning_an_unchanged_file_keeps_exactly_one_index_entry() {
+    let db = Db::open_in_memory().unwrap();
+    for (generation, mtime) in [(1_000, 5), (2_000, 9)] {
+        let g = db.local_begin_scan().unwrap();
+        let mut e = local("/home/u/docs/report.pdf", "report.pdf", false);
+        e.mtime = mtime;
+        db.local_upsert_batch(g, &[e]).unwrap();
+        assert_eq!(db.local_finish_scan(g, generation).unwrap(), 1);
+        let hits = db.search_local("report", 10).unwrap();
+        assert_eq!(hits.len(), 1, "generation {generation}");
+        assert_eq!(hits[0].mtime, mtime);
+    }
 }
 
 /// Queries below the trigram minimum still match, via the `LIKE` fallback.

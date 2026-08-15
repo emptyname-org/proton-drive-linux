@@ -357,6 +357,7 @@ pub fn mount(
     let core = Core {
         client: client.clone(),
         rt: rt.clone(),
+        maintenance: Arc::new(Mutex::new(Default::default())),
         primary_root_uid: root.uid.clone(),
         primary: true,
         state: Arc::new(Mutex::new(State {
@@ -416,6 +417,9 @@ pub fn mount(
     // aside at open. After `hydrate_pending`, so a recovered partial write can
     // see an already-queued write to the same node.
     core.recover_fsynced_writes();
+    // And finally the staged blobs neither of those accounts for: bytes a
+    // failed release left behind with nothing pointing at them.
+    core.reconcile_staging();
     {
         let core = core.clone();
         std::thread::Builder::new()

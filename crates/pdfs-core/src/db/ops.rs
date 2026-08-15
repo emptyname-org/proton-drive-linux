@@ -119,14 +119,31 @@ pub struct PendingOp {
 }
 
 /// How much work the queue owes the server, by whether it carries bytes.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct PendingCounts {
     /// Queued `create`/`revision` ops: files whose content is not on the remote.
     pub uploads: i64,
     /// Queued `mkdir`/`rename`/`trash` ops: metadata the remote has not been
     /// told about.
     pub changes: i64,
+    /// Ops parked at [`PARK_UNTIL`]: a transient file's bytes, held back until
+    /// the rename that gives it its finished name. They are queued but will
+    /// never drain on their own, so counting them as "waiting to upload" would
+    /// have the front-end promise progress that is not coming.
+    pub parked: i64,
+    /// Ops that have failed at least [`FAILING_ATTEMPTS`] times. A permanently
+    /// failing op never wedges the queue — the backoff sees to that — which is
+    /// exactly why it needs surfacing: it retries forever, invisibly.
+    pub failing: i64,
+    /// The most recent error text from a failing op, for the front-end to show
+    /// instead of the bare count.
+    pub last_error: Option<String>,
 }
+
+/// Failed attempts after which an op is reported as failing rather than merely
+/// retrying. Six is where the backoff has reached its ceiling, so an op past it
+/// is retrying at the slowest rate it ever will and has been for minutes.
+pub const FAILING_ATTEMPTS: i64 = 6;
 
 /// The outcome of folding freshly written bytes into a queued create.
 #[derive(Debug, Clone)]
@@ -564,7 +581,33 @@ impl Db {
             params![OP_REVISION, OP_CREATE],
             |r| r.get(0),
         )?;
-        Ok(PendingCounts { uploads, changes })
+        let parked = conn.query_row(
+            "SELECT COUNT(*) FROM pending_op WHERE next_attempt_at >= ?1",
+            params![PARK_UNTIL],
+            |r| r.get(0),
+        )?;
+        let failing = conn.query_row(
+            "SELECT COUNT(*) FROM pending_op WHERE attempts >= ?1",
+            params![FAILING_ATTEMPTS],
+            |r| r.get(0),
+        )?;
+        let last_error = conn
+            .query_row(
+                "SELECT last_error FROM pending_op
+                  WHERE attempts >= ?1 AND last_error IS NOT NULL
+                  ORDER BY attempts DESC LIMIT 1",
+                params![FAILING_ATTEMPTS],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten();
+        Ok(PendingCounts {
+            uploads,
+            changes,
+            parked,
+            failing,
+            last_error,
+        })
     }
 
     /// Nothing bearing this volume may be handed to the API — it would 404. The
@@ -609,4 +652,78 @@ impl Db {
         )?;
         Ok(())
     }
+
+    /// Every staged blob the queue still refers to.
+    ///
+    /// The startup staging reconcile subtracts this from what is actually in
+    /// `staging/`: the difference is bytes the kernel was told were written and
+    /// that nothing is going to upload.
+    pub fn op_blob_paths(&self) -> Result<std::collections::HashSet<String>> {
+        let conn = self.conn.lock();
+        let mut stmt =
+            conn.prepare("SELECT blob_path FROM pending_op WHERE blob_path IS NOT NULL")?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        let mut out = std::collections::HashSet::new();
+        for row in rows {
+            out.insert(row?);
+        }
+        Ok(out)
+    }
+
+    /// Record that this daemon sealed `revision_id` on `uid`, and prune entries
+    /// past [`OWN_SEALED_TTL_MS`].
+    ///
+    /// One row per node, overwritten as the node advances. See
+    /// [`own_sealed_rev`](Self::own_sealed_rev) for what reads it.
+    pub fn set_own_sealed_rev(&self, uid: &str, revision_id: &str, now_ms: i64) -> Result<()> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "INSERT INTO own_sealed_rev (uid, revision_id, sealed_at)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(uid) DO UPDATE SET
+               revision_id = excluded.revision_id,
+               sealed_at   = excluded.sealed_at",
+            params![uid, revision_id, now_ms],
+        )?;
+        conn.execute(
+            "DELETE FROM own_sealed_rev WHERE sealed_at < ?1",
+            params![now_ms - OWN_SEALED_TTL_MS],
+        )?;
+        Ok(())
+    }
+
+    /// The last revision of `uid` this daemon sealed itself, if it is still
+    /// within [`OWN_SEALED_TTL_MS`].
+    ///
+    /// The drain asks before treating a moved-on remote as a conflict: a
+    /// revision we sealed means one writer stalled and resumed, which
+    /// supersedes rather than forking a `(sync-conflict)` copy (docs/BUGS.md
+    /// B70 layer B).
+    pub fn own_sealed_rev(&self, uid: &str, now_ms: i64) -> Result<Option<String>> {
+        let conn = self.conn.lock();
+        Ok(conn
+            .query_row(
+                "SELECT revision_id FROM own_sealed_rev
+                  WHERE uid = ?1 AND sealed_at >= ?2",
+                params![uid, now_ms - OWN_SEALED_TTL_MS],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
+    /// Forget what we sealed on `uid` — it has been trashed, so there is no
+    /// revision left to chain onto.
+    pub fn clear_own_sealed_rev(&self, uid: &str) -> Result<()> {
+        let conn = self.conn.lock();
+        conn.execute("DELETE FROM own_sealed_rev WHERE uid = ?1", params![uid])?;
+        Ok(())
+    }
 }
+
+/// How long a revision this daemon sealed stays recognisable as its own.
+///
+/// Bounds a table that would otherwise grow with every write for the life of
+/// the install. A week is far longer than any stall→resume — a browser download
+/// that pauses and continues, an editor that reopens its handle — and short
+/// enough that the table tracks recent work rather than accumulating history.
+pub const OWN_SEALED_TTL_MS: i64 = 7 * 24 * 60 * 60 * 1000;

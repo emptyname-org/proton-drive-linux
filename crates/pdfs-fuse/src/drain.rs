@@ -355,6 +355,9 @@ impl Core {
         }
         self.db.complete_trash_op(op.id, &uid)?;
         self.own_sealed_revs.lock().remove(&uid);
+        if let Err(e) = self.db.clear_own_sealed_rev(&uid.to_string()) {
+            debug!(%uid, error = %e, "clearing the sealed-revision record failed");
+        }
         self.invalidate_trash();
         self.log_activity(ActivityKind::Trash, &name, "trashed", true);
         info!(%uid, name, "pending trash landed");
@@ -629,7 +632,16 @@ impl Core {
         // instead of forking — so the finished bytes win the name rather than
         // being exiled to a `(sync-conflict)` copy.
         let remote_rev = node_revision_id(&node);
-        let own_rev = self.own_sealed_revs.lock().get(uid).cloned();
+        // In memory first, then the table it is written through to: the map is
+        // this process's cache of it, and after a restart only the table has
+        // the answer (which is the whole reason it is persisted).
+        let own_rev = match self.own_sealed_revs.lock().get(uid).cloned() {
+            Some(rev) => Some(rev),
+            None => self
+                .db
+                .own_sealed_rev(&uid.to_string(), now_millis())
+                .unwrap_or_default(),
+        };
         if is_own_self_supersede(meta.complete, remote_rev.as_deref(), own_rev.as_deref()) {
             debug!(%uid, ?remote_rev,
                    "queued write chains onto our own sealed revision; not a conflict");
@@ -985,7 +997,16 @@ impl Core {
             // change and does not fork (B70 layer B; consulted in
             // `revision_conflict`).
             if let Some(rev) = sealed_rev.clone() {
-                self.own_sealed_revs.lock().insert(uid.clone(), rev);
+                self.own_sealed_revs.lock().insert(uid.clone(), rev.clone());
+                // Write through: losing this at shutdown reopened the fork
+                // window B70 layer B closed, for the first drain after a
+                // restart.
+                if let Err(e) = self
+                    .db
+                    .set_own_sealed_rev(&uid.to_string(), &rev, now_millis())
+                {
+                    warn!(%uid, error = %e, "persisting our sealed revision failed");
+                }
             }
             self.for_each_state(|st| {
                 for aw in st.active_writes.values_mut() {

@@ -41,32 +41,43 @@ impl Db {
         Ok(next)
     }
 
-    /// Write one batch of walked entries under scan generation `generation`. The
-    /// FTS index is *not* touched here — it is rebuilt once in
-    /// [`local_finish_scan`](Self::local_finish_scan).
+    /// Write one batch of walked entries under scan generation `generation`,
+    /// keeping the FTS index in step with them.
+    ///
+    /// The index is maintained incrementally rather than rebuilt at the end of
+    /// the scan, because a rebuild reads and re-tokenises every row in the table
+    /// — trigrams over a few hundred thousand paths — inside one transaction on
+    /// the single shared connection, which stalls the whole mount for as long as
+    /// it takes. Incremental maintenance is possible here for a reason specific
+    /// to this table: `local_fts` covers `name` and `path`, `path` is the
+    /// table's key, and `name` is derived from it, so an existing row's indexed
+    /// content can never change. Only insertions and deletions touch the index;
+    /// a re-scan that finds the same files does no index work at all.
+    ///
+    /// Hence the update-then-insert shape below rather than an upsert: the
+    /// distinction between "already indexed" and "new row" is exactly what
+    /// decides whether the index needs a write.
     pub fn local_upsert_batch(&self, generation: i64, entries: &[LocalEntry]) -> Result<()> {
         let mut conn = self.conn.lock();
         let tx = conn.transaction()?;
         {
-            let mut stmt = tx.prepare_cached(
-                "INSERT INTO local_files (path, name, is_dir, size, mtime, scan_gen)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-                 ON CONFLICT(path) DO UPDATE SET
-                   name     = excluded.name,
-                   is_dir   = excluded.is_dir,
-                   size     = excluded.size,
-                   mtime    = excluded.mtime,
-                   scan_gen = excluded.scan_gen",
+            let mut update = tx.prepare_cached(
+                "UPDATE local_files
+                    SET name = ?2, is_dir = ?3, size = ?4, mtime = ?5, scan_gen = ?6
+                  WHERE path = ?1",
             )?;
+            let mut insert = tx.prepare_cached(
+                "INSERT INTO local_files (path, name, is_dir, size, mtime, scan_gen)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            )?;
+            let mut index =
+                tx.prepare_cached("INSERT INTO local_fts (rowid, name, path) VALUES (?1, ?2, ?3)")?;
             for e in entries {
-                stmt.execute(params![
-                    e.path,
-                    e.name,
-                    e.is_dir as i64,
-                    e.size,
-                    e.mtime,
-                    generation
-                ])?;
+                let row = params![e.path, e.name, e.is_dir as i64, e.size, e.mtime, generation];
+                if update.execute(row)? == 0 {
+                    insert.execute(row)?;
+                    index.execute(params![tx.last_insert_rowid(), e.name, e.path])?;
+                }
             }
         }
         tx.commit()?;
@@ -74,16 +85,25 @@ impl Db {
     }
 
     /// Close scan generation `generation`: drop every row an older scan wrote
-    /// (those paths are gone from disk), rebuild the FTS index over what remains,
-    /// and stamp the completion time. Returns the number of indexed entries.
+    /// (those paths are gone from disk), drop their FTS entries, and stamp the
+    /// completion time. Returns the number of indexed entries.
+    ///
+    /// The FTS deletes name the old values explicitly, which is how an
+    /// external-content FTS5 table is told to retract a row — see
+    /// [`local_upsert_batch`](Self::local_upsert_batch) for why this is done
+    /// per-row instead of by rebuilding the index.
     pub fn local_finish_scan(&self, generation: i64, finished_at: i64) -> Result<i64> {
         let mut conn = self.conn.lock();
         let tx = conn.transaction()?;
         tx.execute(
+            "INSERT INTO local_fts (local_fts, rowid, name, path)
+             SELECT 'delete', id, name, path FROM local_files WHERE scan_gen != ?1",
+            params![generation],
+        )?;
+        tx.execute(
             "DELETE FROM local_files WHERE scan_gen != ?1",
             params![generation],
         )?;
-        tx.execute_batch("INSERT INTO local_fts(local_fts) VALUES('rebuild');")?;
         tx.execute(
             "INSERT INTO sync_state (key, value) VALUES ('local_indexed_at', ?1)
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",

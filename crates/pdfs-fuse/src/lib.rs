@@ -425,6 +425,14 @@ struct Core {
     /// storage moves slowly enough that a minute-old number is a better answer
     /// than either a stall or the zeroes the default implementation returns.
     quota: Arc<Mutex<Option<(std::time::Instant, i64, i64)>>>,
+    /// Database maintenance that has been moved off the request thread.
+    ///
+    /// `VACUUM` and a deep `integrity_check` both hold the single connection for
+    /// tens of seconds against a real install, which stops every FUSE handler
+    /// that needs the database — so the handler acknowledges the request and a
+    /// thread does the work, exactly as the other long control requests already
+    /// do. See [`Maintenance`].
+    maintenance: Arc<Mutex<Maintenance>>,
     /// Folders whose listing was enumerated cheaply and is having its file sizes
     /// filled in right now, so a burst of `stat`s over a fresh listing starts one
     /// upgrade rather than one per entry. See [`Core::spawn_size_upgrade`].
@@ -508,6 +516,21 @@ struct Core {
     ///
     /// `Weak`, so an unmounted fork's state is dropped rather than pinned here.
     states: Arc<StateRegistry>,
+}
+
+/// Background database maintenance: what is running, and what the last deep
+/// integrity check found.
+///
+/// One at a time — both operations are whole-database and there is nothing to
+/// gain from overlapping them — and the result of a check outlives the request
+/// that asked for it, because the request is answered before the check finishes.
+#[derive(Default)]
+struct Maintenance {
+    /// A vacuum or integrity check is running right now.
+    running: bool,
+    /// Findings of the most recent completed deep check. `None` means none has
+    /// finished this run, which is *not* the same as "found nothing".
+    integrity: Option<Vec<String>>,
 }
 
 /// How long a change this daemon made stays recognisable as its own. Generous
@@ -695,6 +718,82 @@ enum SwitchBlocked {
 }
 
 impl Core {
+    /// Start a background `VACUUM`, or refuse because maintenance is already
+    /// running.
+    ///
+    /// Returns as soon as the thread is spawned; the caller acknowledges the
+    /// request. The outcome is a log line and a job that disappears from
+    /// `GetQueueStatus` when it is done — a vacuum has nothing to report that a
+    /// follow-up `CacheInspect` cannot show.
+    fn start_vacuum(&self) -> CoreResult<()> {
+        {
+            let mut m = self.maintenance.lock();
+            if m.running {
+                return Err(CoreError::conflict(
+                    "database maintenance is already running",
+                ));
+            }
+            m.running = true;
+        }
+        let core = self.clone();
+        std::thread::spawn(move || {
+            let job = core.transfers.begin_job("Compacting the cache database");
+            job.detail("Rewriting the database file");
+            let started = Instant::now();
+            match core.db.vacuum() {
+                Ok(outcome) => info!(
+                    freed_bytes = outcome.freed_bytes(),
+                    before_bytes = outcome.before_bytes,
+                    after_bytes = outcome.after_bytes,
+                    wal_frames = outcome.wal_frames_checkpointed,
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "cache database vacuumed"
+                ),
+                Err(e) => warn!(error = %e, "vacuum failed"),
+            }
+            core.maintenance.lock().running = false;
+        });
+        Ok(())
+    }
+
+    /// Answer a deep `CacheInspect`: hand back the last completed integrity
+    /// check, and start one if none is running.
+    ///
+    /// Returns `(problems, checked, running)`. A first request gets
+    /// `(_, false, true)` and the answer lands on a later one — the check reads
+    /// every page of the database under the connection mutex, so the choice is
+    /// between answering late and freezing the mount until it finishes.
+    fn start_or_read_integrity_check(&self) -> (Vec<String>, bool, bool) {
+        let mut m = self.maintenance.lock();
+        if let Some(problems) = m.integrity.clone() {
+            return (problems, true, m.running);
+        }
+        if m.running {
+            return (Vec::new(), false, true);
+        }
+        m.running = true;
+        drop(m);
+
+        let core = self.clone();
+        std::thread::spawn(move || {
+            let job = core.transfers.begin_job("Checking the cache database");
+            job.detail("Verifying every page");
+            let problems = match core.db.integrity_check() {
+                Ok(problems) => problems,
+                Err(e) => vec![format!("integrity check failed: {e:?}")],
+            };
+            if problems.is_empty() {
+                info!("cache database integrity check found no problems");
+            } else {
+                warn!(problems = problems.len(), "cache database integrity check");
+            }
+            let mut m = core.maintenance.lock();
+            m.integrity = Some(problems);
+            m.running = false;
+        });
+        (Vec::new(), false, true)
+    }
+
     /// Register an inode space so background work can reach it. Called once for
     /// the primary mount and once per on-demand fork.
     fn register_state(&self, mountpoint: &Path) {
@@ -1215,6 +1314,100 @@ impl Core {
         }
         if restored > 0 {
             info!(count = restored, "restored pending ops");
+        }
+    }
+
+    /// Re-attach staged blobs that no queued op refers to.
+    ///
+    /// `staging/` holds the only copy of writes the kernel has already been
+    /// told succeeded. Three release-path failures put bytes there and return
+    /// `EIO` without leaving a `pending_op` row behind — an access change
+    /// mid-release, a write overlapping an undrained incomplete edit, a create
+    /// that drained out from under its own handle. Until now nothing ever
+    /// walked the directory again: `hydrate_pending` reads the op table and
+    /// [`recover_fsynced_writes`](Self::recover_fsynced_writes) reads
+    /// `recovery/`, so an orphaned staged blob was invisible to the daemon and
+    /// to the user alike, and stayed that way until someone found the file.
+    ///
+    /// Runs once at mount, after `hydrate_pending`, so `pending` already
+    /// describes what the queue owns. An orphan whose sidecar names a real node
+    /// is queued as an ordinary revision — the condition that made it fail is
+    /// gone by definition, since the op it collided with has since drained.
+    /// Anything that cannot be addressed (no sidecar, an unparseable uid, a
+    /// `local~` placeholder whose create is gone) is left in place and named in
+    /// the log: unexplained bytes are never evidence that user data is
+    /// disposable.
+    fn reconcile_staging(&self) {
+        let staged = self.cache.staged_writes();
+        if staged.is_empty() {
+            return;
+        }
+        let claimed = match self.db.op_blob_paths() {
+            Ok(paths) => paths,
+            Err(e) => {
+                error!(error = %e, "cannot read queued blob paths; skipping staging reconcile");
+                return;
+            }
+        };
+        let mut queued = 0usize;
+        let mut stranded = 0usize;
+        for (blob, meta) in staged {
+            if claimed.contains(&blob.to_string_lossy().into_owned()) {
+                continue;
+            }
+            let addressable = meta.as_ref().and_then(|m| parse_node_uid(&m.uid));
+            let Some((meta, uid)) = meta.zip(addressable).filter(|(_, uid)| !is_local_uid(uid))
+            else {
+                stranded += 1;
+                warn!(blob = %blob.display(),
+                      "staged bytes belong to no queued upload and name no node; kept for recovery");
+                continue;
+            };
+            if self.pending.lock().contains_key(&uid) {
+                // A newer write for the same node is queued and carries its own
+                // blob. These bytes are older; keeping them is right, uploading
+                // them over the newer ones is not.
+                stranded += 1;
+                warn!(%uid, blob = %blob.display(),
+                      "staged bytes are superseded by a queued write; kept for recovery");
+                continue;
+            }
+            let op = PendingOp {
+                id: 0,
+                kind: OP_REVISION.to_string(),
+                uid: uid.to_string(),
+                parent_uid: None,
+                name: None,
+                blob_path: Some(blob.to_string_lossy().into_owned()),
+                meta_json: Some(serde_json::to_string(&meta).unwrap_or_default()),
+                created_at: now_millis(),
+                attempts: 0,
+                last_error: None,
+                next_attempt_at: now_millis(),
+            };
+            match self.db.enqueue_op(&op) {
+                Ok((_, superseded)) => {
+                    if let Some(old) = superseded {
+                        self.cache.discard_staged(Path::new(&old));
+                    }
+                    self.pending.lock().insert(
+                        uid.clone(),
+                        PendingRevision {
+                            path: blob.clone(),
+                            meta,
+                        },
+                    );
+                    queued += 1;
+                }
+                Err(e) => {
+                    stranded += 1;
+                    error!(%uid, blob = %blob.display(), error = %e,
+                           "cannot queue an orphaned staged write; bytes kept");
+                }
+            }
+        }
+        if queued > 0 || stranded > 0 {
+            info!(queued, stranded, "reconciled orphaned staged writes");
         }
     }
 

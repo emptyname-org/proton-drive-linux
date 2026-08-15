@@ -21,7 +21,7 @@ use std::fmt;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use proton_drive_rs::proton_sdk::ids::NodeUid;
@@ -146,6 +146,19 @@ struct PinFile {
 /// in the gaps. Uploading that as-is would silently corrupt the file.
 /// `authored` says which ranges are real; `complete` says whether the file can
 /// be uploaded as it stands.
+/// What `staging/` currently holds, from [`ContentCache::staging_usage`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StagingUsage {
+    /// Bytes across every staged blob.
+    pub bytes: u64,
+    /// Staged blobs, not counting their sidecars.
+    pub files: u64,
+    /// Age of the oldest staged blob, in seconds. Zero when there are none —
+    /// what makes a figure here interesting is it being *large*, which is the
+    /// shape of a write that is never going to drain by itself.
+    pub oldest_secs: u64,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct StagedWrite {
     /// Node the write targeted, in `volume~link` display form.
@@ -287,6 +300,14 @@ pub struct ContentCache {
     /// once [`TOUCH_FLUSH_AT`] have accumulated, and always before an eviction
     /// pass reads the ordering these describe.
     touches: Mutex<HashMap<String, i64>>,
+    /// Whether `recovery/` may hold a write the daemon has not queued yet.
+    ///
+    /// The drain asks for recovered writes on every idle pass — a `read_dir` of
+    /// a directory that is empty in every run that did not crash. The directory
+    /// gains entries in exactly two places (the rescue at open, and the release
+    /// path that parks a still-authoritative scratch file), both of which set
+    /// this; a scan that finds nothing actionable clears it.
+    recovery_pending: AtomicBool,
 }
 
 impl ContentCache {
@@ -350,6 +371,8 @@ impl ContentCache {
             thumb_bytes: AtomicU64::new(0),
             db,
             touches: Mutex::new(HashMap::new()),
+            // The rescue above has already run, so start by looking once.
+            recovery_pending: AtomicBool::new(true),
         };
         cache.reconcile()?;
         // After reconcile, so the totals describe the index that now describes
@@ -1039,7 +1062,14 @@ impl ContentCache {
     /// daemon to hand to the upload queue. A blob whose sidecar did not survive
     /// is not actionable automatically, but is retained for manual recovery:
     /// unexplained bytes are never evidence that user data is disposable.
+    ///
+    /// Asked for on every idle drain pass, so the usual answer — a directory
+    /// that has been empty since the last clean shutdown — costs an atomic load
+    /// rather than a `read_dir` (see [`recovery_pending`](Self::recovery_pending)).
     pub fn recovered_writes(&self) -> Vec<(PathBuf, StagedWrite)> {
+        if !self.recovery_pending.load(Ordering::Relaxed) {
+            return Vec::new();
+        }
         let Ok(entries) = std::fs::read_dir(&self.recovery_dir) else {
             return Vec::new();
         };
@@ -1055,6 +1085,39 @@ impl ContentCache {
             {
                 out.push((blob, meta));
             }
+        }
+        // Blobs whose sidecar did not survive stay here for a human and are
+        // never actionable, so "nothing to queue" is the condition that stops
+        // the polling — not "the directory is empty".
+        if out.is_empty() {
+            self.recovery_pending.store(false, Ordering::Relaxed);
+        }
+        out
+    }
+
+    /// Every blob in `staging/`, paired with its sidecar when it has a readable
+    /// one.
+    ///
+    /// For the startup reconcile: staging holds the only copy of writes the
+    /// kernel has already been told succeeded, and three failure paths can
+    /// leave one there with no `pending_op` row pointing at it. Nothing walked
+    /// this directory, so those bytes were invisible to the daemon and to the
+    /// user both — `hydrate_pending` walks the op table and
+    /// [`recovered_writes`](Self::recovered_writes) walks `recovery/`.
+    pub fn staged_writes(&self) -> Vec<(PathBuf, Option<StagedWrite>)> {
+        let Ok(entries) = std::fs::read_dir(&self.staging_dir) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for entry in entries.flatten() {
+            let blob = entry.path();
+            if blob.extension().is_some_and(|e| e == "json") {
+                continue;
+            }
+            let meta = std::fs::read(Self::scratch_sidecar(&blob))
+                .ok()
+                .and_then(|b| serde_json::from_slice::<StagedWrite>(&b).ok());
+            out.push((blob, meta));
         }
         out
     }
@@ -1226,6 +1289,10 @@ impl ContentCache {
                         if std::fs::rename(scratch, &recovery).is_ok() {
                             let _ = std::fs::File::open(&self.recovery_dir)
                                 .and_then(|dir| dir.sync_all());
+                            // These bytes are unaccompanied, but re-arm the
+                            // scan anyway: the flag exists to skip a directory
+                            // nothing has written to, and something just did.
+                            self.recovery_pending.store(true, Ordering::Relaxed);
                             return Err(retained(
                                 &recovery,
                                 Error::Other(format!(
@@ -1502,6 +1569,44 @@ impl ContentCache {
             .iter()
             .map(|k| self.pool(k).load(Ordering::Relaxed))
             .sum()
+    }
+
+    /// Bytes and file count held in `staging/`, with the age of the oldest
+    /// entry in seconds.
+    ///
+    /// Staging is not part of [`usage`](Self::usage) and is not subject to the
+    /// budget — it holds the *only* copy of writes that have not been uploaded,
+    /// so nothing here may ever be evicted to reclaim space. That is precisely
+    /// why it has to be reportable: a parked transient create (three abandoned
+    /// 4 GiB downloads, say) otherwise occupies disk with nothing in any UI
+    /// accounting for it.
+    ///
+    /// A `read_dir` per call, which is fine for the callers it has: a status
+    /// request, polled every couple of seconds against a directory that is
+    /// empty whenever the queue is drained.
+    pub fn staging_usage(&self) -> StagingUsage {
+        let Ok(entries) = std::fs::read_dir(&self.staging_dir) else {
+            return StagingUsage::default();
+        };
+        let mut usage = StagingUsage::default();
+        let now = std::time::SystemTime::now();
+        for entry in entries.flatten() {
+            // Sidecars describe the blob beside them; counting both would double
+            // the file count and report metadata as user bytes.
+            if entry.path().extension().is_some_and(|e| e == "json") {
+                continue;
+            }
+            let Ok(meta) = entry.metadata() else { continue };
+            usage.files += 1;
+            usage.bytes += meta.len();
+            if let Ok(age) = meta.modified().and_then(|m| {
+                now.duration_since(m)
+                    .map_err(|_| std::io::Error::other("modified in the future"))
+            }) {
+                usage.oldest_secs = usage.oldest_secs.max(age.as_secs());
+            }
+        }
+        usage
     }
 
     /// Configured soft byte cap (`0` = unlimited), for display alongside

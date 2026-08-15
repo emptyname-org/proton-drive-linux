@@ -1193,6 +1193,28 @@ pub enum Response {
         /// calling a queued `mkdir` an upload is a lie.
         #[serde(default)]
         pending_changes: u64,
+        /// Queued writes held back because the file still wears a transient
+        /// name (a browser's `*.crdownload`, an editor's `*.swp`). They are not
+        /// waiting on the network and will not drain until the finalising
+        /// rename, so they are counted apart from `pending_uploads`.
+        #[serde(default)]
+        parked_uploads: u64,
+        /// Queued ops that have failed enough times to be considered stuck.
+        /// They keep retrying forever — correctly, since their staged bytes are
+        /// the only copy — which is why they have to be visible.
+        #[serde(default)]
+        failing_ops: u64,
+        /// The most recent error from a stuck op, when there is one.
+        #[serde(default)]
+        failing_error: Option<String>,
+        /// Bytes held in `staging/`: writes accepted from the kernel whose only
+        /// copy is on local disk. Never evictable, never counted against the
+        /// cache budget — hence reported separately.
+        #[serde(default)]
+        staged_bytes: u64,
+        /// Age of the oldest staged write, in seconds.
+        #[serde(default)]
+        staged_oldest_secs: u64,
     },
     /// A human-readable success message.
     Ok { message: String },
@@ -1217,6 +1239,12 @@ pub enum Response {
         /// Whether the integrity check actually ran, so an empty problem list
         /// is not mistaken for a clean bill of health it never gave.
         integrity_checked: bool,
+        /// Whether a deep check is running right now. It reads every page of
+        /// the database under the daemon's only connection, so it is answered
+        /// asynchronously: this says "ask again shortly", which is a different
+        /// thing to say than either of the two above.
+        #[serde(default)]
+        integrity_running: bool,
     },
     /// The pin registry.
     Pins { pins: Vec<Pin> },

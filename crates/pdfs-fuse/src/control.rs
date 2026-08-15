@@ -148,7 +148,13 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
         Ok(CtlRequest::Status) => {
             let pins = core.cache.list_pins();
             let queued = core.db.pending_op_counts().unwrap_or_default();
+            let staging = core.cache.staging_usage();
             CtlResponse::Status {
+                parked_uploads: queued.parked.max(0) as u64,
+                failing_ops: queued.failing.max(0) as u64,
+                failing_error: queued.last_error.clone(),
+                staged_bytes: staging.bytes,
+                staged_oldest_secs: staging.oldest_secs,
                 username: username.to_string(),
                 mountpoint: mountpoint.display().to_string(),
                 pinned: pins.len(),
@@ -562,19 +568,20 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
         }
         Ok(CtlRequest::CacheInspect { deep }) => match core.db.stats() {
             Ok(stats) => {
-                // The deep check reads every page, so it runs only on request;
-                // `integrity_checked` tells the caller which answer it is
-                // holding, since "no problems found" and "never looked" are
-                // both an empty list.
-                let (integrity_problems, integrity_checked) = if deep {
-                    match core.db.integrity_check() {
-                        Ok(problems) => (problems, true),
-                        Err(e) => (vec![format!("integrity check failed: {e:?}")], true),
-                    }
+                // The deep check reads every page — tens of seconds on a real
+                // database, all of it holding the connection every FUSE handler
+                // needs — so it runs on a thread and this request returns
+                // whatever the last completed check found. `integrity_checked`
+                // tells the caller which answer it is holding, since "no
+                // problems found" and "never looked" are both an empty list;
+                // `integrity_running` says a fresh answer is on its way.
+                let (integrity_problems, integrity_checked, integrity_running) = if deep {
+                    core.start_or_read_integrity_check()
                 } else {
-                    (Vec::new(), false)
+                    (Vec::new(), false, false)
                 };
                 CtlResponse::CacheReport {
+                    integrity_running,
                     schema_version: stats.schema_version,
                     db_bytes: stats.total_bytes(),
                     db_reclaimable_bytes: stats.reclaimable_bytes(),
@@ -587,17 +594,16 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
             }
             Err(e) => CtlResponse::error(CoreError::internal(format!("read db stats: {e:?}"))),
         },
-        Ok(CtlRequest::CacheVacuum) => match core.db.vacuum() {
-            Ok(outcome) => CtlResponse::Ok {
-                message: format!(
-                    "vacuumed: {:.1} MiB freed ({:.1} MiB → {:.1} MiB), {} WAL frame(s) checkpointed",
-                    outcome.freed_bytes() as f64 / 1_048_576.0,
-                    outcome.before_bytes as f64 / 1_048_576.0,
-                    outcome.after_bytes as f64 / 1_048_576.0,
-                    outcome.wal_frames_checkpointed,
-                ),
+        // Ack and vacuum on a thread. `VACUUM` rewrites the whole database
+        // under the connection mutex — minutes on a large one — and the
+        // request's own socket timeout is 10 s, so running it inline both froze
+        // the mount and lost its own answer. Progress shows up as a job in
+        // `GetQueueStatus`; the outcome goes to the log.
+        Ok(CtlRequest::CacheVacuum) => match core.start_vacuum() {
+            Ok(()) => CtlResponse::Ok {
+                message: "compacting the cache database in the background".into(),
             },
-            Err(e) => CtlResponse::error(CoreError::internal(format!("vacuum: {e:?}"))),
+            Err(e) => CtlResponse::error(e),
         },
         Ok(CtlRequest::GetQueueStatus) => CtlResponse::Transfers {
             items: core.transfers.snapshot(),

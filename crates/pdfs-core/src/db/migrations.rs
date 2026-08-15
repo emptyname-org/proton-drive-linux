@@ -9,7 +9,7 @@ use super::Db;
 use crate::Result;
 
 /// Current schema version. Bump on every forward migration added below.
-pub(super) const SCHEMA_VERSION: i64 = 22;
+pub(super) const SCHEMA_VERSION: i64 = 24;
 
 impl Db {
     pub(super) fn migrate(&self) -> Result<()> {
@@ -130,6 +130,24 @@ impl Db {
             // `activity_time` indexes `time DESC` while both activity queries
             // order by `id`: it has only ever cost writes.
             tx.execute_batch("DROP INDEX IF EXISTS activity_time;")?;
+        }
+        if current < 23 {
+            // One last full rebuild of the local index, because from here on the
+            // scan maintains it incrementally (`local_upsert_batch`) and so can
+            // no longer repair a `local_fts` that drifted from `local_files`.
+            // Whatever it costs, it costs once, at startup, before the mount
+            // serves anything.
+            let present: bool = tx.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'local_fts'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )? > 0;
+            if present {
+                tx.execute_batch("INSERT INTO local_fts(local_fts) VALUES('rebuild');")?;
+            }
+        }
+        if current < 24 {
+            tx.execute_batch(MIGRATION_V24)?;
         }
         tx.execute(
             "INSERT INTO sync_state (key, value) VALUES ('schema_version', ?1)
@@ -633,3 +651,22 @@ const MIGRATION_V22: [(&str, &str); 3] = [
         "CREATE INDEX IF NOT EXISTS idx_nodes_parent_live ON nodes(parent_uid) WHERE trashed = 0;",
     ),
 ];
+
+/// V24: the revisions this daemon sealed itself, so restarting does not reopen
+/// the conflict hole B70 layer B closed.
+///
+/// `Core::own_sealed_revs` held these in memory: a queued write whose baseline
+/// names an earlier revision is a conflict *unless* the remote sits at a
+/// revision we sealed, in which case it is one writer stalling and resuming and
+/// must supersede rather than fork a `(sync-conflict)` copy. Losing the map at
+/// shutdown meant the first drain after a restart could not tell the two apart.
+///
+/// `sealed_at` is what bounds the table: entries older than the window in which
+/// a stall→resume is plausible are pruned on write.
+const MIGRATION_V24: &str = "
+CREATE TABLE IF NOT EXISTS own_sealed_rev (
+  uid         TEXT PRIMARY KEY,
+  revision_id TEXT NOT NULL,
+  sealed_at   INTEGER NOT NULL
+);
+";

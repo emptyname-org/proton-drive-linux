@@ -18,8 +18,10 @@
 use parking_lot::Mutex;
 use rusqlite::Connection;
 
-use crate::Result;
-use std::path::Path;
+use crate::{Error, Result};
+use std::fs::File;
+use std::os::fd::AsRawFd;
+use std::path::{Path, PathBuf};
 
 mod activity;
 mod albums;
@@ -86,12 +88,50 @@ const WAL_AUTOCHECKPOINT_PAGES: i64 = 500;
 /// the inner `Mutex<Connection>`.
 pub struct Db {
     conn: Mutex<Connection>,
+    /// The single-writer lock, held open for as long as this handle lives.
+    ///
+    /// Never read; dropping the `File` is what releases the `flock`, so it has
+    /// to be owned here rather than by `open`'s stack frame. `None` for
+    /// in-memory databases, which nothing else can reach.
+    _single_writer: Option<File>,
 }
 
 impl Db {
     /// Open (creating if absent) the database at `path`, enable WAL, and bring
     /// the schema up to [`SCHEMA_VERSION`].
+    ///
+    /// Takes the single-instance lock first (see
+    /// [`acquire_single_writer_lock`]), and rebuilds from empty if what is on
+    /// disk turns out not to be a readable database (see [`is_corrupt`]).
     pub fn open(path: &Path) -> Result<Self> {
+        let single_writer = acquire_single_writer_lock(path)?;
+        let conn = match Self::open_configured(path) {
+            Ok(conn) => conn,
+            Err(e) if is_corrupt(&e) => {
+                // Every byte in here is derived from the account or from the
+                // content cache directory, so the recovery is to start over —
+                // loudly, and keeping the damaged file for a post-mortem rather
+                // than deleting evidence.
+                tracing::error!(
+                    db = %path.display(),
+                    error = %e,
+                    "cache database is corrupt — moving it aside and rebuilding \
+                     (metadata will be re-fetched; no user data is stored here)"
+                );
+                quarantine_corrupt_db(path)?;
+                Self::open_configured(path)?
+            }
+            Err(e) => return Err(e),
+        };
+        Ok(Self {
+            conn: Mutex::new(conn),
+            _single_writer: single_writer,
+        })
+    }
+
+    /// Open the file, apply every PRAGMA, and migrate. Split out of
+    /// [`open`](Self::open) so the corruption path can retry it verbatim.
+    fn open_configured(path: &Path) -> Result<Connection> {
         let conn = Connection::open(path)?;
         // WAL: readers never block the single writer. NORMAL sync is the
         // standard durability/throughput tradeoff for WAL.
@@ -137,9 +177,17 @@ impl Db {
 
         let db = Self {
             conn: Mutex::new(conn),
+            _single_writer: None,
         };
         db.migrate()?;
-        Ok(db)
+        Ok(db.into_conn())
+    }
+
+    /// Unwrap the connection back out of a temporary handle. Only
+    /// [`open_configured`](Self::open_configured) uses it, to run `migrate`
+    /// (which is written against `&self`) before the real handle exists.
+    fn into_conn(self) -> Connection {
+        self.conn.into_inner()
     }
 
     /// Open an in-memory database. For tests.
@@ -152,6 +200,7 @@ impl Db {
         conn.pragma_update(None, "foreign_keys", "ON")?;
         let db = Self {
             conn: Mutex::new(conn),
+            _single_writer: None,
         };
         db.migrate()?;
         Ok(db)
@@ -163,6 +212,103 @@ impl Db {
         let conn = self.conn.lock();
         f(&conn)
     }
+}
+
+/// Whether `path` names the in-memory database rather than a file. Both
+/// spellings SQLite accepts are checked, because neither has a lock file or a
+/// corruption story.
+fn is_in_memory(path: &Path) -> bool {
+    let p = path.as_os_str();
+    p == ":memory:" || p.is_empty()
+}
+
+/// Take the single-instance write lock for the database at `path`.
+///
+/// The daemon is the only writer by design — the front-ends go through the
+/// control socket — but nothing stopped a hand-run `pdfs mount` from starting
+/// alongside the systemd unit, at which point two processes own the same inode
+/// space, the same content cache, and the same drain queue. SQLite's own
+/// locking makes each *statement* safe and does nothing about that.
+///
+/// `flock` on a sibling `.lock` file rather than on the database itself:
+/// SQLite uses POSIX record locks, so the two never interact, and a lock file
+/// left behind carries no state — the lock lives in the kernel and dies with
+/// the process, however it exits.
+fn acquire_single_writer_lock(path: &Path) -> Result<Option<File>> {
+    if is_in_memory(path) {
+        return Ok(None);
+    }
+    let lock_path = lock_path_for(path);
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .truncate(false)
+        .write(true)
+        .open(&lock_path)?;
+    // SAFETY: `file` owns the descriptor and outlives the call.
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if rc != 0 {
+        let e = std::io::Error::last_os_error();
+        if e.raw_os_error() == Some(libc::EWOULDBLOCK) {
+            return Err(Error::Other(format!(
+                "another Proton Drive daemon is already using {} — \
+                 stop it first (`systemctl --user stop proton-drive.service`)",
+                path.display()
+            )));
+        }
+        return Err(Error::Io(e));
+    }
+    Ok(Some(file))
+}
+
+fn lock_path_for(path: &Path) -> PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(".lock");
+    PathBuf::from(name)
+}
+
+/// Whether `e` says the file is not a usable database, as opposed to any other
+/// failure. These are the only two conditions rebuilding fixes; a disk error, a
+/// permission problem or a newer-than-supported schema must all still fail.
+fn is_corrupt(e: &Error) -> bool {
+    matches!(
+        e,
+        Error::Db(rusqlite::Error::SqliteFailure(inner, _))
+            if inner.code == rusqlite::ErrorCode::DatabaseCorrupt
+                || inner.code == rusqlite::ErrorCode::NotADatabase
+    )
+}
+
+/// Move a damaged database (and its WAL sidecars) out of the way so the next
+/// open starts from empty.
+///
+/// Renamed rather than deleted: this is a cache, but it is also the only
+/// evidence of what went wrong, and it costs one file the user can remove.
+fn quarantine_corrupt_db(path: &Path) -> Result<()> {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    for suffix in ["", "-wal", "-shm"] {
+        let mut from = path.as_os_str().to_owned();
+        from.push(suffix);
+        let from = PathBuf::from(from);
+        if !from.exists() {
+            continue;
+        }
+        let mut to = path.as_os_str().to_owned();
+        to.push(format!(".corrupt-{stamp}{suffix}"));
+        let to = PathBuf::from(to);
+        // A failure to rename the sidecars is survivable — SQLite discards a
+        // WAL whose database header no longer matches — but failing to move the
+        // database itself is not, because the retry would hit the same file.
+        match std::fs::rename(&from, &to) {
+            Ok(()) => tracing::warn!(from = %from.display(), to = %to.display(), "quarantined"),
+            Err(e) if suffix.is_empty() => return Err(Error::Io(e)),
+            Err(e) => tracing::warn!(file = %from.display(), error = %e, "could not quarantine"),
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

@@ -1336,6 +1336,11 @@ fn cmd_status() -> Result<()> {
             online,
             pending_uploads,
             pending_changes,
+            parked_uploads,
+            failing_ops,
+            failing_error,
+            staged_bytes,
+            staged_oldest_secs,
             ..
         }) => {
             let state = if online { "" } else { ", offline" };
@@ -1344,6 +1349,25 @@ fn cmd_status() -> Result<()> {
                 None => String::new(),
             };
             println!("Mounted at {mountpoint} ({pinned} pinned{state}{queued})");
+            // Everything below is a queue that is not making progress on its
+            // own. Printed only when it exists, because in the ordinary case
+            // there is nothing to say.
+            if staged_bytes > 0 {
+                println!(
+                    "Staged     {} not yet uploaded (oldest {})",
+                    human_bytes(staged_bytes),
+                    human_age(staged_oldest_secs),
+                );
+            }
+            if parked_uploads > 0 {
+                println!("Parked     {parked_uploads} upload(s) waiting for a final filename");
+            }
+            if failing_ops > 0 {
+                println!(
+                    "Stuck      {failing_ops} queued operation(s) keep failing: {}",
+                    failing_error.as_deref().unwrap_or("no error recorded"),
+                );
+            }
         }
         Ok(other) => println!("Mount: unexpected response {other:?}"),
         Err(_) => println!("Mount: not running."),
@@ -1886,6 +1910,18 @@ fn path_arg(path: &Path) -> Result<String> {
         .ok_or_else(|| anyhow!("path is not valid UTF-8"))
 }
 
+/// Format an age in seconds for a report line, coarsely — the point of the
+/// number is whether it is minutes or weeks.
+fn human_age(secs: u64) -> String {
+    const UNITS: [(&str, u64); 4] = [("d", 86_400), ("h", 3_600), ("m", 60), ("s", 1)];
+    for (unit, scale) in UNITS {
+        if secs >= scale {
+            return format!("{}{unit}", secs / scale);
+        }
+    }
+    "just now".to_string()
+}
+
 /// Format a byte count for a report line.
 fn human_bytes(bytes: u64) -> String {
     const UNITS: [(&str, f64); 4] = [
@@ -1925,6 +1961,32 @@ fn cmd_cache(action: CacheCmd) -> Result<()> {
     }
 }
 
+/// Ask for a deep integrity check and wait for it to finish.
+///
+/// The daemon answers the request immediately and runs the check on a thread —
+/// it holds the single database connection for as long as it takes, which would
+/// otherwise stall the mount — so a caller that needs the verdict polls for it.
+/// `pdfs doctor` is that caller: it is a diagnostic the user is watching, so
+/// waiting is right, and the bound is generous enough for a large database
+/// without hanging forever if the daemon never finishes.
+fn await_integrity_check() -> Result<CtlResponse> {
+    const POLL: std::time::Duration = std::time::Duration::from_secs(1);
+    const GIVE_UP_AFTER: std::time::Duration = std::time::Duration::from_secs(120);
+
+    let started = std::time::Instant::now();
+    loop {
+        let response = control_request(CtlRequest::CacheInspect { deep: true })?;
+        match &response {
+            CtlResponse::CacheReport {
+                integrity_running: true,
+                integrity_checked: false,
+                ..
+            } if started.elapsed() < GIVE_UP_AFTER => std::thread::sleep(POLL),
+            _ => return Ok(response),
+        }
+    }
+}
+
 fn cmd_cache_inspect(deep: bool) -> Result<()> {
     let response = control_request(CtlRequest::CacheInspect { deep })?;
     if emit_json(&response)? {
@@ -1940,6 +2002,7 @@ fn cmd_cache_inspect(deep: bool) -> Result<()> {
             cache_budget,
             integrity_problems,
             integrity_checked,
+            integrity_running,
         } => {
             println!(
                 "Database   schema v{schema_version}, {}",
@@ -1972,6 +2035,11 @@ fn cmd_cache_inspect(deep: bool) -> Result<()> {
                         println!("  {problem}");
                     }
                 }
+            } else if integrity_running {
+                // The daemon runs the check on a thread rather than holding its
+                // only database connection for the length of it, so the answer
+                // belongs to a later request.
+                println!("\nIntegrity  checking in the background — run this again for the result");
             } else {
                 println!("\nIntegrity  not checked (pass --deep)");
             }
@@ -2209,13 +2277,23 @@ fn cmd_diagnose() -> Result<()> {
                     format!("{pending} waiting to upload")
                 },
             );
-            match control_request(CtlRequest::CacheInspect { deep: true }) {
+            match await_integrity_check() {
                 Ok(CtlResponse::CacheReport {
-                    integrity_problems, ..
+                    integrity_problems,
+                    integrity_checked: true,
+                    ..
                 }) if integrity_problems.is_empty() => report.finding(
                     DiagnoseLevel::Ok,
                     "  database integrity",
                     "SQLite integrity_check passed",
+                ),
+                Ok(CtlResponse::CacheReport {
+                    integrity_checked: false,
+                    ..
+                }) => report.finding(
+                    DiagnoseLevel::Warn,
+                    "  database integrity",
+                    "still checking — run `pdfs cache inspect --deep` for the result",
                 ),
                 Ok(CtlResponse::CacheReport {
                     integrity_problems, ..
