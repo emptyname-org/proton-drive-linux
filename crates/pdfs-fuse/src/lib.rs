@@ -166,6 +166,30 @@ const DRAIN_IDLE_POLL: Duration = Duration::from_secs(30);
 /// creates a conflict copy of itself. Holding the op for a short window gives
 /// the follow-up write time to supersede it.
 const DRAIN_REVISION_DEBOUNCE: Duration = Duration::from_secs(2);
+/// Ceiling on the *adaptive* part of that grace period.
+///
+/// The fixed 2 seconds is enough for a preallocate-then-write tool, and wrong
+/// for a file that takes half a minute to upload: an editor saving every ten
+/// seconds queues a write, watches it start uploading, and supersedes it — each
+/// save uploading bytes that the next one replaces, and never catching up.
+/// Widening the debounce toward how long this node's last upload actually took
+/// makes the supersede happen in the queue, where it is free, instead of on the
+/// wire. Bounded so a file on a slow link still reaches Drive in a minute rather
+/// than deferring indefinitely, and so a one-off stall cannot park a node.
+const DRAIN_REVISION_DEBOUNCE_MAX: Duration = Duration::from_secs(60);
+/// How many nodes' measured upload times to remember for that. Bounds a map
+/// that would otherwise grow with every file ever written; the debounce falls
+/// back to [`DRAIN_REVISION_DEBOUNCE`] for anything evicted, which is the
+/// behaviour a node that has never been uploaded gets anyway.
+const UPLOAD_TIME_MEMORY: usize = 512;
+/// Threads draining the pending-op queue.
+///
+/// One meant a single 10 GiB upload blocked every queued rename, trash and
+/// small write behind it. Ordering only has to hold per node — enforced by the
+/// claim query, not by the thread count — so the rest is throughput. Kept small:
+/// these are uploads, and past a handful they compete for the same uplink and
+/// for the SDK's own per-request concurrency.
+const DRAIN_WORKERS: usize = 3;
 
 const ONLINE_PROBE_MIN: Duration = Duration::from_secs(5);
 const ONLINE_PROBE_MAX: Duration = Duration::from_secs(300);
@@ -423,9 +447,23 @@ struct Core {
     /// Nodes removed through this daemon which a briefly stale remote listing
     /// may still return. Uids are not reused; an explicit restore clears one.
     hidden: Arc<Mutex<HashSet<NodeUid>>>,
-    /// Nudges the drain worker: set true and notify to have it re-examine the
-    /// queue instead of waiting out its backoff.
+    /// Nudges the drain workers: set true and notify to have them re-examine
+    /// the queue instead of waiting out their backoff.
     drain_wake: Arc<(Mutex<bool>, Condvar)>,
+    /// How long this node's last upload actually took, in milliseconds, with
+    /// the time it was measured for eviction. Feeds
+    /// [`Core::revision_debounce`]: a file that takes 30 seconds to send needs
+    /// a grace period on that scale, or every save supersedes an upload that
+    /// was already on the wire. Bounded by [`UPLOAD_TIME_MEMORY`].
+    upload_times: Arc<Mutex<HashMap<String, (u64, i64)>>>,
+    /// Cancellation flags for uploads currently on the wire, keyed by node.
+    ///
+    /// Set when a newer revision of the same file is queued: the bytes in
+    /// flight have just been superseded, and the only thing finishing them
+    /// achieves is spending the user's uplink on a revision the next op
+    /// replaces. Read by the upload's own reader ([`CountingReader`]), which is
+    /// the one thing the SDK calls often enough to notice.
+    upload_cancel: Arc<Mutex<HashMap<NodeUid, Arc<AtomicBool>>>>,
     /// True while a background refresh of the photos timeline (resp. the trash) is
     /// already running, so a burst of page requests against a stale listing kicks
     /// off one refresh rather than one per request.
@@ -2756,6 +2794,12 @@ impl Core {
             }
         })?;
         let meta_json = serde_json::to_string(&meta).unwrap_or_default();
+        // Whatever this write supersedes, it supersedes now — including an
+        // upload already on the wire, whose bytes describe a revision the row
+        // written just below replaces. Signalled before the enqueue so the
+        // in-flight reader stops at its next block rather than after however
+        // much of the file is left.
+        self.cancel_upload(uid);
         let superseded = if is_local_uid(uid) {
             // The node has no server-side identity to hang a revision on, so the
             // bytes ride on the create that will mint it.
@@ -2789,7 +2833,7 @@ impl Core {
                 created_at: now_millis(),
                 attempts: 0,
                 last_error: None,
-                next_attempt_at: now_millis() + DRAIN_REVISION_DEBOUNCE.as_millis() as i64,
+                next_attempt_at: now_millis() + self.revision_debounce(uid).as_millis() as i64,
             };
             let (_id, superseded) = self.db.enqueue_op(&op).map_err(|e| {
                 error!(%uid, error = %e, "queueing upload failed");
@@ -3095,6 +3139,12 @@ impl Core {
     /// worse in every way.
     fn queue_trash(&self, uid: &NodeUid, name: &str) -> Result<(), Errno> {
         self.require_uid_writable(uid)?;
+        // The bytes below are about to be discarded, and a drain worker may be
+        // reading them onto the wire right now. Stop it first: with several
+        // workers the trash op this queues can be claimed while that upload is
+        // still running, and the two would race to decide whether the file
+        // exists.
+        self.cancel_upload(uid);
         let (_, blobs) = self
             .db
             .replace_ops_with_trash(&uid.to_string(), name, now_millis())
@@ -3124,6 +3174,9 @@ impl Core {
 
     /// Drop every op queued against a node, and the staged bytes they own.
     fn discard_queued_ops(&self, uid: &NodeUid) -> Result<(), Errno> {
+        // Same reason as `queue_trash`: an upload may be reading the very blobs
+        // this is about to unlink.
+        self.cancel_upload(uid);
         let blobs = self.db.delete_ops_for_uid(&uid.to_string()).map_err(|e| {
             error!(%uid, error = %e, "dropping queued ops failed");
             Errno::EIO
@@ -6875,6 +6928,19 @@ mod tests {
         }
         let trash = function_source(source, "fn queue_trash(");
         assert_before(trash, "replace_ops_with_trash", "discard_staged");
+
+        // §5, parallel drain: every path that unlinks a staged blob or hands
+        // the same node's work to another worker has to stop the upload that
+        // may be reading those bytes *first*. Late is a superseded revision on
+        // the wire, or two workers deciding whether the file exists.
+        for (signature, mutation) in [
+            ("fn enqueue_staged_write(", "attach_blob_to_create"),
+            ("fn queue_trash(", "replace_ops_with_trash"),
+            ("fn discard_queued_ops(", "delete_ops_for_uid"),
+        ] {
+            let function = function_source(source, signature);
+            assert_before(function, "cancel_upload", mutation);
+        }
 
         let filesystem = include_str!("filesystem.rs");
         for signature in ["fn serve_unlink(", "fn serve_rmdir("] {

@@ -3545,3 +3545,114 @@ fn a_read_does_not_wait_for_the_write_connection() {
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_file(format!("{}.lock", path.display()));
 }
+
+/// §5: the drain is several workers over one queue, and the claim column is the
+/// only thing keeping them off each other's work. Two properties matter — no
+/// row is ever handed to two workers, and no *node* is ever worked by two
+/// workers even though its ops are separate rows.
+#[test]
+fn a_claimed_op_is_invisible_to_every_other_worker() {
+    let db = Db::open_in_memory().unwrap();
+    let root = uid("root").to_string();
+    for i in 0..3 {
+        db.enqueue_op(&bulk_op(i, &root)).unwrap();
+    }
+
+    let first = db.claim_next_due_op(10).unwrap().expect("an op is due");
+    let second = db
+        .claim_next_due_op(10)
+        .unwrap()
+        .expect("another op is due");
+    let third = db
+        .claim_next_due_op(10)
+        .unwrap()
+        .expect("a third op is due");
+    assert!(
+        db.claim_next_due_op(10).unwrap().is_none(),
+        "a fourth claim must find nothing left: every queued op is taken"
+    );
+
+    let mut ids = [first.id, second.id, third.id];
+    ids.sort_unstable();
+    assert_eq!(
+        ids,
+        [1, 2, 3],
+        "each worker must get a distinct row, oldest first"
+    );
+
+    // Releasing puts one back, and it is the one that comes out next.
+    db.release_op_claim(second.id).unwrap();
+    let again = db.claim_next_due_op(10).unwrap().expect("the released op");
+    assert_eq!(again.id, second.id);
+}
+
+#[test]
+fn two_workers_never_share_a_node() {
+    let db = Db::open_in_memory().unwrap();
+    let root = uid("root").to_string();
+    // Two ops of different kinds against one node — a queued rename and a
+    // queued revision, which is an ordinary `mv` plus a save.
+    let mut revision = bulk_op(0, &root);
+    revision.parent_uid = None;
+    db.enqueue_op(&revision).unwrap();
+    let rename = PendingOp {
+        kind: OP_RENAME.to_string(),
+        parent_uid: Some(root.clone()),
+        blob_path: None,
+        meta_json: None,
+        ..bulk_op(0, &root)
+    };
+    db.enqueue_op(&rename).unwrap();
+
+    let claimed = db.claim_next_due_op(10).unwrap().expect("an op is due");
+    assert_eq!(claimed.kind, OP_REVISION, "the older op goes first");
+    assert!(
+        db.claim_next_due_op(10).unwrap().is_none(),
+        "the second op targets the same node, so it must wait for the first: \
+         two workers on one uid would race over its staged blob and land its \
+         changes out of order"
+    );
+
+    db.release_op_claim(claimed.id).unwrap();
+    db.delete_op(claimed.id).unwrap();
+    assert_eq!(
+        db.claim_next_due_op(10).unwrap().map(|o| o.kind),
+        Some(OP_RENAME.to_string()),
+        "once the revision retires, the rename is claimable"
+    );
+}
+
+#[test]
+fn claims_do_not_survive_the_process_that_took_them() {
+    let db = Db::open_in_memory().unwrap();
+    let root = uid("root").to_string();
+    for i in 0..2 {
+        db.enqueue_op(&bulk_op(i, &root)).unwrap();
+    }
+    db.claim_next_due_op(10).unwrap().unwrap();
+    db.claim_next_due_op(10).unwrap().unwrap();
+    assert!(db.claim_next_due_op(10).unwrap().is_none());
+
+    // What `Db::open` does after the single-writer lock says the previous run
+    // is gone. Without it those ops are invisible to every worker forever.
+    assert_eq!(db.clear_op_claims().unwrap(), 2);
+    assert!(
+        db.claim_next_due_op(10).unwrap().is_some(),
+        "a crashed run's claims must not park its queue"
+    );
+}
+
+#[test]
+fn an_idle_worker_does_not_wait_on_an_op_another_worker_has() {
+    let db = Db::open_in_memory().unwrap();
+    let root = uid("root").to_string();
+    db.enqueue_op(&bulk_op(0, &root)).unwrap();
+
+    assert_eq!(db.earliest_due_at().unwrap(), Some(0));
+    db.claim_next_due_op(10).unwrap().unwrap();
+    assert_eq!(
+        db.earliest_due_at().unwrap(),
+        None,
+        "an op somebody else is draining is not work this worker is waiting for"
+    );
+}

@@ -230,7 +230,7 @@ impl Db {
             }
             Err(e) => return Err(e),
         };
-        Ok(Self {
+        let db = Self {
             conn: Mutex::new(conn),
             // No pool for `:memory:`. A second connection to that name is a
             // second, empty database rather than another view of this one, so
@@ -240,7 +240,17 @@ impl Db {
                 idle: Mutex::new(Vec::new()),
             }),
             _single_writer: single_writer,
-        })
+        };
+        // A drain claim names a worker thread in the process that took it, and
+        // the single-writer lock above says that process is not running. Any
+        // claim still on disk is therefore a crashed run's, and leaving it would
+        // hide those ops from every worker for good.
+        match db.clear_op_claims() {
+            Ok(0) => {}
+            Ok(n) => tracing::info!(ops = n, "released drain claims left by a previous run"),
+            Err(e) => tracing::warn!(error = %e, "clearing stale drain claims failed"),
+        }
+        Ok(db)
     }
 
     /// A connection for a `SELECT`-only method.

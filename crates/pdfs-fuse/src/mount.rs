@@ -376,6 +376,8 @@ pub fn mount(
         pending: Arc::new(Mutex::new(HashMap::new())),
         hidden: Arc::new(Mutex::new(HashSet::new())),
         drain_wake: Arc::new((Mutex::new(false), Condvar::new())),
+        upload_times: Arc::new(Mutex::new(HashMap::new())),
+        upload_cancel: Arc::new(Mutex::new(HashMap::new())),
         timeline_refreshing: Arc::new(AtomicBool::new(false)),
         albums_refreshing: Arc::new(AtomicBool::new(false)),
         trash_refreshing: Arc::new(AtomicBool::new(false)),
@@ -413,11 +415,16 @@ pub fn mount(
     // And finally the staged blobs neither of those accounts for: bytes a
     // failed release left behind with nothing pointing at them.
     core.reconcile_staging();
-    {
+    // Several drain workers over one queue. One thread meant a single large
+    // upload held every queued rename, trash and small write behind it for as
+    // long as it ran; the claim column (`Db::claim_next_due_op`) keeps the
+    // workers off each other's nodes, which is the only ordering the queue
+    // actually needs. Worker 0 additionally runs the queue's idle chores.
+    for worker in 0..DRAIN_WORKERS {
         let core = core.clone();
         std::thread::Builder::new()
-            .name("pdfs-drain".into())
-            .spawn(move || core.run_pending_drain())?;
+            .name(format!("pdfs-drain-{worker}"))
+            .spawn(move || core.run_pending_drain(worker == 0))?;
     }
 
     // Start the folder-sync engine. It watches every mirror folder, polls the

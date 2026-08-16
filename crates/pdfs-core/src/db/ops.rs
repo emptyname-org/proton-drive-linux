@@ -512,17 +512,115 @@ impl Db {
         Ok(op)
     }
 
+    /// Take the oldest due op for this worker, marking it claimed so no other
+    /// drain worker takes it, or `None` when there is nothing to do.
+    ///
+    /// The drain is several workers over one queue, which is only safe because
+    /// the claim is a column: a row is offered to exactly one worker, and the
+    /// worker that took it is the only one that may retire, defer or fail it.
+    ///
+    /// Two exclusions on top of [`next_due_op`](Self::next_due_op)'s:
+    ///
+    /// * `claimed_at = 0` — not already in flight somewhere else.
+    /// * no *other* claimed op shares this `uid`. Ordering only has to hold per
+    ///   node, but there it has to hold absolutely: a queued rename and a queued
+    ///   revision of one file must land in the order they were made, and two
+    ///   workers on one node would also race over its staged blob and its
+    ///   pending entry. `ORDER BY id` plus this exclusion gives per-uid serial
+    ///   order for free — the older op is claimed first and the newer one is
+    ///   invisible until it retires.
+    ///
+    /// Select and mark are one transaction, so two workers cannot both see the
+    /// row as unclaimed.
+    pub fn claim_next_due_op(&self, now: i64) -> Result<Option<PendingOp>> {
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
+        let op = {
+            let mut stmt = tx.prepare_cached(&format!(
+                "SELECT id, kind, uid, parent_uid, name, blob_path, meta_json, created_at,
+                        attempts, last_error, next_attempt_at
+                 FROM pending_op
+                 WHERE next_attempt_at <= ?1
+                   AND claimed_at = 0
+                   AND (parent_uid IS NULL OR substr(parent_uid, 1, {n}) <> '{v}~')
+                   AND uid NOT IN (SELECT uid FROM pending_op WHERE claimed_at <> 0)
+                 ORDER BY id LIMIT 1",
+                v = LOCAL_VOLUME,
+                n = LOCAL_VOLUME.len() + 1,
+            ))?;
+            stmt.query_row(params![now], |r| {
+                Ok(PendingOp {
+                    id: r.get(0)?,
+                    kind: r.get(1)?,
+                    uid: r.get(2)?,
+                    parent_uid: r.get(3)?,
+                    name: r.get(4)?,
+                    blob_path: r.get(5)?,
+                    meta_json: r.get(6)?,
+                    created_at: r.get(7)?,
+                    attempts: r.get(8)?,
+                    last_error: r.get(9)?,
+                    next_attempt_at: r.get(10)?,
+                })
+            })
+            .optional()?
+        };
+        if let Some(op) = op.as_ref() {
+            tx.execute(
+                "UPDATE pending_op SET claimed_at = ?2 WHERE id = ?1",
+                params![op.id, now.max(1)],
+            )?;
+        }
+        tx.commit()?;
+        Ok(op)
+    }
+
+    /// Give a claimed op back to the queue, whatever became of the attempt.
+    ///
+    /// Called on every path out of a drain attempt rather than only the failing
+    /// ones: a handler that retires its own row leaves nothing to release (the
+    /// `UPDATE` matches nothing), and a handler that returns without retiring
+    /// *and* without failing would otherwise leave the row claimed by a worker
+    /// that has moved on — invisible to every worker, forever.
+    pub fn release_op_claim(&self, id: i64) -> Result<()> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "UPDATE pending_op SET claimed_at = 0 WHERE id = ?1",
+            params![id],
+        )?;
+        Ok(())
+    }
+
+    /// Drop every claim in the table.
+    ///
+    /// A claim describes a worker in *this* process, so one surviving on disk
+    /// means the previous run died holding it. The single-writer lock
+    /// ([`Db::open`]) is what makes that inference safe: nobody else can be
+    /// draining this queue while we are opening it.
+    pub fn clear_op_claims(&self) -> Result<usize> {
+        let conn = self.conn.lock();
+        Ok(conn.execute(
+            "UPDATE pending_op SET claimed_at = 0 WHERE claimed_at <> 0",
+            [],
+        )?)
+    }
+
     /// The earliest `next_attempt_at` among all queued ops, or `None` if the
     /// queue is empty. Used by the drain loop to sleep exactly until the next
     /// debounced or backed-off op becomes eligible rather than waiting the full
     /// idle-poll interval.
+    ///
+    /// Claimed ops are excluded: another worker is already on them, so they are
+    /// not work this one is waiting for, and counting them would have an idle
+    /// worker spin on a row it cannot have.
     pub fn earliest_due_at(&self) -> Result<Option<i64>> {
         let conn = self.read();
         let ts: Option<i64> = conn
             .query_row(
                 &format!(
                     "SELECT MIN(next_attempt_at) FROM pending_op \
-                     WHERE parent_uid IS NULL OR substr(parent_uid, 1, {n}) <> '{v}~'",
+                     WHERE claimed_at = 0 \
+                       AND (parent_uid IS NULL OR substr(parent_uid, 1, {n}) <> '{v}~')",
                     v = LOCAL_VOLUME,
                     n = LOCAL_VOLUME.len() + 1,
                 ),

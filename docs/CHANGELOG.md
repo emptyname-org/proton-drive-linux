@@ -9,6 +9,26 @@ release ships. Migrations are forward-only — a database written by a newer cli
 refuse-to-open, not a downgrade, so rolling back a release means restoring the cache from
 scratch (user data in `staging/` and `recovery/` is never touched by this).
 
+## [1.7.1] — 2026-08-16
+
+Write-back throughput follow-up to 1.7.0, same audit
+(`docs/plans/audit-2026-08-15-perf-locks.md`). Schema: 26 — migration V26 adds
+`pending_op.claimed_at`.
+
+### Added
+- Parallel write-back drain: three workers share the queue through a `pending_op.claimed_at`
+  claim column (migration V26), so a large upload no longer holds every queued rename, trash
+  and small write behind it. Ordering is preserved per node — the claim query never offers
+  two workers ops for the same uid — and claims left by a crashed run are cleared at open.
+- An upload already on the wire is cancelled when a newer write, a trash or a discard
+  supersedes it, instead of spending the uplink on a revision the next operation replaces.
+
+### Changed
+- The revision debounce is adaptive: it widens toward how long that node's last upload
+  actually took (bounded to 2–60 s), so a file saved faster than it can be sent supersedes
+  in the queue rather than mid-upload.
+- Workspace deps bumped to `proton-sdk` / `proton-drive-rs` 0.6.0.
+
 ## [1.7.0] — 2026-08-16
 
 Performance and robustness pass over the mount, from the architecture audit in
@@ -232,6 +252,7 @@ First stable release: FUSE files-on-demand mount, sync daemon under `proton-driv
 - The outstanding FUSE defects tracked in `docs/BUGS.md`, plus a truncate defect, validated
   by a new POSIX compliance suite for the filesystem.
 
+[1.7.1]: https://github.com/narrrl/proton-drive-linux/releases/tag/v1.7.1
 [1.7.0]: https://github.com/narrrl/proton-drive-linux/releases/tag/v1.7.0
 [1.6.0]: https://github.com/narrrl/proton-drive-linux/releases/tag/v1.6.0
 [1.5.0]: https://github.com/narrrl/proton-drive-linux/releases/tag/v1.5.0

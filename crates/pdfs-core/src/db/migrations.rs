@@ -9,7 +9,7 @@ use super::Db;
 use crate::Result;
 
 /// Current schema version. Bump on every forward migration added below.
-pub(super) const SCHEMA_VERSION: i64 = 25;
+pub(super) const SCHEMA_VERSION: i64 = 26;
 
 impl Db {
     pub(super) fn migrate(&self) -> Result<()> {
@@ -159,6 +159,27 @@ impl Db {
             )? > 0;
             if has_nodes {
                 tx.execute_batch(MIGRATION_V25)?;
+            }
+        }
+        if current < 26 {
+            // Same guard as V22: a fixture that never exercised the queue may
+            // not have `pending_op`, and altering an absent table is an error
+            // rather than a no-op.
+            // A fixture built from the current schema and then rewound to an
+            // older `schema_version` already has the column, and `ADD COLUMN`
+            // has no `IF NOT EXISTS`.
+            let has_column: bool = tx.query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('pending_op') WHERE name = 'claimed_at'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )? > 0;
+            let has_ops: bool = tx.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'pending_op'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )? > 0;
+            if has_ops && !has_column {
+                tx.execute_batch(MIGRATION_V26)?;
             }
         }
         tx.execute(
@@ -724,4 +745,27 @@ UPDATE nodes
  WHERE EXISTS (SELECT 1 FROM node_paths p WHERE p.uid = nodes.uid);
 
 DROP TABLE node_paths;
+";
+
+/// V26: `pending_op.claimed_at` — the drain's claim column.
+///
+/// The drain was one thread taking one op at a time, so a 10 GiB upload held
+/// every queued rename and small write behind it for as long as it ran. Several
+/// workers can share the queue only if a claim is visible to the others: this
+/// column is what makes "already being drained by someone" a fact about the row
+/// rather than about one thread's local variable.
+///
+/// `0` is unclaimed; anything else is the ms at which a worker took it. A
+/// claim is process-local state that outlives nothing — the single-writer lock
+/// means a non-zero value found at open belongs to a crashed run, and
+/// [`Db::clear_op_claims`](super::Db::clear_op_claims) drops the lot.
+///
+/// The index is partial so it costs nothing on the ordinary row: only the
+/// handful of claimed rows are in it, which is exactly the set the claim query
+/// has to subtract to keep two workers off one node.
+const MIGRATION_V26: &str = "
+ALTER TABLE pending_op ADD COLUMN claimed_at INTEGER NOT NULL DEFAULT 0;
+
+CREATE INDEX IF NOT EXISTS idx_pending_op_claimed
+    ON pending_op(uid) WHERE claimed_at <> 0;
 ";

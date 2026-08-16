@@ -19,7 +19,7 @@ use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
 
 use pdfs_core::control::{JobItem, TransferDirection, TransferItem};
@@ -272,20 +272,50 @@ impl<R: Read> Read for OwnedCountingReader<R> {
     }
 }
 
-/// A [`Read`] that tallies bytes read through a [`TransferGuard`] (upload path).
+/// A [`Read`] that tallies bytes read through a [`TransferGuard`] (upload path),
+/// and can be told to stop.
 pub struct CountingReader<'a, R> {
     inner: R,
     guard: &'a TransferGuard,
+    cancel: Option<Arc<AtomicBool>>,
 }
 
 impl<'a, R: Read> CountingReader<'a, R> {
     pub fn new(inner: R, guard: &'a TransferGuard) -> Self {
-        Self { inner, guard }
+        Self {
+            inner,
+            guard,
+            cancel: None,
+        }
+    }
+
+    /// Abandon the upload as soon as the SDK asks for its next bytes when
+    /// `cancel` is set.
+    ///
+    /// This is the only cancellation point an upload has: the SDK takes a plain
+    /// blocking [`Read`] and pulls from it a block at a time, so refusing to
+    /// hand over the next block is what stops it. Used when a newer revision of
+    /// the same file is queued — the bytes on the wire have already been
+    /// superseded, and finishing them only spends uplink on a revision the next
+    /// op replaces.
+    pub fn with_cancel(mut self, cancel: Arc<AtomicBool>) -> Self {
+        self.cancel = Some(cancel);
+        self
     }
 }
 
 impl<R: Read> Read for CountingReader<'_, R> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if let Some(cancel) = &self.cancel
+            && cancel.load(Ordering::Relaxed)
+        {
+            // Not `Ok(0)`: a short read is how this reader says "end of file",
+            // and the SDK would seal a truncated revision from it.
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "upload superseded by a newer write",
+            ));
+        }
         let n = self.inner.read(buf)?;
         self.guard.add(n as u64);
         Ok(n)

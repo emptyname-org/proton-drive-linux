@@ -20,10 +20,14 @@
 //! are kept as a conflict copy rather than discarded — see
 //! [`Core::revision_conflict`].
 
+use std::collections::HashMap;
 use std::fs::File;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::Ordering;
-use std::time::Duration;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
+
+use parking_lot::Mutex;
 
 use pdfs_core::batch;
 use pdfs_core::cache::{Baseline, StagedWrite};
@@ -36,12 +40,58 @@ use tracing::{debug, error, info, warn};
 use super::state::Intervals;
 use super::transfers::CountingReader;
 use super::{
-    Core, DRAIN_BACKOFF_MAX, DRAIN_BACKOFF_MIN, DRAIN_IDLE_POLL, ROOT_INO, conflict_name,
-    is_already_exists, is_gone, is_local_uid_str, media_type_for, node_revision_id, node_size,
-    now_millis, now_secs, parse_node_uid,
+    Core, DRAIN_BACKOFF_MAX, DRAIN_BACKOFF_MIN, DRAIN_IDLE_POLL, DRAIN_REVISION_DEBOUNCE,
+    DRAIN_REVISION_DEBOUNCE_MAX, ROOT_INO, UPLOAD_TIME_MEMORY, conflict_name, is_already_exists,
+    is_gone, is_local_uid_str, media_type_for, node_revision_id, node_size, now_millis, now_secs,
+    parse_node_uid,
 };
 
 const DRAIN_ACCESS_RECHECK: Duration = Duration::from_secs(5);
+
+/// A registered cancellation flag for one in-flight upload, deregistered when
+/// dropped. See [`Core::begin_cancellable_upload`].
+struct UploadCancel {
+    registry: Arc<Mutex<HashMap<NodeUid, Arc<AtomicBool>>>>,
+    uid: NodeUid,
+    flag: Arc<AtomicBool>,
+}
+
+impl UploadCancel {
+    /// Whether this upload was told to stop. Distinguishes an upload we
+    /// abandoned on purpose from one the network broke.
+    fn cancelled(&self) -> bool {
+        self.flag.load(Ordering::Relaxed)
+    }
+
+    fn flag(&self) -> Arc<AtomicBool> {
+        self.flag.clone()
+    }
+}
+
+impl Drop for UploadCancel {
+    fn drop(&mut self) {
+        let mut registry = self.registry.lock();
+        // By identity: a supersede racing this upload's last bytes may already
+        // have registered the next one under the same uid.
+        if registry
+            .get(&self.uid)
+            .is_some_and(|current| Arc::ptr_eq(current, &self.flag))
+        {
+            registry.remove(&self.uid);
+        }
+    }
+}
+
+/// The debounce arithmetic of [`Core::revision_debounce`], without the map:
+/// the last measured upload time for this node, bounded on both sides.
+///
+/// A node nobody has uploaded yet gets the fixed grace period, which is the
+/// same answer the fixed debounce always gave.
+fn adaptive_debounce(measured: Option<Duration>) -> Duration {
+    measured
+        .unwrap_or(DRAIN_REVISION_DEBOUNCE)
+        .clamp(DRAIN_REVISION_DEBOUNCE, DRAIN_REVISION_DEBOUNCE_MAX)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DrainDisposition {
@@ -127,24 +177,57 @@ impl Core {
     /// that is due — one file wedged against a folder that no longer exists must
     /// not hold up an unrelated upload behind it. The worker only blocks once
     /// nothing is due at all.
-    pub(crate) fn run_pending_drain(&self) {
+    ///
+    /// Several of these run at once ([`DRAIN_WORKERS`]), sharing the queue
+    /// through [`Db::claim_next_due_op`]: the alternative was that a 10 GiB
+    /// upload held every queued rename, trash and small write behind it for as
+    /// long as it took. Ordering only has to hold *per node*, and the claim
+    /// query is what guarantees it — no two workers are ever on one uid.
+    ///
+    /// `primary` marks the one worker that also runs the queue's idle chores.
+    /// They are cheap, but they are not per-op work and doing them in every
+    /// worker would just multiply them.
+    ///
+    /// [`DRAIN_WORKERS`]: super::DRAIN_WORKERS
+    /// [`Db::claim_next_due_op`]: pdfs_core::db::Db::claim_next_due_op
+    pub(crate) fn run_pending_drain(&self, primary: bool) {
         loop {
             let now = now_millis();
-            // One row, chosen by the database. Reading the whole queue to pick
-            // one op made a long queue quadratic to drain, and held the shared
-            // connection — and so every FUSE metadata call — for the duration.
-            let due = self.db.next_due_op(now).unwrap_or_default();
-
-            let Some(op) = due.filter(|_| self.online.load(Ordering::Relaxed)) else {
-                // Nothing to upload is exactly when the connection is free, so
-                // this is where the read path's buffered LRU touches get written
-                // (`ContentCache::flush_touches`). Cheap and a no-op when empty.
-                self.cache.flush_touches();
-                self.recover_fsynced_writes();
-                // A debounced or backed-off op may be waiting: sleep only
-                // until it becomes due rather than the full idle-poll.
-                self.wait_for_drain_work_or_due();
-                continue;
+            // One row, chosen and *claimed* by the database. Reading the whole
+            // queue to pick one op made a long queue quadratic to drain, and
+            // held the shared connection — and so every FUSE metadata call —
+            // for the duration.
+            let due = match self.db.claim_next_due_op(now) {
+                Ok(due) => due,
+                Err(error) => {
+                    error!(%error, "claiming the next pending operation failed");
+                    self.wait_for_drain_work();
+                    continue;
+                }
+            };
+            let online = self.online.load(Ordering::Relaxed);
+            let op = match due {
+                Some(op) if online => op,
+                idle => {
+                    // Claimed but offline: hand it straight back, or it stays
+                    // invisible to every worker until this one happens to be
+                    // the next to notice the reconnect.
+                    if let Some(op) = idle {
+                        self.release_claim(&op);
+                    }
+                    if primary {
+                        // Nothing to upload is exactly when the connection is
+                        // free, so this is where the read path's buffered LRU
+                        // touches get written (`ContentCache::flush_touches`).
+                        // Cheap and a no-op when empty.
+                        self.cache.flush_touches();
+                        self.recover_fsynced_writes();
+                    }
+                    // A debounced or backed-off op may be waiting: sleep only
+                    // until it becomes due rather than the full idle-poll.
+                    self.wait_for_drain_work_or_due();
+                    continue;
+                }
             };
             let outcome = run_authorized_drain(
                 &op,
@@ -159,6 +242,7 @@ impl Core {
                         %error,
                         "deferring access-blocked pending operation failed"
                     );
+                    self.release_claim(&op);
                     self.wait_for_drain_work();
                 } else {
                     debug!(
@@ -166,6 +250,7 @@ impl Core {
                         next_attempt_at,
                         "pending operation deferred until access is writable"
                     );
+                    self.release_claim(&op);
                 }
                 continue;
             }
@@ -188,9 +273,103 @@ impl Core {
                     now_millis() + backoff.as_millis() as i64,
                 ) {
                     error!(uid = %op.uid, error = %e, "recording a drain failure failed");
+                    self.release_claim(&op);
                     self.wait_for_drain_work();
+                    continue;
                 }
             }
+            // Unconditionally, on every path: a handler that retired its own row
+            // leaves nothing to release, and one that returned without retiring
+            // must not leave the row claimed by a worker that has moved on.
+            self.release_claim(&op);
+        }
+    }
+
+    /// Hand a claimed op back to the queue, logging rather than propagating —
+    /// there is no caller left to propagate to, and the drain must not stop.
+    fn release_claim(&self, op: &PendingOp) {
+        if let Err(error) = self.db.release_op_claim(op.id) {
+            error!(uid = %op.uid, %error, "releasing a drain claim failed");
+        }
+    }
+
+    /// How long a freshly queued revision of `uid` should wait before a worker
+    /// may pick it up.
+    ///
+    /// [`DRAIN_REVISION_DEBOUNCE`] exists for a tool that preallocates a file
+    /// and then writes it, where two seconds is the right scale. It is the wrong
+    /// scale for a large file on a slow link: an editor saving a 200 MB project
+    /// every ten seconds queues a write, the drain starts sending it, the next
+    /// save supersedes it mid-flight, and the file never finishes uploading
+    /// while the user keeps working. Waiting roughly as long as the last upload
+    /// of *this* node took moves that supersede into the queue, where replacing
+    /// a row costs nothing.
+    ///
+    /// Never shorter than the fixed debounce and never longer than
+    /// [`DRAIN_REVISION_DEBOUNCE_MAX`]: a node whose upload is genuinely slow
+    /// still has to reach Drive, and a single pathological stall must not park
+    /// it.
+    ///
+    /// [`DRAIN_REVISION_DEBOUNCE`]: super::DRAIN_REVISION_DEBOUNCE
+    /// [`DRAIN_REVISION_DEBOUNCE_MAX`]: super::DRAIN_REVISION_DEBOUNCE_MAX
+    pub(crate) fn revision_debounce(&self, uid: &NodeUid) -> Duration {
+        let measured = self
+            .upload_times
+            .lock()
+            .get(&uid.to_string())
+            .map(|&(ms, _)| Duration::from_millis(ms));
+        adaptive_debounce(measured)
+    }
+
+    /// Remember how long an upload of `uid` took, for the next write's
+    /// debounce.
+    ///
+    /// Only a *completed* upload is a measurement. A cancelled or failed one
+    /// says how long it ran before it stopped, which is not how long the file
+    /// takes to send, and feeding that back would let one network fault widen
+    /// the debounce for good.
+    fn record_upload_time(&self, uid: &NodeUid, took: Duration) {
+        let mut times = self.upload_times.lock();
+        let now = now_millis();
+        if times.len() >= UPLOAD_TIME_MEMORY
+            && !times.contains_key(&uid.to_string())
+            && let Some(oldest) = times
+                .iter()
+                .min_by_key(|(_, (_, at))| *at)
+                .map(|(k, _)| k.clone())
+        {
+            times.remove(&oldest);
+        }
+        times.insert(uid.to_string(), (took.as_millis() as u64, now));
+    }
+
+    /// Register a cancellation flag for an upload of `uid` that is about to
+    /// start, returning a guard that deregisters it.
+    ///
+    /// Deregistration is by identity rather than by key: a supersede that
+    /// arrives just as this upload finishes may already have registered the
+    /// *next* upload's flag under the same uid, and removing that one would
+    /// leave the newer upload uncancellable.
+    fn begin_cancellable_upload(&self, uid: &NodeUid) -> UploadCancel {
+        let flag = Arc::new(AtomicBool::new(false));
+        self.upload_cancel.lock().insert(uid.clone(), flag.clone());
+        UploadCancel {
+            registry: self.upload_cancel.clone(),
+            uid: uid.clone(),
+            flag,
+        }
+    }
+
+    /// Tell an upload of `uid` that is on the wire to stop, if there is one.
+    ///
+    /// Called when a newer revision of the file is queued. The upload does not
+    /// stop instantly — it stops when the SDK next asks its reader for bytes,
+    /// which for a 4 MiB block is soon enough to matter and late enough to be
+    /// safe: the staged blob it is reading stays open until it lets go.
+    pub(crate) fn cancel_upload(&self, uid: &NodeUid) {
+        if let Some(flag) = self.upload_cancel.lock().get(uid) {
+            flag.store(true, Ordering::Relaxed);
+            debug!(%uid, "cancelling a superseded upload");
         }
     }
 
@@ -907,15 +1086,37 @@ impl Core {
         let guard =
             self.transfers
                 .begin(&name, meta.uid.clone(), TransferDirection::Upload, meta.len);
-        let reader = CountingReader::new(File::open(&blob)?, &guard);
-        self.rt.block_on(self.client.upload_new_revision_from(
+        // Registered before the first byte moves, so a write that lands while
+        // this is on the wire can stop it rather than paying for a revision the
+        // op it queued will immediately replace.
+        let cancel = self.begin_cancellable_upload(&uid);
+        let reader = CountingReader::new(File::open(&blob)?, &guard).with_cancel(cancel.flag());
+        let started = Instant::now();
+        let sent = self.rt.block_on(self.client.upload_new_revision_from(
             &uid,
             reader,
             meta.len as i64,
             Vec::new(),
             None,
-        ))?;
+        ));
+        let took = started.elapsed();
+        if let Err(e) = sent {
+            if cancel.cancelled() {
+                // Not a failure, and not this op's row to retire: the write that
+                // cancelled us deleted it and took ownership of the staged blob
+                // when it superseded this revision. Leaving the blob alone here
+                // is the whole point — it is either already unlinked or it
+                // belongs to the newer op.
+                info!(%uid, "upload abandoned; a newer write superseded it");
+                return Ok(());
+            }
+            return Err(e.into());
+        }
+        drop(cancel);
         drop(guard);
+        // Only a completed upload times how long this file takes to send, which
+        // is what the next write's debounce is scaled from.
+        self.record_upload_time(&uid, took);
 
         // Retire the op before dropping the blob: a crash between the two leaves
         // an orphaned file (harmless), whereas the reverse would leave a queued
@@ -1411,5 +1612,44 @@ mod tests {
         // No id to prove the revision was ours: fall through to a fork rather
         // than matching None==None.
         assert!(!is_own_self_supersede(true, None, None));
+    }
+}
+
+#[cfg(test)]
+mod debounce_tests {
+    use super::*;
+
+    #[test]
+    fn a_node_never_uploaded_keeps_the_fixed_grace_period() {
+        assert_eq!(adaptive_debounce(None), DRAIN_REVISION_DEBOUNCE);
+    }
+
+    #[test]
+    fn a_fast_upload_does_not_shorten_the_grace_period() {
+        // The 2 seconds are not about upload time at all — they are the window
+        // in which a preallocate-then-write tool supersedes its own first
+        // close. A file that sends in 50 ms must still get them.
+        assert_eq!(
+            adaptive_debounce(Some(Duration::from_millis(50))),
+            DRAIN_REVISION_DEBOUNCE
+        );
+    }
+
+    #[test]
+    fn a_slow_upload_widens_the_grace_period_to_match() {
+        // The case the fixed debounce got wrong: saves arriving faster than the
+        // upload completes, each superseding one already on the wire.
+        assert_eq!(
+            adaptive_debounce(Some(Duration::from_secs(25))),
+            Duration::from_secs(25)
+        );
+    }
+
+    #[test]
+    fn a_pathological_upload_cannot_park_a_node() {
+        assert_eq!(
+            adaptive_debounce(Some(Duration::from_secs(6000))),
+            DRAIN_REVISION_DEBOUNCE_MAX
+        );
     }
 }
