@@ -77,6 +77,19 @@ Schema: **28** — migration V28 adds `sync_entry.local_mtime_ns`.
   and the refusals for symlinks, hard links, device nodes and `chmod` are deliberate — Drive
   cannot represent them, and a local-only representation no other Proton client can read would
   be worse than a clean refusal (B31).
+- Six of this release's fixes were then driven live against the installed 1.8.1 on a real
+  account: the same-second edit uploads (B25), three rapid rewrites of a 64 MiB file publish the
+  third one byte for byte (B32), a write racing a download survives as a conflict copy (B39), an
+  upload torn by a concurrent write heals itself on the following pass (B40), a `getdents64`
+  walk with a 160-byte buffer against a directory mutated between pages returns every entry
+  exactly once (B43), and a restart of a daemon with six mounts and a busy drain stops in 110 ms
+  and comes back at the same thread count (B44). B42 could not be driven from a single machine —
+  see B86 below.
+- One new bug came out of the verification: an on-demand mount serves a folder listing that
+  predates the sync engine's own uploads, so files the mirror pass created are invisible until
+  the folder is switched back (`docs/BUGS.md` B86). Nothing is lost — they are on the server and
+  come back on the next mirror pass — but they cannot be seen or named while the folder is
+  on-demand, which is also what blocks B42's live verification.
 
 ## [1.8.0] — 2026-08-16
 

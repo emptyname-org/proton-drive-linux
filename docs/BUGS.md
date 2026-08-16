@@ -12,13 +12,52 @@ Conventions:
 
 ---
 
+## B86 — An on-demand mount serves a listing that predates the mirror engine's own uploads
+
+**Status:** Open, live-reproduced 2026-08-16 on 1.8.1.
+**Found:** 2026-08-16, while trying to drive B42's remote-delete path from one machine.
+**Where:** `crates/pdfs-fuse/src/sync.rs` upload path (no listing invalidation) meets the cached
+children snapshot the on-demand mount enumerates from.
+
+**Repro.** With folder 6 (`~/pdfs-live-mirror`) in mirror mode: create `c1.txt` and `c2.txt`,
+`pdfs sync now 6` — the activity feed reports `c1.txt new file`, `c2.txt new file` and
+`sync_entry` gains rows carrying real `remote_uid`s. Switch the folder to on-demand and list it:
+
+```
+$ ls ~/pdfs-live-mirror
+b25.txt
+b40.bin          # c1.txt, c2.txt and the conflict copy are missing
+```
+
+`ls ~/pdfs-live-mirror/c1.txt` returns `ENOENT`. Restarting the daemon does not help — the stale
+children snapshot is in the database, not in memory. Switching the folder back to mirror proves
+the files were on the server the whole time: the pass downloads all five, and `b40.bin` comes back
+md5-identical.
+
+**Effect.** No data loss — the mirror side is correct and the files are intact remotely — but a
+user who switches a synced folder to on-demand sees an incomplete folder, and anything that walks
+it (a backup, an indexer, `rm -r`) sees the same incomplete folder. It also blocks B42's live
+verification, because `pdfs rm` cannot name a file the mount will not admit exists.
+
+**Second, smaller gap in the same repro:** `pdfs refresh` and `pdfs ls` reject any path that is
+not under the *primary* mountpoint (`Error: … is not under the mountpoint`), so a secondary
+on-demand mount has no manual escape hatch either.
+
+**Required fix/test:** invalidate (or update) the parent's cached children when the sync engine
+creates a remote node, the same way the FUSE write path does; and let `refresh`/`ls` resolve a
+path under any mount the daemon owns, not just the primary. Test: the repro above, asserting the
+new files appear immediately after the mode switch.
+
+---
+
 ## B84 — A block read that comes back short truncates the file, silently
 
 **Status:** Fixed and **live-verified 2026-08-16**. **Data correctness** — an application reading a large
 file through the mount could get a truncated copy that reported success. The truncation is now
 impossible: a disagreement is repaired from the whole-file download, or the read fails `EIO`.
-Unverified because the repair path has not yet been driven against the three known files on a
-live mount, and the metadata question below is still open.
+Re-verified on 1.8.1 after the release build: `118454731_p0.png`, `121677947_p0.png`,
+`123349685_p0.png` and `128451683_p0.png` each delivered exactly their `stat` size
+(19471492, 11811519, 22055175, 11393178 bytes) with no `Invalid argument` reply in the journal.
 **Found:** 2026-08-16, chasing what looked like log noise. GNOME's file indexer
 (`localsearch-3`) was filling the journal with `libpng error: Read Error`,
 `libpng error: IDAT: CRC error` and `File too small to be a PNG` on files under
@@ -1795,8 +1834,16 @@ suite run against a heavily loaded drain.
 
 ## B25 — Weak Conflict Baseline Detection `(mtime, size)` (HIGH-05)
 
-**Status:** Fixed (unverified) 2026-08-16 — the FUSE-write half was closed by **B69**; the
-mirror half is closed here.  
+**Status:** Fixed and **live-verified 2026-08-16** on 1.8.1 — the FUSE-write half was closed by
+**B69**; the mirror half is closed here.  
+
+**Live verification (2026-08-16, `~/pdfs-live-mirror`, folder 6).** `b25.txt` was written with
+mtime `12:00:10.100000000`, synced (baseline `local_mtime=1786874410`,
+`local_mtime_ns=1786874410100000000`), then rewritten with sixteen different bytes and stamped
+`12:00:10.900000000` — identical whole second, identical length. The next pass classified it as
+locally changed and uploaded `b25.txt new version`; the baseline advanced to
+`…410900000000`, and reading the file back through an on-demand mount of the same folder returned
+`BBBBBBBBBBBBBBBB`. Under the old whole-second comparison this edit was invisible.  
 **Found:** 2026-07-21, multi-agent sync engine audit (`audit_bugs.md` HIGH-05)  
 **Where:** `crates/pdfs-core/src/cache.rs:L157`, `Baseline`
 
@@ -1961,7 +2008,15 @@ that made these look like incidents in the journal.
 
 ## B32 — Race Condition in Concurrent Handle Release and Open (MED-05)
 
-**Status:** Fixed (unverified) 2026-08-16  
+**Status:** Fixed and **live-verified 2026-08-16** on 1.8.1  
+
+**Live verification (2026-08-16).** Three 64 MiB random files were written over the same mount
+path (`ProtonDrive/pdfs-live-20260816/b32.bin`) back to back, each `cp` closing before the next
+began, while the drain was still working. The queue coalesced them into a single op (29 queued =
+28 known-stuck + 1). After the drain retired it, `pdfs refresh` dropped the cached listing and a
+full re-read from Drive returned `4ad41482f5199a401e425381d7621626` — the md5 of the *third*
+write, byte for byte. No open re-used a stale staged base, and the retry warning never had to
+fire.  
 **Found:** 2026-07-21, multi-agent concurrency audit (`audit_bugs.md` MED-05)  
 **Where:** `crates/pdfs-fuse/src/lib.rs:L4042, L4574`
 
@@ -2101,7 +2156,22 @@ pass from being treated as successfully settled.
 
 ## B39 — Sync Download Can Overwrite a Concurrent Local Edit (HIGH-09)
 
-**Status:** Fixed (unverified) 2026-08-16
+**Status:** Fixed and **live-verified 2026-08-16** on 1.8.1
+
+**Live verification (2026-08-16).** Folder 6 was switched to on-demand (evicting its local
+copies) and then back to mirror, which queues a download of the 128 MiB `b40.bin`. Three seconds
+into that download, `RACING-LOCAL-EDIT-B39` was written to the destination path. The pass logged
+
+```
+WARN pdfs_fuse::sync: sync: local file changed while downloading; keeping it as a conflict copy
+  path=/home/narl/pdfs-live-mirror/b40.bin expected=None
+  actual=Some(LocalSig { mtime: 1786916720, mtime_ns: Some(1786916720414151922), size: 21 })
+```
+
+and finished with the remote copy at `b40.bin` and the racing 21 bytes intact at
+`b40 (sync-conflict 1786916794).bin` — which the following pass then uploaded as a file of its
+own. Before the fix the rename would have destroyed those bytes with no trace.
+
 **Found:** 2026-07-22, sync concurrency audit
 **Where:** `crates/pdfs-fuse/src/sync.rs`, download classification and apply path
 
@@ -2136,7 +2206,25 @@ the guard directly instead.
 
 ## B40 — Sync Upload Can Stream Torn Live Content (HIGH-10)
 
-**Status:** Fixed (unverified) 2026-08-16
+**Status:** Fixed and **live-verified 2026-08-16** on 1.8.1
+
+**Live verification (2026-08-16).** A 128 MiB `b40.bin` was dropped into folder 6 and a pass
+forced; six seconds into the upload, sixteen bytes were overwritten at offset 100,000,000. The
+pass logged
+
+```
+WARN pdfs_fuse::sync: sync: file changed while uploading; the remote revision may be torn and
+  will be replaced on the next pass rel="b40.bin"
+  streamed=LocalSig { mtime: 1786916599, mtime_ns: Some(1786916599336211782), size: 134217728 }
+  now=Some(LocalSig { mtime: 1786916605, mtime_ns: Some(1786916605686365985), size: 134217728 })
+```
+
+and — this is the part that matters — recorded the baseline against the *streamed* signature
+(`…599`), not the file on disk. The very next pass therefore read the file as locally changed and
+uploaded `b40.bin new version`. Round-tripping the folder through on-demand and back later
+downloaded the remote copy at md5 `cfb45003003fb2ad50c2c365f8313849` — the post-mutation local
+content, exactly. The torn revision healed itself without anyone asking.
+
 **Found:** 2026-07-22, sync concurrency audit
 **Where:** `crates/pdfs-fuse/src/sync.rs`, upload apply and baseline update
 
@@ -2227,11 +2315,29 @@ the state the engine was asking for. Covered by
 `sync::tests::an_already_absent_path_counts_as_removed`. Unverified because no live sync pass has
 been driven over an externally-deleted file yet.
 
+**Live verification attempted 2026-08-16, blocked.** Driving this needs the *remote* side of a
+mirror folder to lose a file, and a mirror folder's remote lives in the device share, which no
+mountpoint exposes — `pdfs rm` only accepts paths under a mountpoint, and the obvious workaround
+(switch the folder to on-demand, trash the file through its own mount, switch back) runs into
+**B86**: the on-demand mount serves a listing that predates the mirror engine's uploads, so the
+file to be trashed is not visible to `rm` at all. Verifying B42 live therefore needs either a
+second client on the account or B86 fixed first. The ENOENT branch remains covered only by its
+unit test.
+
 ---
 
 ## B43 — FUSE Directory Cookies Are Not Stable (MED-09)
 
-**Status:** Fixed (unverified) 2026-08-16
+**Status:** Fixed and **live-verified 2026-08-16** on 1.8.1
+
+**Live verification (2026-08-16).** A probe opened
+`ProtonDrive/pdfs-live-20260816` (12 files) and called `getdents64` with a 160-byte buffer, so the
+kernel had to page through the listing; between every page it created a new file in the directory
+and unlinked an older one. Three pages, 14 entries returned (12 + `.` + `..`), zero duplicates,
+zero pre-existing entries missed — and none of the files created mid-enumeration appeared, which
+is the frozen snapshot behaving as specified. The same probe against the pre-fix index-cookie
+readdir is what this entry was written about.
+
 **Found:** 2026-07-22, FUSE/POSIX audit
 **Where:** `crates/pdfs-fuse/src/filesystem.rs`, `ProtonFs::serve_readdir`
 
@@ -2267,7 +2373,15 @@ entries between `getdents` calls, asserting no entry is skipped or repeated.
 
 ## B44 — FUSE Background Workers Have No Coordinated Shutdown (MED-10)
 
-**Status:** Fixed (unverified) 2026-08-16
+**Status:** Fixed and **live-verified 2026-08-16** on 1.8.1
+
+**Live verification (2026-08-16).** `systemctl --user restart proton-drive.service` on a daemon
+with six live mounts, a busy drain and 18.4 GiB staged: stop to `Stopped` took 110 ms, the journal
+shows the six unmounts followed by `sync engine stopping` and `daemon stopping`, and systemd never
+reached its SIGKILL timeout. The old PID was gone immediately, and the fresh daemon settled at 42
+threads — the same count the outgoing one had, so no loop was left behind or spawned twice. A
+second restart mid-session behaved identically.
+
 **Found:** 2026-07-22, daemon lifecycle audit
 **Where:** `crates/pdfs-fuse/src/mount.rs`, mount lifecycle; drain/index/sync loops
 
