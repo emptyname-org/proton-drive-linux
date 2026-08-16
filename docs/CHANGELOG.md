@@ -9,6 +9,84 @@ release ships. Migrations are forward-only — a database written by a newer cli
 refuse-to-open, not a downgrade, so rolling back a release means restoring the cache from
 scratch (user data in `staging/` and `recovery/` is never touched by this).
 
+## [1.8.2] — 2026-08-17
+
+Closes the two findings 1.8.1's live verification produced (B85, B86) and finishes the data-safety
+audit entries that had been sitting as "fixed in code, verification pending" since 1.0 (B49–B55).
+No schema change. Schema: **28**.
+
+The read path no longer assumes a revision is a series of 4 MiB blocks; it takes the geometry from
+the revision. The B85 investigation also **contradicted its own bug report** — see Notes, because
+the conclusion recorded there was that reads of such files were losing data, and they were not.
+
+### Fixed
+- A folder switched from mirror to on-demand now shows the files the mirror pass itself uploaded.
+  The sync engine created nodes on the remote without invalidating the parent's cached child
+  listing, and that listing is a database flag rather than an in-memory cache — so it survived a
+  daemon restart, and the files stayed invisible until the folder was switched back. Every remote
+  mutation the engine makes (folder create, file upload, and the three trash paths) now drops the
+  parent's cached listing by uid, which reaches a folder that no mount has resident — the case a
+  mirror folder always is (`docs/BUGS.md` B86).
+- `pdfs ls` and `pdfs refresh` accept a path under any mount the daemon owns, not only the primary
+  one. Both previously answered "is not under the mountpoint" for anything inside a secondary
+  on-demand mount, which left a folder serving a stale listing with no manual way to re-enumerate
+  it. A path under nothing this daemon has mounted still gets the same error as before.
+- A file whose blocks are not 4 MiB is no longer read twice over. Block offsets came from
+  `index * 4 MiB`, so on a revision laid out differently every block the client asked for
+  straddled two of the revision's own, and each was fetched and decrypted to answer for one — then
+  cached at boundaries the next read would not ask about. Offsets now come from the revision's
+  recorded block sizes, and the on-disk cache, the in-memory ring and the in-flight fetch key
+  address a block by the byte range it covers rather than by its index (`docs/BUGS.md` B85).
+
+### Changed
+- The block cache records each block's plaintext start alongside its `(mtime, size)` tag, and each
+  revision's block table in a small sidecar beside its blocks. Blocks cached by an earlier release
+  carry no start; they are honoured wherever the old 4 MiB assumption and the new plan agree on
+  the offset, which is every file this client uploaded — so the existing cache survives the
+  upgrade intact and is quietly refetched only for the files it was placing wrongly.
+
+### Notes
+- **B85's diagnosis was wrong, and the entry has been corrected rather than closed.** It read a
+  set of journal lines as proof that this client was requesting wrong byte ranges and being saved
+  only by B84's repair path. `RevisionReader::read_at` does not work that way: it plans over the
+  revision's real block sizes and clamps every block to the range asked for, identically in the
+  0.6.0 the client builds against and in every earlier version. A read can therefore never return
+  more bytes than it requested — yet every quoted line shows exactly that (`blen=4194304
+  got=4939506`), and the one place in the client that logs that shape can only reach it on the
+  opposite condition. The numbers were either transcribed with two fields swapped or captured from
+  a build not in the history; they want re-capturing from the journal before anything is concluded
+  from them. What was real is the assumption itself, and that is what this release removes — a
+  cost fix, not a correctness one. Nothing here changes what a read returns.
+- The first read of a file still plans on the 4 MiB assumption, and learns the real geometry as a
+  side effect of opening the reader it needs anyway. Resolving a reader merely to *plan* would
+  reintroduce the per-read key derivation the block cache exists to avoid, so the first read of a
+  non-4-MiB file pays one straddling fetch and then self-corrects.
+- Seven data-safety audit entries (B49–B55) moved from "fixed in code, verification pending" to
+  verified. The fixes were all genuinely present and needed no change; what they lacked was the
+  injected-failure testing each entry asked for, and that is what was written — unwritable
+  directories and `chmod 000` subtrees for permission failures, a real `/dev/shm`↔`/tmp` device
+  boundary for the cross-filesystem fallbacks, SQLite's `max_page_count` for a full disk, an abort
+  trigger for a failed insert, and truncated and unpublished sidecars for the crash boundaries.
+  Two seams were added to make failure arrangeable at all: `stage_write_at`, mirroring the
+  `preserve_write_at` that already existed, and `walk_local_tree` lifted out of the sync engine so
+  the local scan can be driven against a real tree without a daemon.
+- **Two of those entries are not fully closed, and say so.** B51 and B52 concern crash consistency,
+  and nothing short of a machine actually losing power tests that; the crash *boundaries* are
+  covered by reconstructing on disk exactly what a crash at each point leaves. B54 also diverges
+  from its required fix on purpose: it has no "deliberate delete" confirmation path, so a total
+  local wipe is refused outright rather than offered for confirmation. That is stricter than asked
+  for, and the cost is that a user who really did delete everything must remove and re-add the
+  sync folder.
+- B86's fix routes only `ls` and `refresh` to the owning mount. The other path-addressed control
+  requests — pin, rename, move, delete, sharing — still resolve against the primary mount only.
+  That is a larger change and was not what blocked the repro; it is recorded as an open follow-up
+  (`docs/BUGS.md` B88).
+- Three findings were opened rather than fixed: the geometry above is learned one read late, so a
+  non-4-MiB file pays a single wasted fetch on its first read (B87); the remaining path-addressed
+  control requests are still primary-only (B88); and the container-level `CLAUDE.md` still
+  describes the SDK dependency as 0.1.11 when 1.7.1 bumped it to 0.6.0, which is what sent the
+  B85 investigation to the wrong source tree to begin with (B89).
+
 ## [1.8.1] — 2026-08-16
 
 Some files read short through the mount and reported success — an application got a truncated
@@ -361,6 +439,9 @@ First stable release: FUSE files-on-demand mount, sync daemon under `proton-driv
 - The outstanding FUSE defects tracked in `docs/BUGS.md`, plus a truncate defect, validated
   by a new POSIX compliance suite for the filesystem.
 
+[1.8.2]: https://github.com/narrrl/proton-drive-linux/releases/tag/v1.8.2
+[1.8.1]: https://github.com/narrrl/proton-drive-linux/releases/tag/v1.8.1
+[1.8.0]: https://github.com/narrrl/proton-drive-linux/releases/tag/v1.8.0
 [1.7.1]: https://github.com/narrrl/proton-drive-linux/releases/tag/v1.7.1
 [1.7.0]: https://github.com/narrrl/proton-drive-linux/releases/tag/v1.7.0
 [1.6.0]: https://github.com/narrrl/proton-drive-linux/releases/tag/v1.6.0

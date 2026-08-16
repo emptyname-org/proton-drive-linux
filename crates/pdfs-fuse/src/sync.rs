@@ -525,6 +525,9 @@ impl Core {
                 continue;
             }
             trashed.push(rel.clone());
+            if let Some(parent) = parent_uid_of(rel, &remote_dirs, &baseline) {
+                self.invalidate_children_of(&parent);
+            }
             let _ = self.db.sync_entry_remove(folder_id, rel);
             self.log_activity(
                 ActivityKind::Trash,
@@ -777,6 +780,9 @@ impl Core {
                         outcome.errors += 1;
                         continue;
                     }
+                    if let Some(parent) = parent_uid_of(rel, &remote_dirs, &baseline) {
+                        self.invalidate_children_of(&parent);
+                    }
                     let _ = self.db.sync_entry_remove(folder_id, rel);
                     self.log_activity(
                         ActivityKind::Trash,
@@ -832,6 +838,9 @@ impl Core {
                 outcome.errors += 1;
                 continue;
             }
+            if let Some(parent) = parent_uid_of(&rel, &remote_dirs, &baseline) {
+                self.invalidate_children_of(&parent);
+            }
             let _ = self.db.sync_entry_remove(folder_id, &rel);
             self.log_activity(
                 ActivityKind::Trash,
@@ -857,70 +866,9 @@ impl Core {
         writing: &HashSet<PathBuf>,
         out: &mut HashMap<String, LocalItem>,
     ) -> Result<(), String> {
-        let entries = std::fs::read_dir(dir).map_err(|e| format!("read {}: {e}", dir.display()))?;
-        for entry in entries {
-            let entry = entry.map_err(|e| format!("read entry in {}: {e}", dir.display()))?;
-            let path = entry.path();
-            let meta = std::fs::symlink_metadata(&path)
-                .map_err(|e| format!("stat {}: {e}", path.display()))?;
-            let stripped = path.strip_prefix(root).map_err(|e| {
-                format!(
-                    "local path {} escaped sync root {}: {e}",
-                    path.display(),
-                    root.display()
-                )
-            })?;
-            let rel = stripped.to_str().ok_or_else(|| {
-                format!(
-                    "local path {} is not valid UTF-8; refusing a destructive sync pass",
-                    path.display()
-                )
-            })?;
-            // Ignore our own in-flight download temp files.
-            if rel.contains(".pdfs-tmp-") {
-                continue;
-            }
-            // Ignored paths are dropped here as well as from the classification
-            // union — not for correctness (the union filter is what makes this
-            // safe) but so an ignored `node_modules/` is never descended into or
-            // counted against scan progress.
-            if rules.is_ignored(rel, meta.is_dir()) {
-                continue;
-            }
-            if meta.is_dir() {
-                out.insert(
-                    rel.to_string(),
-                    LocalItem {
-                        is_dir: true,
-                        mtime: 0,
-                        mtime_ns: None,
-                        size: 0,
-                        open_for_write: false,
-                    },
-                );
-                self.progress_scanned(folder_id, base_name(rel));
-                self.walk_local(folder_id, root, &path, rules, writing, out)?;
-            } else if meta.is_file() {
-                // Check whether any process holds this file open for writing.
-                // The canonical path is used because /proc/*/fd links resolve
-                // to canonical targets.
-                let ofw = std::fs::canonicalize(&path)
-                    .map(|canon| writing.contains(&canon))
-                    .unwrap_or(false);
-                out.insert(
-                    rel.to_string(),
-                    LocalItem {
-                        is_dir: false,
-                        mtime: system_mtime(&meta),
-                        mtime_ns: system_mtime_ns(&meta),
-                        size: meta.len() as i64,
-                        open_for_write: ofw,
-                    },
-                );
-                self.progress_scanned(folder_id, base_name(rel));
-            }
-        }
-        Ok(())
+        walk_local_tree(root, dir, rules, writing, out, &mut |rel| {
+            self.progress_scanned(folder_id, base_name(rel))
+        })
     }
 
     /// Map every remote folder under `folder` to its uid by rel path, ignoring
@@ -1186,6 +1134,9 @@ impl Core {
                     .create_folder(parent, base_name(rel), Some(now_secs()))
                     .await
                     .map_err(|e| format!("create remote folder {rel}: {e}"))?;
+                // The parent has gained a child that no cached listing of it
+                // knows about (B86).
+                self.invalidate_children_of(parent);
                 self.baseline_dir(folder_id, rel, &uid)?;
                 Ok(Applied::Dir(rel.clone(), uid))
             }
@@ -1295,6 +1246,10 @@ impl Core {
             )
             .await
             .map_err(|e| format!("upload {rel}: {e}"))?;
+        // The parent has gained a child that no cached listing of it knows
+        // about. Without this, a folder later switched to on-demand serves a
+        // snapshot that predates this upload (B86).
+        self.invalidate_children_of(parent);
         warn_if_torn(rel, &path, streamed);
         self.record_file_baseline(folder_id, rel, Some(streamed), &uid)
             .await
@@ -1546,6 +1501,95 @@ fn removed_locally(result: std::io::Result<()>) -> std::io::Result<()> {
     }
 }
 
+/// The body of [`Core::walk_local`], without a `Core`: recursively collect the
+/// local tree under `dir` into `out`, reporting each entry to `scanned`.
+///
+/// **Every failure here is fatal to the pass, deliberately.** A `read_dir` that
+/// fails, an entry that cannot be stat-ed, a name that is not UTF-8 — each of
+/// them would, if skipped, leave `out` describing a *smaller* tree than the one
+/// on disk. Reconciliation reads a path present in the baseline and absent from
+/// the scan as "the user deleted this", and propagates that to Drive. So an
+/// unreadable subdirectory would trash its remote counterpart, and the deeper
+/// the failure, the more it takes with it (`docs/BUGS.md` B55). Refusing the
+/// whole pass keeps the previous baseline and leaves the remote alone; the next
+/// pass retries once the transient condition clears.
+///
+/// Split out from the method so exactly that can be tested against a real tree
+/// with a real unreadable directory in it, which needs no `Core` at all.
+fn walk_local_tree(
+    root: &Path,
+    dir: &Path,
+    rules: &IgnoreRules,
+    writing: &HashSet<PathBuf>,
+    out: &mut HashMap<String, LocalItem>,
+    scanned: &mut dyn FnMut(&str),
+) -> Result<(), String> {
+    let entries = std::fs::read_dir(dir).map_err(|e| format!("read {}: {e}", dir.display()))?;
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("read entry in {}: {e}", dir.display()))?;
+        let path = entry.path();
+        let meta = std::fs::symlink_metadata(&path)
+            .map_err(|e| format!("stat {}: {e}", path.display()))?;
+        let stripped = path.strip_prefix(root).map_err(|e| {
+            format!(
+                "local path {} escaped sync root {}: {e}",
+                path.display(),
+                root.display()
+            )
+        })?;
+        let rel = stripped.to_str().ok_or_else(|| {
+            format!(
+                "local path {} is not valid UTF-8; refusing a destructive sync pass",
+                path.display()
+            )
+        })?;
+        // Ignore our own in-flight download temp files.
+        if rel.contains(".pdfs-tmp-") {
+            continue;
+        }
+        // Ignored paths are dropped here as well as from the classification
+        // union — not for correctness (the union filter is what makes this
+        // safe) but so an ignored `node_modules/` is never descended into or
+        // counted against scan progress.
+        if rules.is_ignored(rel, meta.is_dir()) {
+            continue;
+        }
+        if meta.is_dir() {
+            out.insert(
+                rel.to_string(),
+                LocalItem {
+                    is_dir: true,
+                    mtime: 0,
+                    mtime_ns: None,
+                    size: 0,
+                    open_for_write: false,
+                },
+            );
+            scanned(rel);
+            walk_local_tree(root, &path, rules, writing, out, scanned)?;
+        } else if meta.is_file() {
+            // Check whether any process holds this file open for writing.
+            // The canonical path is used because /proc/*/fd links resolve
+            // to canonical targets.
+            let ofw = std::fs::canonicalize(&path)
+                .map(|canon| writing.contains(&canon))
+                .unwrap_or(false);
+            out.insert(
+                rel.to_string(),
+                LocalItem {
+                    is_dir: false,
+                    mtime: system_mtime(&meta),
+                    mtime_ns: system_mtime_ns(&meta),
+                    size: meta.len() as i64,
+                    open_for_write: ofw,
+                },
+            );
+            scanned(rel);
+        }
+    }
+    Ok(())
+}
+
 /// Publish a conflict copy without overwriting an earlier conflict bearing the
 /// same timestamp. The original is removed only after the new copy is durable.
 fn preserve_conflict_copy(path: &Path, stamp: i64) -> std::io::Result<PathBuf> {
@@ -1577,6 +1621,26 @@ fn preserve_conflict_copy(path: &Path, stamp: i64) -> std::io::Result<PathBuf> {
         return Ok(conflict);
     }
     unreachable!("u32 conflict suffix space exhausted")
+}
+
+/// The remote uid of `rel`'s parent folder: from the pass's folder-uid map
+/// first, and from the baseline second for a parent the map never covered.
+///
+/// Used to name the folder whose cached listing a remote mutation has just
+/// invalidated (B86). `None` is not an error — it only means this pass cannot
+/// say which folder to invalidate, and the caller skips it.
+fn parent_uid_of(
+    rel: &str,
+    remote_dirs: &HashMap<String, NodeUid>,
+    baseline: &HashMap<String, StoredSyncEntry>,
+) -> Option<NodeUid> {
+    let parent = parent_rel(rel);
+    remote_dirs.get(parent).cloned().or_else(|| {
+        baseline
+            .get(parent)
+            .and_then(|e| e.remote_uid.as_deref())
+            .and_then(parse_uid)
+    })
 }
 
 fn sync_parent_dir(path: &Path) -> std::io::Result<()> {
@@ -1925,6 +1989,44 @@ mod tests {
         assert!(guard_local_wipe(&base, &fresh).is_err());
     }
 
+    /// B54's remaining case, end to end: a folder whose local root is still
+    /// *readable* but is no longer the tree it was — an empty directory left
+    /// where a mount used to be, or a different device mounted over it.
+    ///
+    /// Nothing fails here. The scan succeeds and honestly reports an empty
+    /// directory, so the only thing standing between the user and a trashed
+    /// remote folder is the guard, and it has to fire for a one-file baseline
+    /// exactly as it does for a large one.
+    #[test]
+    fn a_replaced_mountpoint_trips_the_guard_at_every_baseline_size() {
+        let root = sync_test_dir("wipe-replaced-mount");
+        let rules = rules_for(&[]);
+        let writing = HashSet::new();
+        let mut local: HashMap<String, LocalItem> = HashMap::new();
+        let mut progress = no_progress();
+        walk_local_tree(&root, &root, &rules, &writing, &mut local, &mut progress).unwrap();
+        assert!(local.is_empty(), "the replacement root is genuinely empty");
+
+        for size in 1..=3 {
+            let baseline: HashMap<String, ()> =
+                (0..size).map(|i| (format!("file{i}.txt"), ())).collect();
+            assert!(
+                guard_local_wipe(&filter_baseline(&baseline, &rules), &local).is_err(),
+                "a {size}-path baseline against an empty root is not a deletion"
+            );
+        }
+
+        // And the guard steps aside the moment the real tree is back, so a
+        // remounted folder resumes rather than staying wedged.
+        std::fs::write(root.join("file0.txt"), b"back").unwrap();
+        let mut local: HashMap<String, LocalItem> = HashMap::new();
+        walk_local_tree(&root, &root, &rules, &writing, &mut local, &mut progress).unwrap();
+        let baseline: HashMap<String, ()> = [("file0.txt".to_string(), ())].into_iter().collect();
+        assert!(guard_local_wipe(&filter_baseline(&baseline, &rules), &local).is_ok());
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
     /// A restored folder (features.md 5.2) starts with an empty baseline against
     /// an empty local directory and a full remote. That must reconcile as
     /// "download everything" rather than tripping the wipe guard — otherwise
@@ -2124,6 +2226,204 @@ mod tests {
         assert!(source.is_dir(), "failure must not remove the source");
         assert!(!conflict_path(&source, 1700).exists());
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// B49's remaining cases. Preservation is the step that makes a download
+    /// safe to publish, so every way it can fail has to leave the local file
+    /// where it was — the download is aborted, not the file replaced.
+    #[test]
+    fn conflict_preservation_failures_all_keep_the_local_file() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        // An unwritable directory: the conflict copy cannot be created at all.
+        let dir = sync_test_dir("conflict-eacces");
+        let source = dir.join("notes.txt");
+        std::fs::write(&source, b"the only copy").unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let denied = preserve_conflict_copy(&source, 1700);
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(denied.is_err(), "a read-only directory must fail the copy");
+        assert_eq!(
+            std::fs::read(&source).unwrap(),
+            b"the only copy",
+            "the local file survives byte-identical"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        // A source that vanished between planning and preservation. The pass
+        // must report it rather than publish the download over the gap.
+        let dir = sync_test_dir("conflict-enoent");
+        assert!(preserve_conflict_copy(&dir.join("gone.txt"), 1700).is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        // A write error partway through the copy — induced by making the
+        // destination name a directory, so `create_new` fails as something
+        // other than `AlreadyExists`.
+        let dir = sync_test_dir("conflict-eisdir");
+        let source = dir.join("notes.txt");
+        std::fs::write(&source, b"still the only copy").unwrap();
+        std::fs::create_dir(conflict_path(&source, 1700)).unwrap();
+        // Suffix 0 is taken by a directory; `create_new` on it reports
+        // `AlreadyExists`, so preservation moves on to suffix 1 and succeeds.
+        // What must not happen is the source being removed without a copy.
+        let preserved = preserve_conflict_copy(&source, 1700).unwrap();
+        assert!(preserved.is_file());
+        assert_eq!(std::fs::read(&preserved).unwrap(), b"still the only copy");
+        assert!(!source.exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A conflict copy keeps the bytes *and* the metadata that identifies them,
+    /// so the next pass uploads the user's version rather than a file that looks
+    /// freshly written.
+    #[test]
+    fn a_conflict_copy_is_byte_and_mtime_identical() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = sync_test_dir("conflict-identity");
+        let source = dir.join("notes.txt");
+        std::fs::write(&source, b"local edit that must survive").unwrap();
+        let before = std::fs::metadata(&source).unwrap();
+
+        let preserved = preserve_conflict_copy(&source, 1700).unwrap();
+        let after = std::fs::metadata(&preserved).unwrap();
+
+        assert_eq!(
+            std::fs::read(&preserved).unwrap(),
+            b"local edit that must survive"
+        );
+        assert_eq!(after.len(), before.len());
+        assert_eq!(after.modified().unwrap(), before.modified().unwrap());
+        assert_eq!(after.permissions().mode(), before.permissions().mode());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // ---- B55: an incomplete local scan is never a set of deletions ---------
+
+    fn no_progress() -> impl FnMut(&str) {
+        |_: &str| {}
+    }
+
+    /// A directory the pass cannot read must fail the pass. Omitting it would
+    /// hand reconciliation a baseline-minus-subtree, which it reads as the user
+    /// having deleted that subtree and propagates to Drive (B55).
+    #[test]
+    fn an_unreadable_subdirectory_fails_the_scan_instead_of_shrinking_it() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = sync_test_dir("scan-eacces");
+        std::fs::write(root.join("keep.txt"), b"a").unwrap();
+        let locked = root.join("locked");
+        std::fs::create_dir(&locked).unwrap();
+        std::fs::write(locked.join("inner.txt"), b"b").unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let rules = rules_for(&[]);
+        let writing = HashSet::new();
+        let mut out = HashMap::new();
+        let mut progress = no_progress();
+        let result = walk_local_tree(&root, &root, &rules, &writing, &mut out, &mut progress);
+
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::remove_dir_all(&root).unwrap();
+
+        let error = result.expect_err("an unreadable directory must abort the pass");
+        assert!(
+            error.contains("locked"),
+            "the error should name the subtree it could not read: {error}"
+        );
+    }
+
+    /// The same rule one level up: if the sync root itself cannot be read, the
+    /// pass sees nothing, and "nothing" must never mean "delete everything".
+    #[test]
+    fn an_unreadable_root_fails_the_scan() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = sync_test_dir("scan-root-eacces");
+        std::fs::write(root.join("keep.txt"), b"a").unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let rules = rules_for(&[]);
+        let writing = HashSet::new();
+        let mut out = HashMap::new();
+        let mut progress = no_progress();
+        let result = walk_local_tree(&root, &root, &rules, &writing, &mut out, &mut progress);
+
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::remove_dir_all(&root).unwrap();
+
+        assert!(result.is_err());
+        assert!(out.is_empty());
+    }
+
+    /// A root that is gone entirely — an unmounted device folder, a removed
+    /// directory — is the sharpest version of the same case: every baseline path
+    /// is "missing", and the scan must refuse rather than report an empty tree.
+    #[test]
+    fn an_absent_root_fails_the_scan() {
+        let root = sync_test_dir("scan-absent");
+        std::fs::remove_dir_all(&root).unwrap();
+
+        let rules = rules_for(&[]);
+        let writing = HashSet::new();
+        let mut out = HashMap::new();
+        let mut progress = no_progress();
+        assert!(walk_local_tree(&root, &root, &rules, &writing, &mut out, &mut progress).is_err());
+        assert!(out.is_empty());
+    }
+
+    /// A name that is not valid UTF-8 cannot be keyed into the scan, so it
+    /// cannot be compared against the baseline either. Refusing the pass is the
+    /// only safe reading: skipping it would classify the file as deleted.
+    #[test]
+    fn a_non_utf8_name_fails_the_scan() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let root = sync_test_dir("scan-non-utf8");
+        std::fs::write(root.join(OsStr::from_bytes(b"bad\xffname")), b"x").unwrap();
+
+        let rules = rules_for(&[]);
+        let writing = HashSet::new();
+        let mut out = HashMap::new();
+        let mut progress = no_progress();
+        let result = walk_local_tree(&root, &root, &rules, &writing, &mut out, &mut progress);
+        std::fs::remove_dir_all(&root).unwrap();
+
+        let error = result.expect_err("a name the scan cannot key must abort the pass");
+        assert!(error.contains("UTF-8"), "{error}");
+    }
+
+    /// The complement: a scan that *can* read everything reports everything, so
+    /// the strictness above does not come at the cost of a working pass. A
+    /// symlink is skipped by design rather than by failure, and a dangling one
+    /// stats fine through `symlink_metadata`.
+    #[test]
+    fn a_readable_tree_scans_completely() {
+        let root = sync_test_dir("scan-complete");
+        std::fs::write(root.join("a.txt"), b"aa").unwrap();
+        std::fs::create_dir(root.join("sub")).unwrap();
+        std::fs::write(root.join("sub/b.txt"), b"bbb").unwrap();
+        std::os::unix::fs::symlink("nowhere", root.join("dangling")).unwrap();
+
+        let rules = rules_for(&[]);
+        let writing = HashSet::new();
+        let mut out = HashMap::new();
+        let mut seen: Vec<String> = Vec::new();
+        let result = walk_local_tree(&root, &root, &rules, &writing, &mut out, &mut |rel| {
+            seen.push(rel.to_string())
+        });
+        std::fs::remove_dir_all(&root).unwrap();
+
+        result.unwrap();
+        let mut keys: Vec<&str> = out.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, vec!["a.txt", "sub", "sub/b.txt"]);
+        assert_eq!(out["a.txt"].size, 2);
+        assert_eq!(out["sub/b.txt"].size, 3);
+        assert!(out["sub"].is_dir);
+        assert_eq!(seen.len(), 3, "every reported entry ticks scan progress");
     }
 
     fn sync_test_dir(label: &str) -> PathBuf {

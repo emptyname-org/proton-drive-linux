@@ -12,9 +12,93 @@ Conventions:
 
 ---
 
+## B89 — The recorded SDK dependency is three minor versions out of date in the working memory
+
+**Status:** Open — documentation only, but it misdirects every reader of the SDK code.
+**Found:** 2026-08-17, while checking B85's evidence against the reader implementation.
+**Where:** `proton-dev/CLAUDE.md` (the container-level file, not in this repo).
+
+`CLAUDE.md` states that `proton-drive-linux/Cargo.toml` declares `proton-sdk = "0.1"` /
+`proton-drive-rs = "0.1"` and that `Cargo.lock` pins **0.1.11** from the registry, against a local
+`proton-sdk-rs/` at 0.1.12. Neither half is true any more: the lock pins **0.6.0**, bumped by
+1.7.1 (see its changelog entry, "Workspace deps bumped to `proton-sdk` / `proton-drive-rs` 0.6.0")
+and never reflected in the working memory.
+
+**Why it matters beyond tidiness.** The whole point of that section is to tell you which source
+you are reasoning about when you read SDK code. Verifying B85 meant establishing what `read_at`
+does in the version the client actually builds against; following `CLAUDE.md` sends you to
+`proton-drive-rs-0.1.11` in the registry cache, and to a local checkout described as one patch
+ahead of it when it is in fact five minor versions behind. The conclusion happened to be the same
+in every version — but that was luck, and the next question of this shape may not be.
+
+**Fix:** correct the versions, and prefer describing where to *look* (`grep -A2 'name =
+"proton-drive-rs"' Cargo.lock`) over restating a number that goes stale on every dependency bump.
+
+---
+
+## B88 — `pdfs pin`, `rename`, `move`, `delete` and sharing still cannot name a path under a secondary mount
+
+**Status:** Open — B86's fix covers `ls` and `refresh` only.
+**Found:** 2026-08-17, while fixing B86.
+**Where:** `crates/pdfs-fuse/src/control.rs`, every handler still calling `rel_to_mount`.
+
+B86's second half added `Core::rooted_at` and `control.rs::route_to_mount`, which resolve a path
+against whichever mount the daemon owns it under and answer the request in that mount's inode
+space. Only `ListDir` and `RefreshScope::Dir` were routed through it, because those two were what
+the B86 repro needed: an escape hatch for a folder serving a stale listing.
+
+Every other path-addressed control request — `Pin`, `Unpin`, `Rename`, `Move`, `Delete`,
+`CreateFolder`, `OpenFile`, the sharing and public-link requests, `ListRevisions` — still uses the
+primary-only `rel_to_mount`, so an absolute path inside a secondary on-demand mount is rejected
+with "is not under the mountpoint". The user can now *see* such a folder's contents and cannot act
+on them by path.
+
+**Why it was left.** Routing a mutating request is not the same change as routing a read. Each of
+those handlers resolves an inode, checks access, performs a remote operation and then invalidates
+local state, and several of them invalidate `self.state()` — the primary — explicitly. Routing
+them means auditing each for which mount's state it is really talking about, which is a larger and
+riskier change than the one B86 needed. Doing it half-way would be worse than not doing it.
+
+**Required fix/test:** move the remaining handlers onto `route_to_mount`, auditing each for
+per-mount state assumptions as it goes; the `for_each_state`/uid-keyed helpers are the pattern for
+the ones that touch more than their own inode space. Test: a `pdfs pin` and a `pdfs rename` by
+absolute path inside a secondary on-demand mount, plus a path under no mount still erroring.
+
+---
+
+## B87 — A revision's block geometry is learned a read too late
+
+**Status:** Open — a bounded, self-correcting cost, accepted deliberately in 1.8.2.
+**Found:** 2026-08-17, while fixing B85. This is the residue that fix leaves.
+**Where:** `crates/pdfs-fuse/src/reads.rs` (`Core::block_geometry`, `read_block`).
+
+B85's fix takes block boundaries from the revision instead of assuming 4 MiB. The geometry comes
+from `RevisionReader::block_sizes()`, and a reader is expensive to open — link details, ancestor
+keys, an S2K node-key unlock and the block table, which is exactly the per-read work the block
+cache exists to avoid (B12). So the geometry is *learned* as a side effect of the first read,
+which has to open a reader anyway, and written to a `<key>.geom` sidecar for later reads.
+
+The first read of a file therefore still plans on `BlockGeometry::uniform`. On a file whose blocks
+are not 4 MiB that plan is wrong, and it costs exactly one straddling fetch: the reader fetches
+two of the revision's blocks to answer for one client block, and the block written to the cache is
+at an offset the *next* read — now planning correctly — will not ask for, so it ages out unused.
+Every read after the first is right.
+
+**Why it is not being fixed now.** The alternatives are all worse than the cost. Resolving a
+reader before planning reintroduces B12's per-read key derivation on every file. Persisting the
+geometry at upload only covers files this client wrote, which are the ones the fallback is already
+correct for. Fetching the block table alone still costs the node-key unlock.
+
+**Worth doing if:** non-4-MiB revisions turn out to be common on real accounts rather than a
+handful of files on one, or if the block table becomes reachable without unlocking the node key.
+Measure before deciding — one wasted fetch per file per revision is not obviously worth paying
+anything to remove.
+
+---
+
 ## B86 — An on-demand mount serves a listing that predates the mirror engine's own uploads
 
-**Status:** Open, live-reproduced 2026-08-16 on 1.8.1.
+**Status:** Fixed in code (2026-08-17); live re-run of the repro pending.
 **Found:** 2026-08-16, while trying to drive B42's remote-delete path from one machine.
 **Where:** `crates/pdfs-fuse/src/sync.rs` upload path (no listing invalidation) meets the cached
 children snapshot the on-demand mount enumerates from.
@@ -47,6 +131,35 @@ on-demand mount has no manual escape hatch either.
 creates a remote node, the same way the FUSE write path does; and let `refresh`/`ls` resolve a
 path under any mount the daemon owns, not just the primary. Test: the repro above, asserting the
 new files appear immediately after the mode switch.
+
+### Fix (2026-08-17)
+
+Two halves, matching the two halves of the report.
+
+**The stale listing.** `Core::invalidate_children_of` (`pdfs-fuse/src/lib.rs`) drops a folder's
+cached children *by uid*. The existing `invalidate_parent_listing` could not serve here for two
+reasons: it names the folder by inode, and a mirror folder has no inode space at all at the moment
+the engine writes to it; and the listing that outlived the pass was not a hot-cache map but the
+`listed` flag on the folder's DB row — which is why restarting the daemon did not help. The new
+helper clears that flag unconditionally and then invalidates whichever mounts happen to hold the
+folder resident. The sync engine calls it after every remote mutation it makes: folder creation
+and file upload (`apply_one`, `upload_new`), and the three remote-trash sites, whose parent uid
+comes from the pass's folder-uid map or the baseline (`parent_uid_of`).
+
+**The missing escape hatch.** `StateRegistry` now carries each mount's `size_upgrades` map as well
+as its state, notifier and liveness flag — that set is exactly the per-mount half of a `Core`
+(everything `fork_state` replaces) — and `StateRegistry::covering_parts` returns it for the mount
+that most specifically covers a path. `Core::rooted_at` swaps those fields into a clone of the
+`Core`, giving a view rooted at the owning mount plus the path relative to *its* root. `pdfs ls`
+and `pdfs refresh` route through it (`control.rs::route_to_mount`), so a secondary on-demand mount
+can be named at last; a path under nothing this daemon has mounted still gets the familiar "is not
+under the mountpoint" error. The other path-addressed control requests deliberately still use the
+primary-only `rel_to_mount` — routing the mutating ones is a larger change and was not what
+blocked the repro.
+
+Test: `covering_parts_route_a_path_to_the_mount_that_owns_it` covers the routing rule (nested
+mount wins, suffix relative to it, its own inode space and upgrade batches, a path under no mount
+routes nowhere). The listing-invalidation half is the live repro, which is what is still pending.
 
 ---
 
@@ -166,7 +279,9 @@ download on first read.
 
 ## B85 — The read path assumes 4 MiB blocks; some revisions do not have them
 
-**Status:** Open — **data correctness**, currently masked by B84's repair path
+**Status:** Fixed in code (2026-08-17) — the geometry now comes from the revision. See
+"Correction to the diagnosis" below: the premise that this was *losing* data does not survive
+reading the SDK, and the fix is a cost fix, not a correctness one.
 **Found:** 2026-08-16, while live-verifying B84 (see its journal evidence)
 **Where:** `crates/pdfs-fuse/src/reads.rs`, `crates/pdfs-core/src/cache.rs` (`BLOCK_SIZE`,
 `block_len`)
@@ -209,6 +324,65 @@ client's chunk size; these are *not* uniform (5239804, 5670228, 5233034), which 
 size recorded per block after some transformation. Worth answering before choosing the fix, since
 "blocks are whatever the revision says" and "blocks are a different constant" lead to different
 designs.
+
+### Correction to the diagnosis (2026-08-17)
+
+**The logged numbers cannot have come from `read_at`, and the "this client asks for the wrong
+range" reading is wrong.** `RevisionReader::read_at(offset, length)` does not assume any geometry:
+it computes `end = min(offset + length, file_size)`, plans over the *real* block sizes
+(`plan_blocks`), and splices each block clamped to `[offset, end)` (`splice_block`). Both are
+present and identical in the version the client actually builds against — `Cargo.lock` pins
+`proton-drive-rs` **0.6.0**, not the 0.1.11 the top-level `CLAUDE.md` still describes — and in
+0.1.11 as well. So a `read_at(bstart, blen)` can return at most `blen` bytes, and every quoted
+line has `got > blen`:
+
+```
+bidx=0 blen=4194304 got=4939506     # got exceeds the length requested
+bidx=1 blen=4194304 got=5670228     # …as does this one
+```
+
+The only site in the client that logs this shape (`reads.rs`, the `blen`/`got`/`fsize` warning)
+reaches it solely on the `bytes.len() != blen` branch of a `read_at(bstart, blen)`. Those two
+facts cannot both hold. Either the numbers were transcribed with `blen` and `got` swapped, or they
+came from a build that is not in the history. **This wants re-capturing from the journal before
+anything is concluded from it** — and in particular, the entry's claim that B84's repair path is
+"currently masking data loss" here is not supported.
+
+What *is* true, and is what got fixed: the client assumed the geometry. `idx * BLOCK_SIZE` and
+`block_len(size, idx)` encoded "4 MiB blocks with a remainder" in the range planner, the in-memory
+ring, the in-flight fetch key and the on-disk block cache. When a revision is not shaped that way,
+nothing breaks — but every client block straddles two server blocks, so the reader fetches and
+decrypts two to answer for one, and the block written to disk lines up with nothing the next read
+asks for. That is a real and unbounded cost on exactly the files the entry found, and it defeats
+the property the block cache was built around.
+
+### Fix (2026-08-17)
+
+`BlockGeometry` (`pdfs-core/src/cache.rs`) is a prefix sum over a revision's block sizes, with
+`BlockGeometry::uniform(size)` reproducing the old constant-block arithmetic exactly. Blocks are
+now addressed by `BlockSpan { idx, start, len }` rather than by index, everywhere: the range
+planner (`spans(offset, end)`), the in-memory ring, the in-flight-fetch key, and the on-disk block
+cache. The span is the identity because the index alone stopped naming one byte range — block 1
+under the fallback and block 1 under the real geometry are different bytes — so the block
+sidecar records the block's plaintext `start` and a re-planned read misses rather than being
+served the wrong offset. Sidecars written before that field existed read as "wherever the 4 MiB
+assumption put it", which keeps the existing cache intact for every file this client uploaded.
+
+The geometry itself is learned as a side effect of the first read (which has to open a
+`RevisionReader` anyway) and written to a `<key>.geom` sidecar under the block cache;
+`Core::block_geometry` reads it back and falls back to `uniform` when it is absent. Resolving a
+reader just to *plan* would reintroduce the per-read key derivation the block cache exists to
+avoid (B12), so the first read of a file still plans on the fallback and self-corrects. A recorded
+table whose sizes do not sum to the node's size is refused outright, and eviction takes the
+geometry with the blocks it describes.
+
+The open question above is still open, and no longer blocks anything: "blocks are whatever the
+revision says" is now what the code does, so a different constant is just another table.
+
+Tests: `the_uniform_geometry_is_the_old_block_arithmetic`,
+`a_non_uniform_geometry_places_blocks_by_prefix_sum` (built on the exact sizes from the log
+above), `a_cached_block_is_not_served_to_a_different_geometry`,
+`a_recorded_geometry_is_returned_only_for_the_revision_it_describes`.
 
 ---
 
@@ -2611,7 +2785,8 @@ reused, making a session-long tombstone safe.
 
 ## B49 — Failed Conflict Preservation Still Overwrites the Local File (CRIT-05)
 
-**Status:** Fixed in code with deterministic regressions; live/fault verification pending
+**Status:** Fixed, with the injected-failure suite the entry asked for (2026-08-17). Only the
+end-to-end live conflict remains unexercised.
 **Found:** 2026-07-22, 1.0 data-safety audit
 **Where:** `crates/pdfs-fuse/src/sync.rs`, download/conflict handling
 
@@ -2624,11 +2799,23 @@ use collision-resistant names. Test existing names, permissions, `ENOSPC`,
 `EIO`, and cross-filesystem behavior. This is B39's failure path; B25 remains
 the separate weak-baseline problem.
 
+**Verification (2026-08-17).** `preserve_conflict_copy` was already correct — it copies to a
+`create_new` destination, syncs data and directory, and removes the source last, so every failure
+returns `Err` and `apply_one` never reaches the download. What was missing was proof, so:
+`conflict_preservation_failures_all_keep_the_local_file` drives an unwritable directory
+(`EACCES`), a source that vanished between planning and preservation (`ENOENT`), and a destination
+name already taken by a directory — and asserts the local file is still there, byte-identical,
+after each. `a_conflict_copy_is_byte_and_mtime_identical` covers the other half: the copy carries
+the bytes, mtime and mode, so the next pass uploads the user's version rather than something that
+looks freshly written. The existing collision test covers the suffix search.
+
+Not covered: a genuine `ENOSPC` or `EIO` from the storage layer, and the end-to-end live conflict.
+
 ---
 
 ## B50 — Failed Orphan Staging Deletes the Sole Scratch Copy (CRIT-06)
 
-**Status:** Fixed in code; injected filesystem-failure verification pending
+**Status:** Fixed, with injected filesystem-failure verification (2026-08-17).
 **Found:** 2026-07-22, 1.0 data-safety audit
 **Where:** `crates/pdfs-fuse/src/lib.rs`, `Core::stage_orphaned_write`
 
@@ -2640,11 +2827,29 @@ metadata are committed. Inject `ENOSPC`, `EIO`, `EROFS`, permission, and
 cross-device failures and assert a byte-identical copy remains discoverable.
 Related: B23, B27, and B28.
 
+**Verification (2026-08-17).** Four new tests in `pdfs-core/src/cache.rs`.
+`orphan_preservation_keeps_the_scratch_copy_when_staging_is_unwritable` makes staging mode `0500`
+so both the rename and the copy fallback fail, and asserts the scratch file survives
+byte-identical, is the path the error names, and carries its recovery marker.
+`a_retained_orphan_write_is_discoverable_after_a_restart` reopens the cache after that failure and
+asserts `recovered_writes` finds the bytes *with their metadata* — present is not the same as
+discoverable, and discoverable is what the entry asked for.
+`orphan_preservation_across_a_device_boundary_publishes_before_removing` and
+`a_failed_cross_device_preservation_keeps_the_marked_source` drive the copy fallback across a real
+device boundary (`/dev/shm` vs `/tmp`), asserting the ordering — destination and sidecar published
+and synced first, source removed last — and that a publication which does not finish leaves the
+marked source in place. The cross-device pair skips with a printed note on a machine that has only
+one filesystem, rather than passing silently.
+
+Not covered: a genuine `ENOSPC`/`EIO` from the block layer; `EROFS` is approximated by the
+unwritable-directory case rather than a read-only mount.
+
 ---
 
 ## B51 — Scratch Sidecar Does Not Establish a Durable Recovery Record (CRIT-07)
 
-**Status:** Fixed in code; power-loss verification pending
+**Status:** Fixed, with crash-boundary and corrupt-sidecar verification (2026-08-17). True
+power-loss testing (a machine actually losing power mid-write) is still not covered.
 **Found:** 2026-07-22, 1.0 crash-consistency audit
 **Where:** `crates/pdfs-core/src/cache.rs`, scratch durability markers
 
@@ -2657,11 +2862,24 @@ a sparse partial write as complete and replace untouched ranges with zeros.
 then sync the directory before acknowledging durability. Crash-test every
 boundary and corrupt/partial sidecars. B20 and B23 do not cover this invariant.
 
+**Verification (2026-08-17).** `a_half_written_scratch_sidecar_is_never_read_as_a_record` puts on
+disk exactly what a crash inside `mark_scratch_durable` leaves — a `.json.tmp` and no published
+sidecar — and asserts the next open recovers nothing from it, so an unpublished temporary can
+never be replayed as a write. `a_corrupt_scratch_sidecar_still_rescues_its_bytes` truncates a
+published sidecar to a JSON prefix and asserts the blob is still moved to `recovery/`
+unaccompanied: metadata loss must not take the user's bytes with it.
+`remarking_a_scratch_file_replaces_its_record_atomically` covers the repeated-`fsync` case — each
+call leaves one complete parseable record and no debris.
+
+Not covered: real power loss. Nothing short of a crashing VM tests that, and the entry should not
+be closed as if it did.
+
 ---
 
 ## B52 — Staged-Write Publication Is Not Crash-Safe (CRIT-08)
 
-**Status:** Fixed in code; cross-filesystem and power-loss verification pending
+**Status:** Fixed, with cross-filesystem verification against a real device boundary
+(2026-08-17). True power-loss testing is still not covered.
 **Found:** 2026-07-22, 1.0 crash-consistency audit
 **Where:** `crates/pdfs-core/src/cache.rs`, staged-write publication
 
@@ -2674,11 +2892,24 @@ renames and directory syncs; delete the source only after verification. Inject
 failure after every write, sync, rename, DB enqueue, and deletion. Related: B50
 and B51.
 
+**Verification (2026-08-17).** `stage_write` gained a `stage_write_at` seam — the public entry
+point picks a timestamped destination, which is right for production and impossible to arrange a
+failure at, the same reason `preserve_write_at` exists.
+`staging_across_a_device_boundary_removes_the_source_last` drives the copy path across a real
+device boundary and asserts the destination and sidecar are both on disk before the source goes.
+`a_failed_staging_sidecar_keeps_the_cross_device_source` blocks the sidecar's temporary name and
+asserts the source survives — a staged blob nothing describes is not a substitute for the bytes.
+`an_unaccompanied_staged_blob_survives_a_restart` asserts startup leaves an undescribed staging
+blob (and a leftover `.json.tmp`) alone rather than tidying user data away.
+
+Not covered: real power loss, and injected failure at *every* one of the listed points — the
+sidecar and source-removal boundaries are covered, the intermediate `fsync` calls are not.
+
 ---
 
 ## B53 — Superseding a Pending Operation Is Not Transactional (CRIT-09)
 
-**Status:** Fixed with rollback regression; crash/ENOSPC verification pending
+**Status:** Fixed, with rollback, restart and full-database verification (2026-08-17).
 **Found:** 2026-07-22, 1.0 SQLite durability audit
 **Where:** `crates/pdfs-core/src/db/ops.rs`, `Db::enqueue_op`
 
@@ -2691,11 +2922,22 @@ blob until commit and make cleanup recoverable. Inject insert/commit failures
 and prove that old or new operation—never neither—remains queued. B27 concerns
 a retained failing row; this issue erases the row.
 
+**Verification (2026-08-17).** The existing `failed_superseding_insert_keeps_the_old_pending_op`
+proves the row rolls back. Two tests were added for the parts that make the rollback usable.
+`a_rolled_back_supersede_keeps_its_blob_and_survives_reopen` asserts the failed call does *not*
+report the old blob as superseded — that value is the caller's instruction to delete those bytes,
+and the row that owns them is still queued — and that the rollback is still there after closing
+and reopening a file-backed database, so it is not an artefact of the connection that failed.
+`a_full_database_rolls_the_supersede_back_rather_than_erasing_it` caps `max_page_count` at the
+current size, which is the same `SQLITE_FULL` an out-of-space filesystem produces, and asserts the
+acknowledged upload is still queued and still owns its bytes.
+
 ---
 
 ## B54 — Total-Wipe Guard Does Not Protect a One-Entry Baseline (CRIT-10)
 
-**Status:** Fixed with one-entry regression; live mode-matrix verification pending
+**Status:** Fixed, with one-entry, absent-root, unreadable-root and replaced-mountpoint
+regressions (2026-08-17). The live mode matrix is still the only thing unexercised.
 **Found:** 2026-07-22, 1.0 mirror-sync audit
 **Where:** `crates/pdfs-fuse/src/sync/planner.rs`
 
@@ -2708,11 +2950,31 @@ independently complete scan plus an explicit deliberate-delete signal for a
 total wipe. Test absent roots, replaced mountpoints, permissions, and one-file
 folders in every mode combination.
 
+**Verification (2026-08-17).** The guard reads `!baseline.is_empty()`, so every non-empty baseline
+is protected; `guard_local_wipe_blocks_only_a_total_disappearance` already carried the one-entry
+case. The "independently complete scan" half is B55's fix — an absent, unreadable or partially
+readable root now fails the pass before the guard is reached, which those tests cover.
+
+What was missing is the case where nothing fails: a root that is readable but is no longer the
+tree it was, an empty directory left where a mount used to be.
+`a_replaced_mountpoint_trips_the_guard_at_every_baseline_size` walks a real empty root, confirms
+the scan honestly reports nothing, and asserts the guard fires for baselines of one, two and three
+paths — then that it steps aside the moment the tree is back, so a remounted folder resumes
+instead of staying wedged.
+
+**Deliberate divergence from the required fix:** there is no explicit deliberate-delete signal.
+The guard refuses a total wipe outright rather than offering a way to confirm one. That is
+stricter than asked for, and it means a user who really did delete everything must remove and
+re-add the sync folder. Worth revisiting if anyone hits it; not worth building a confirmation path
+nobody has asked for yet.
+
+Not covered: the live mode matrix (`scripts/fuse-acceptance.sh --managed-live`).
+
 ---
 
 ## B55 — Incomplete Local Scans Are Interpreted as Deletions (CRIT-11)
 
-**Status:** Fixed in code; injected iterator/stat failure tests pending
+**Status:** Fixed, with injected iterator/stat failure tests (2026-08-17).
 **Found:** 2026-07-22, 1.0 mirror-sync audit
 **Where:** `crates/pdfs-fuse/src/sync.rs`, local scan/reconciliation
 
@@ -2724,6 +2986,23 @@ deletions and propagate them remotely.
 subtree must make the pass non-destructive and retain its prior baseline. Test
 `readdir`, `stat`, permission, transient-I/O, and disappearing-entry failures.
 B42 covers the inverse local-delete failure.
+
+**Verification (2026-08-17).** The scan body was lifted out of `Core::walk_local` into a free
+`walk_local_tree`, so it can be driven against a real tree with a real unreadable directory in it
+and no `Core` at all. Every failure in it is fatal to the pass by construction — a `read_dir` that
+fails, an entry that cannot be stat-ed, a name that is not UTF-8 — because a skipped path is a
+path reconciliation reads as a deletion and propagates to Drive.
+
+Tests: `an_unreadable_subdirectory_fails_the_scan_instead_of_shrinking_it` (chmod `000` on a
+subdirectory holding a file, asserting the error names the subtree),
+`an_unreadable_root_fails_the_scan`, `an_absent_root_fails_the_scan` (the unmounted-device case),
+`a_non_utf8_name_fails_the_scan`, and `a_readable_tree_scans_completely` as the complement — the
+strictness must not cost a working pass, so a healthy tree still reports every entry and still
+skips symlinks by design.
+
+Not covered: transient I/O errors, and an entry that disappears between `read_dir` and `stat`.
+Both are races that would need a filesystem shim to force; the code path they take is the same
+`symlink_metadata` failure the permission test drives.
 
 ---
 

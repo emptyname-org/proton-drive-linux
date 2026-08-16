@@ -72,9 +72,12 @@ fn now_millis() -> i64 {
         .unwrap_or(0)
 }
 
-/// Block size for the on-demand block cache. Matches the SDK content block size
-/// (`DEFAULT_BLOCK_SIZE`, 4 MiB) so each cached block maps to exactly one
-/// `download_range` fetch with no straddling.
+/// Block size the on-demand block cache falls back to when a revision's real
+/// geometry is not known yet. Matches the SDK's default content block size
+/// (`DEFAULT_BLOCK_SIZE`, 4 MiB), which is what this client's own uploads
+/// produce — so for a file this client wrote, the fallback *is* the geometry.
+///
+/// It is only a fallback, though. See [`BlockGeometry`].
 pub const BLOCK_SIZE: u64 = 1 << 22;
 
 /// Buffered LRU touches that trigger a flush. Sized so a sequential read of a
@@ -93,6 +96,135 @@ pub fn block_len(size: u64, idx: u64) -> u64 {
     size.saturating_sub(start).min(BLOCK_SIZE)
 }
 
+/// One block of a revision, as the read path and the block cache address it:
+/// its index in the revision's block table, and the plaintext range it covers.
+///
+/// `start` travels with `idx` because the index alone stopped being enough once
+/// the geometry came from the revision rather than from a constant — see
+/// [`BlockGeometry`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct BlockSpan {
+    /// Position in the revision's block table.
+    pub idx: u64,
+    /// Plaintext offset the block begins at.
+    pub start: u64,
+    /// Plaintext length of the block.
+    pub len: u64,
+}
+
+impl BlockSpan {
+    /// One past the block's last plaintext byte.
+    pub fn end(&self) -> u64 {
+        self.start + self.len
+    }
+}
+
+/// Where a revision's content blocks actually begin and end in its plaintext.
+///
+/// The read path used to assume the answer: [`BLOCK_SIZE`] blocks with a
+/// remainder at the end, encoded as `idx * BLOCK_SIZE` and [`block_len`]. That
+/// holds for revisions this client uploaded, and it does not hold in general —
+/// `RevisionReader::block_sizes()` reports per-block plaintext sizes that some
+/// accounts have revisions for which are neither 4 MiB nor uniform
+/// (`docs/BUGS.md` B85).
+///
+/// Getting it wrong is not a truncation: `read_at` plans over the real sizes
+/// and clamps to the range asked for, so the bytes are right either way. What
+/// it costs is work. A client block that straddles two server blocks makes the
+/// reader fetch and decrypt both to answer for one, and the block written to
+/// the on-disk cache then lines up with nothing the next read will ask for.
+/// Planning from the revision restores the one-cached-block-is-one-fetched-block
+/// property the cache was designed around.
+///
+/// [`BlockGeometry::uniform`] is the old assumption, kept as the answer for a
+/// file whose real geometry has not been learned yet — the first read of a file
+/// has no reader open, and resolving one just to plan would reintroduce the
+/// per-read key derivation the block cache exists to avoid.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BlockGeometry {
+    /// Plaintext start offset of each block; same length as `sizes`.
+    starts: Vec<u64>,
+    sizes: Vec<u64>,
+    size: u64,
+}
+
+impl BlockGeometry {
+    /// The geometry a revision reports, as a prefix sum over its block sizes.
+    ///
+    /// Trailing zero-length blocks are dropped: they name no bytes, so they can
+    /// only produce empty spans that every caller would have to special-case.
+    pub fn from_sizes(sizes: &[u64]) -> Self {
+        let mut kept: Vec<u64> = sizes.to_vec();
+        while kept.last() == Some(&0) {
+            kept.pop();
+        }
+        let mut starts = Vec::with_capacity(kept.len());
+        let mut at = 0_u64;
+        for &len in &kept {
+            starts.push(at);
+            at = at.saturating_add(len);
+        }
+        Self {
+            starts,
+            sizes: kept,
+            size: at,
+        }
+    }
+
+    /// The [`BLOCK_SIZE`] assumption, for a file of `size` bytes.
+    pub fn uniform(size: u64) -> Self {
+        let blocks = size.div_ceil(BLOCK_SIZE);
+        Self::from_sizes(&(0..blocks).map(|i| block_len(size, i)).collect::<Vec<_>>())
+    }
+
+    /// Total plaintext size this geometry accounts for.
+    pub fn size(&self) -> u64 {
+        self.size
+    }
+
+    /// Number of blocks.
+    pub fn blocks(&self) -> u64 {
+        self.sizes.len() as u64
+    }
+
+    /// Block `idx`, or `None` past the end of the table.
+    pub fn span(&self, idx: u64) -> Option<BlockSpan> {
+        let i = usize::try_from(idx).ok()?;
+        Some(BlockSpan {
+            idx,
+            start: *self.starts.get(i)?,
+            len: self.sizes[i],
+        })
+    }
+
+    /// The index of the block containing plaintext offset `at`, or `None` at or
+    /// past the end.
+    pub fn index_at(&self, at: u64) -> Option<u64> {
+        if at >= self.size {
+            return None;
+        }
+        // `starts` is sorted, so the containing block is the last one that
+        // begins at or before `at`.
+        let i = self.starts.partition_point(|&s| s <= at).checked_sub(1)?;
+        Some(i as u64)
+    }
+
+    /// Every block overlapping the plaintext range `[offset, end)`, in order.
+    /// Empty when the range is empty or lies wholly past the end.
+    pub fn spans(&self, offset: u64, end: u64) -> Vec<BlockSpan> {
+        let Some(first) = self.index_at(offset) else {
+            return Vec::new();
+        };
+        if end <= offset {
+            return Vec::new();
+        }
+        let last = self
+            .index_at(end - 1)
+            .unwrap_or_else(|| self.blocks().saturating_sub(1));
+        (first..=last).filter_map(|i| self.span(i)).collect()
+    }
+}
+
 /// How many eviction candidates to pull per batch when a pool is over budget.
 /// Large enough that a normal overshoot (a store or two past the cap) is settled
 /// in one query, small enough that a badly-over-budget cache does not read its
@@ -107,6 +239,40 @@ struct Meta {
     mtime: i64,
     /// Plaintext size in bytes.
     size: u64,
+}
+
+/// Validity tag stored alongside a cached *block*: [`Meta`] plus where in the
+/// plaintext the block begins.
+///
+/// The offset is what makes the block re-plannable. See
+/// [`ContentCache::block_tag`] for why `(mtime, size)` alone stopped being
+/// enough, and why `start` is optional.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+struct BlockMeta {
+    mtime: i64,
+    size: u64,
+    /// Absent in sidecars written before the geometry became per-revision;
+    /// those are read as "wherever the 4 MiB assumption would have put it".
+    #[serde(default)]
+    start: Option<u64>,
+}
+
+/// A revision's block geometry as cached on disk, so a read can plan without
+/// opening a [`RevisionReader`](proton_sdk) first.
+///
+/// Learning the geometry costs a revision listing and the file's key
+/// derivation, which is exactly the per-read work the block cache exists to
+/// avoid. So it is learned as a side effect of the first read — which has to
+/// open a reader anyway to fetch anything — written here, and used to plan
+/// every read after it. The first read of a file therefore still plans on
+/// [`BlockGeometry::uniform`]; if that turns out to be wrong, the blocks it
+/// cached are simply not the blocks the next read asks for, and they age out.
+#[derive(Serialize, Deserialize, Clone)]
+struct GeometryMeta {
+    mtime: i64,
+    size: u64,
+    /// Plaintext size of each content block, in block order.
+    sizes: Vec<u64>,
 }
 
 /// One pin, as carried over the control socket and listed in `status`.
@@ -425,7 +591,10 @@ impl ContentCache {
             for entry in rd.flatten() {
                 let name = entry.file_name();
                 let Some(name) = name.to_str() else { continue };
-                if name.ends_with(".meta") {
+                // `.geom` is a block-geometry sidecar (see `GeometryMeta`), tens
+                // of bytes and not a cached block; like `.meta` it is neither
+                // budgeted nor evictable on its own.
+                if name.ends_with(".meta") || name.ends_with(".geom") {
                     continue;
                 }
                 // A `.tmp` is a staging file from a store that never completed
@@ -615,60 +784,133 @@ impl ContentCache {
             .join(format!("{}.b{idx}.meta", Self::key(uid)))
     }
 
-    /// Whether block `idx` of `uid` is cached and fresh for `(mtime, size)`,
-    /// without reading it. For a caller deciding whether a block is worth
-    /// *fetching* — reading 4 MiB to answer that would defeat the point.
-    pub fn has_block(&self, uid: &NodeUid, mtime: i64, size: u64, idx: u64) -> bool {
-        self.block_tag(uid, idx) == Some(Meta { mtime, size })
-            && std::fs::metadata(self.block_blob(uid, idx))
-                .is_ok_and(|m| m.len() == block_len(size, idx))
+    fn geometry_meta(&self, uid: &NodeUid) -> PathBuf {
+        self.block_dir.join(format!("{}.geom", Self::key(uid)))
     }
 
-    /// The `(mtime, size)` a cached block claims to belong to, from its sidecar.
-    fn block_tag(&self, uid: &NodeUid, idx: u64) -> Option<Meta> {
-        serde_json::from_slice(&std::fs::read(self.block_meta(uid, idx)).ok()?).ok()
-    }
-
-    /// Serve cached block `idx` (a [`BLOCK_SIZE`]-aligned chunk) of `uid`, or
-    /// `None` on miss/stale. Validated against `(mtime, size)` like a whole-file
-    /// blob, so a new revision (which bumps the mtime) is detected. Bumps the
-    /// block's mtime for LRU, best effort.
-    pub fn cached_block(&self, uid: &NodeUid, mtime: i64, size: u64, idx: u64) -> Option<Vec<u8>> {
-        if self.block_tag(uid, idx)? != (Meta { mtime, size }) {
+    /// The block geometry recorded for this revision of `uid`, or `None` if it
+    /// has not been learned (or belongs to an older revision).
+    ///
+    /// Callers fall back to [`BlockGeometry::uniform`], which is what every
+    /// read did unconditionally before `docs/BUGS.md` B85.
+    pub fn block_geometry(&self, uid: &NodeUid, mtime: i64, size: u64) -> Option<BlockGeometry> {
+        let meta: GeometryMeta =
+            serde_json::from_slice(&std::fs::read(self.geometry_meta(uid)).ok()?).ok()?;
+        if meta.mtime != mtime || meta.size != size {
             return None;
         }
-        let mut f = std::fs::File::open(self.block_blob(uid, idx)).ok()?;
+        let geometry = BlockGeometry::from_sizes(&meta.sizes);
+        // A table that does not add up to the node's size describes a different
+        // file than the one being read; planning on it would place every block
+        // after the discrepancy wrongly. Refusing it costs a fallback to the
+        // uniform assumption, which is where B84's repair path takes over.
+        (geometry.size() == size).then_some(geometry)
+    }
+
+    /// Record the block geometry `sizes` for this revision of `uid`.
+    ///
+    /// Best effort and disposable, like every other file under the block cache:
+    /// losing it costs the next read a plan on the uniform assumption, never
+    /// correctness. Not counted against the block budget — it is tens of bytes
+    /// per file and is what keeps the blocks that *are* counted addressable.
+    pub fn store_block_geometry(&self, uid: &NodeUid, mtime: i64, size: u64, sizes: &[u64]) {
+        let meta = GeometryMeta {
+            mtime,
+            size,
+            sizes: sizes.to_vec(),
+        };
+        if let Ok(bytes) = serde_json::to_vec(&meta) {
+            let _ = std::fs::write(self.geometry_meta(uid), bytes);
+        }
+    }
+
+    /// Whether `span` of `uid` is cached and fresh for `(mtime, size)`, without
+    /// reading it. For a caller deciding whether a block is worth *fetching* —
+    /// reading 4 MiB to answer that would defeat the point.
+    pub fn has_block(&self, uid: &NodeUid, mtime: i64, size: u64, span: BlockSpan) -> bool {
+        self.block_tag(uid, mtime, size, span).is_some()
+            && std::fs::metadata(self.block_blob(uid, span.idx)).is_ok_and(|m| m.len() == span.len)
+    }
+
+    /// The sidecar of block `span.idx`, if it describes the block the caller
+    /// means.
+    ///
+    /// `(mtime, size)` catches a new revision, and used to be the whole check:
+    /// with the geometry fixed at [`BLOCK_SIZE`], an index named one byte range
+    /// and only one. It no longer does — the same index names a different range
+    /// under the revision's own geometry than under the fallback — so the
+    /// sidecar records the block's plaintext `start` and it has to agree too
+    /// (`docs/BUGS.md` B85).
+    ///
+    /// A sidecar written before that field existed deserialises with `start`
+    /// absent. Those are honoured only where the old assumption and the caller
+    /// agree on the offset, which is every file this client uploaded: the
+    /// existing cache survives intact for them, and is quietly refetched for the
+    /// files it was placing wrongly.
+    fn block_tag(
+        &self,
+        uid: &NodeUid,
+        mtime: i64,
+        size: u64,
+        span: BlockSpan,
+    ) -> Option<BlockMeta> {
+        let meta: BlockMeta =
+            serde_json::from_slice(&std::fs::read(self.block_meta(uid, span.idx)).ok()?).ok()?;
+        if meta.mtime != mtime || meta.size != size {
+            return None;
+        }
+        let recorded = meta
+            .start
+            .unwrap_or_else(|| span.idx.saturating_mul(BLOCK_SIZE));
+        (recorded == span.start).then_some(meta)
+    }
+
+    /// Serve the cached block at `span` of `uid`, or `None` on miss/stale.
+    /// Validated against `(mtime, size)` and the block's plaintext start, so
+    /// both a new revision and a re-planned geometry are detected. Bumps the
+    /// block's mtime for LRU, best effort.
+    pub fn cached_block(
+        &self,
+        uid: &NodeUid,
+        mtime: i64,
+        size: u64,
+        span: BlockSpan,
+    ) -> Option<Vec<u8>> {
+        self.block_tag(uid, mtime, size, span)?;
+        let mut f = std::fs::File::open(self.block_blob(uid, span.idx)).ok()?;
         // The blob is not fsynced on the way in (see `store_block`), so a crash
         // can leave a short one behind the sidecar that describes it. Length is
         // what makes that detectable, the same check `valid_blob` applies to a
         // whole-file blob.
-        if f.metadata().ok()?.len() != block_len(size, idx) {
+        if f.metadata().ok()?.len() != span.len {
             return None;
         }
         // LRU touch, buffered rather than written (see `touch`).
-        self.touch(self.block_key(uid, idx));
+        self.touch(self.block_key(uid, span.idx));
         let mut buf = Vec::new();
         f.read_to_end(&mut buf).ok()?;
         Some(buf)
     }
 
-    /// Store `bytes` as cached block `idx` of `uid`, tagged `(mtime, size)`.
-    /// Temp-file-then-rename like [`store`](Self::store); meta written last so a
-    /// crash mid-store fails validation. Enforces the block-cache LRU budget.
+    /// Store `bytes` as the cached block at `span` of `uid`, tagged
+    /// `(mtime, size)` and the block's plaintext start. Temp-file-then-rename
+    /// like [`store`](Self::store); meta written last so a crash mid-store fails
+    /// validation. Enforces the block-cache LRU budget.
     ///
-    /// The caller owes it a block of exactly [`block_len`] bytes; anything else
-    /// reads back as a miss ([`cached_block`](Self::cached_block) checks), so a
-    /// bad block cannot escape this cache even though this does not check.
-    /// Validating a block is the *reader's* job, at the point it is fetched —
-    /// see `Core::read_block` (bugs.md B84).
+    /// The caller owes it exactly `span.len` bytes; anything else reads back as
+    /// a miss ([`cached_block`](Self::cached_block) checks), so a bad block
+    /// cannot escape this cache even though this does not check. Validating a
+    /// block is the *reader's* job, at the point it is fetched — see
+    /// `Core::read_block` (bugs.md B84).
     pub fn store_block(
         &self,
         uid: &NodeUid,
         mtime: i64,
         size: u64,
-        idx: u64,
+        span: BlockSpan,
         bytes: &[u8],
     ) -> Result<()> {
+        let idx = span.idx;
         let blob = self.block_blob(uid, idx);
         let tmp = self
             .block_dir
@@ -685,7 +927,11 @@ impl ContentCache {
         std::fs::rename(&tmp, &blob)?;
         std::fs::write(
             self.block_meta(uid, idx),
-            serde_json::to_vec(&Meta { mtime, size })?,
+            serde_json::to_vec(&BlockMeta {
+                mtime,
+                size,
+                start: Some(span.start),
+            })?,
         )?;
         self.db.cache_touch(
             &self.block_key(uid, idx),
@@ -1165,9 +1411,21 @@ impl ContentCache {
     /// failure here means we could not save the bytes at all, so it is reported
     /// rather than swallowed.
     pub fn stage_write(&self, meta: &StagedWrite, scratch: &Path) -> Result<PathBuf> {
+        let path = self.staging_path(meta);
+        self.stage_write_at(meta, scratch, &path)
+    }
+
+    /// [`stage_write`](Self::stage_write) with the destination named by the
+    /// caller.
+    ///
+    /// The public entry point picks a timestamped name, which is right for
+    /// production and untestable: a test cannot arrange for publication to fail
+    /// at a path it cannot predict. This is the seam `preserve_write_at` is for
+    /// the rescue path.
+    fn stage_write_at(&self, meta: &StagedWrite, scratch: &Path, path: &Path) -> Result<PathBuf> {
         use std::io::Write as _;
 
-        let path = self.staging_path(meta);
+        let path = path.to_path_buf();
         let copied = if let Err(e) = std::fs::rename(scratch, &path) {
             if e.kind() != std::io::ErrorKind::CrossesDevices {
                 return Err(e.into());
@@ -1367,10 +1625,14 @@ impl ContentCache {
             let _ = std::fs::remove_file(self.thumb_blob(uid, ttype));
             let _ = std::fs::remove_file(self.thumb_meta(uid, ttype));
         }
-        // Drop every cached block (and its meta/tmp) for this uid. The block
-        // dir is still scanned here because eviction targets one uid's files by
-        // name prefix, not by LRU order; the index rows are removed in one shot
-        // by `cache_remove_all` below.
+        // Drop every cached block (and its meta/tmp) for this uid, plus the
+        // recorded block geometry — it describes the revision these blocks came
+        // from, and keeping it past them would have the next read plan against a
+        // table for a file it no longer holds. The block dir is still scanned
+        // here because eviction targets one uid's files by name prefix, not by
+        // LRU order; the index rows are removed in one shot by
+        // `cache_remove_all` below.
+        let _ = std::fs::remove_file(self.geometry_meta(uid));
         let prefix = format!("{}.b", Self::key(uid));
         if let Ok(rd) = std::fs::read_dir(&self.block_dir) {
             for entry in rd.flatten() {
@@ -1934,17 +2196,20 @@ mod tests {
         // Cost of a store against a near-empty index...
         let t = Instant::now();
         for i in 0..500u64 {
-            c.store_block(&uid("a"), 1, 1 << 30, i, &payload).unwrap();
+            c.store_block(&uid("a"), 1, 1 << 30, blk(1 << 30, i), &payload)
+                .unwrap();
         }
         let empty = t.elapsed() / 500;
 
         // ...and against one with a few thousand entries in it.
         for i in 500..2500u64 {
-            c.store_block(&uid("a"), 1, 1 << 30, i, &payload).unwrap();
+            c.store_block(&uid("a"), 1, 1 << 30, blk(1 << 30, i), &payload)
+                .unwrap();
         }
         let t = Instant::now();
         for i in 2500..3000u64 {
-            c.store_block(&uid("a"), 1, 1 << 30, i, &payload).unwrap();
+            c.store_block(&uid("a"), 1, 1 << 30, blk(1 << 30, i), &payload)
+                .unwrap();
         }
         let full = t.elapsed() / 500;
 
@@ -1967,7 +2232,8 @@ mod tests {
     fn running_totals_stay_aligned_with_the_index() {
         let (c, _d) = cache_with_pool_cap(KIND_BLOCK, 8);
         for i in 0..12u64 {
-            c.store_block(&uid("a"), 1, 100, i, b"aaaa").unwrap();
+            c.store_block(&uid("a"), 1, 100, blk(100, i), b"aaaa")
+                .unwrap();
             std::thread::sleep(std::time::Duration::from_millis(2));
         }
         let indexed: u64 =
@@ -2031,13 +2297,16 @@ mod tests {
         c.add_pin(&a, Path::new("a"), false).unwrap();
         c.store(&b, 1, 4, b"bbbb").unwrap();
         // A stray on-demand block of the unpinned file is purged too.
-        c.store_block(&b, 1, 8, 0, b"bbbb").unwrap();
+        c.store_block(&b, 1, 8, blk(8, 0), b"bbbb").unwrap();
 
         let freed = c.clear_unpinned();
         assert_eq!(freed, 8, "one 4-byte blob + one 4-byte block freed");
         assert!(c.is_cached(&a, 1, 4), "pinned blob survives purge");
         assert!(!c.is_cached(&b, 1, 4), "unpinned blob purged");
-        assert!(c.cached_block(&b, 1, 8, 0).is_none(), "block purged");
+        assert!(
+            c.cached_block(&b, 1, 8, blk(8, 0)).is_none(),
+            "block purged"
+        );
     }
 
     #[test]
@@ -2171,7 +2440,7 @@ mod tests {
         for i in 0..100u64 {
             c.store(&uid(&format!("file{i}")), 1, payload.len() as u64, &payload)
                 .unwrap();
-            c.store_block(&uid("streamed"), 1, 1 << 30, i, &payload)
+            c.store_block(&uid("streamed"), 1, 1 << 30, blk(1 << 30, i), &payload)
                 .unwrap();
         }
 
@@ -2249,13 +2518,28 @@ mod tests {
         // A 10-byte file is one block of 10 bytes: the length a reader expects
         // is derived from the file size, so the fixture has to be geometrically
         // real or the torn-write check rejects it.
-        c.store_block(&u, 100, 10, 0, b"block-zero").unwrap();
-        assert_eq!(c.cached_block(&u, 100, 10, 0).unwrap(), b"block-zero");
+        c.store_block(&u, 100, 10, blk(10, 0), b"block-zero")
+            .unwrap();
+        assert_eq!(
+            c.cached_block(&u, 100, 10, blk(10, 0)).unwrap(),
+            b"block-zero"
+        );
         // A different index is a separate cache entry, absent here.
-        assert!(c.cached_block(&u, 100, 10, 1).is_none());
+        assert!(c.cached_block(&u, 100, 10, blk(10, 1)).is_none());
         // A new revision (mtime/size bump) invalidates the block.
-        assert!(c.cached_block(&u, 101, 10, 0).is_none());
-        assert!(c.cached_block(&u, 100, 5000, 0).is_none());
+        assert!(c.cached_block(&u, 101, 10, blk(10, 0)).is_none());
+        assert!(c.cached_block(&u, 100, 5000, blk(5000, 0)).is_none());
+    }
+
+    /// The [`BlockSpan`] the uniform geometry gives block `idx` of a file of
+    /// `size` bytes — the shape these tests were written against, and the one
+    /// this client's own uploads still have.
+    fn blk(size: u64, idx: u64) -> BlockSpan {
+        BlockSpan {
+            idx,
+            start: idx.saturating_mul(BLOCK_SIZE),
+            len: block_len(size, idx),
+        }
     }
 
     /// The geometry the whole read path validates against, here and over the
@@ -2273,6 +2557,137 @@ mod tests {
         assert_eq!(block_len(BLOCK_SIZE, 1), 0);
     }
 
+    /// The uniform geometry has to reproduce the constant-block arithmetic it
+    /// replaces exactly, or every file this client uploaded changes shape.
+    #[test]
+    fn the_uniform_geometry_is_the_old_block_arithmetic() {
+        let size = BLOCK_SIZE * 2 + 17;
+        let g = BlockGeometry::uniform(size);
+        assert_eq!(g.size(), size);
+        assert_eq!(g.blocks(), 3);
+        for idx in 0..3 {
+            let span = g.span(idx).unwrap();
+            assert_eq!(span.start, idx * BLOCK_SIZE);
+            assert_eq!(span.len, block_len(size, idx));
+        }
+        assert!(g.span(3).is_none(), "past the end there is no block");
+
+        // An empty file has no blocks at all, and no range covers anything.
+        let empty = BlockGeometry::uniform(0);
+        assert_eq!(empty.blocks(), 0);
+        assert!(empty.spans(0, 10).is_empty());
+    }
+
+    /// The B85 case: block sizes that are neither 4 MiB nor uniform. Offsets
+    /// have to come from the prefix sum, not from a constant.
+    #[test]
+    fn a_non_uniform_geometry_places_blocks_by_prefix_sum() {
+        let sizes = [5_239_804_u64, 5_670_228, 5_233_034];
+        let g = BlockGeometry::from_sizes(&sizes);
+        assert_eq!(g.size(), sizes.iter().sum::<u64>());
+        assert_eq!(g.blocks(), 3);
+        assert_eq!(g.span(0).unwrap().start, 0);
+        assert_eq!(g.span(1).unwrap().start, 5_239_804);
+        assert_eq!(g.span(2).unwrap().start, 5_239_804 + 5_670_228);
+        assert_eq!(g.span(2).unwrap().end(), g.size());
+
+        // A one-byte read in the middle of block 1 asks for block 1 alone —
+        // under the 4 MiB assumption the same offset falls in block 2.
+        let at = 6_000_000;
+        assert_eq!(g.index_at(at), Some(1));
+        assert_eq!(BlockGeometry::uniform(g.size()).index_at(at), Some(1));
+        let spans = g.spans(at, at + 1);
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].idx, 1);
+
+        // A range crossing a boundary asks for both, and only both.
+        let crossing = g.spans(5_239_803, 5_239_805);
+        assert_eq!(
+            crossing.iter().map(|s| s.idx).collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+
+        // At and past the end there is nothing to read.
+        assert_eq!(g.index_at(g.size()), None);
+        assert!(g.spans(g.size(), g.size() + 100).is_empty());
+        assert!(g.spans(10, 10).is_empty(), "an empty range wants no blocks");
+
+        // The single-block case from the same log: one block holding the whole
+        // file, so there is no block 1 to ask for.
+        let whole = BlockGeometry::from_sizes(&[4_939_506]);
+        assert_eq!(whole.blocks(), 1);
+        assert!(whole.span(1).is_none());
+        assert_eq!(whole.spans(0, 4_939_506).len(), 1);
+    }
+
+    /// A cached block is addressed by the range it covers, not by its index
+    /// alone. Re-planning a file onto its real geometry must therefore miss the
+    /// blocks the uniform fallback cached, rather than serve their bytes at the
+    /// wrong offset (bugs.md B85).
+    #[test]
+    fn a_cached_block_is_not_served_to_a_different_geometry() {
+        let (c, _d) = cache();
+        let u = uid("geom");
+        let size = BLOCK_SIZE * 2;
+
+        let uniform = BlockGeometry::uniform(size);
+        let first = uniform.span(0).unwrap();
+        let payload = vec![7u8; first.len as usize];
+        c.store_block(&u, 1, size, first, &payload).unwrap();
+        assert!(c.has_block(&u, 1, size, first), "cached where it was put");
+
+        // The same file, re-planned: block 0 is now a different length, and
+        // block 1 starts somewhere the old plan never had a block.
+        let real = BlockGeometry::from_sizes(&[BLOCK_SIZE + 1, BLOCK_SIZE - 1]);
+        assert_eq!(real.size(), size);
+        assert!(
+            !c.has_block(&u, 1, size, real.span(0).unwrap()),
+            "same index, different length: not the block that was cached"
+        );
+        assert!(
+            c.cached_block(&u, 1, size, real.span(1).unwrap()).is_none(),
+            "same index, different start: not the block that was cached"
+        );
+    }
+
+    /// The geometry sidecar is what lets a later read plan without opening a
+    /// reader. It is tied to the revision, and refused if it does not describe
+    /// a file of the size being read.
+    #[test]
+    fn a_recorded_geometry_is_returned_only_for_the_revision_it_describes() {
+        let (c, _d) = cache();
+        let u = uid("geom");
+        let sizes = [5_239_804_u64, 5_670_228];
+        let size: u64 = sizes.iter().sum();
+
+        assert!(
+            c.block_geometry(&u, 1, size).is_none(),
+            "nothing is known before the first read"
+        );
+
+        c.store_block_geometry(&u, 1, size, &sizes);
+        assert_eq!(
+            c.block_geometry(&u, 1, size),
+            Some(BlockGeometry::from_sizes(&sizes))
+        );
+        assert!(
+            c.block_geometry(&u, 2, size).is_none(),
+            "a new revision bumps the mtime, and this table described the old one"
+        );
+        assert!(c.block_geometry(&u, 1, size + 1).is_none());
+
+        // A table that does not add up to the file is refused outright rather
+        // than used to place blocks that would land wrongly.
+        c.store_block_geometry(&u, 1, size, &[1, 2, 3]);
+        assert!(c.block_geometry(&u, 1, size).is_none());
+
+        // Evicting the file's content takes its geometry with it, so the next
+        // read does not plan against a table for bytes the cache no longer has.
+        c.store_block_geometry(&u, 1, size, &sizes);
+        c.evict(&u);
+        assert!(c.block_geometry(&u, 1, size).is_none());
+    }
+
     /// A block of the wrong length cannot escape the cache even though the
     /// store does not check: the read validates it and reports a miss, so the
     /// next read refetches rather than serving a hole (bugs.md B84).
@@ -2281,9 +2696,9 @@ mod tests {
         let (c, _d) = cache();
         let u = uid("a");
         // A 10-byte file's only block is 10 bytes; 5 is not a short tail.
-        c.store_block(&u, 100, 10, 0, b"block").unwrap();
-        assert!(c.cached_block(&u, 100, 10, 0).is_none());
-        assert!(!c.has_block(&u, 100, 10, 0));
+        c.store_block(&u, 100, 10, blk(10, 0), b"block").unwrap();
+        assert!(c.cached_block(&u, 100, 10, blk(10, 0)).is_none());
+        assert!(!c.has_block(&u, 100, 10, blk(10, 0)));
     }
 
     /// The block cache is written without an fsync, so a crash can leave a blob
@@ -2293,9 +2708,10 @@ mod tests {
     fn a_truncated_block_reads_as_a_miss() {
         let (c, _d) = cache();
         let u = uid("a");
-        c.store_block(&u, 100, 10, 0, b"block-zero").unwrap();
+        c.store_block(&u, 100, 10, blk(10, 0), b"block-zero")
+            .unwrap();
         std::fs::write(c.block_blob(&u, 0), b"block").unwrap();
-        assert!(c.cached_block(&u, 100, 10, 0).is_none());
+        assert!(c.cached_block(&u, 100, 10, blk(10, 0)).is_none());
     }
 
     #[test]
@@ -2305,10 +2721,10 @@ mod tests {
         // Both blocks are stored at their real geometry (a 4-byte file is one
         // block), so this fails if `evict` misses them rather than because the
         // fixture was unreadable to begin with.
-        c.store_block(&u, 1, 4, 0, b"aaaa").unwrap();
-        assert!(c.cached_block(&u, 1, 4, 0).is_some());
+        c.store_block(&u, 1, 4, blk(4, 0), b"aaaa").unwrap();
+        assert!(c.cached_block(&u, 1, 4, blk(4, 0)).is_some());
         c.evict(&u);
-        assert!(c.cached_block(&u, 1, 4, 0).is_none());
+        assert!(c.cached_block(&u, 1, 4, blk(4, 0)).is_none());
     }
 
     #[test]
@@ -2317,20 +2733,26 @@ mod tests {
         // so each fixture is a geometrically real single-block file.
         let (c, _d) = cache_with_pool_cap(KIND_BLOCK, 8);
         let (a, b, d) = (uid("a"), uid("b"), uid("d"));
-        c.store_block(&a, 1, 4, 0, b"aaaa").unwrap();
+        c.store_block(&a, 1, 4, blk(4, 0), b"aaaa").unwrap();
         std::thread::sleep(std::time::Duration::from_millis(10));
-        c.store_block(&b, 1, 4, 0, b"bbbb").unwrap();
+        c.store_block(&b, 1, 4, blk(4, 0), b"bbbb").unwrap();
         // Touch a's block so b's is the least-recently-used.
         std::thread::sleep(std::time::Duration::from_millis(10));
-        assert!(c.cached_block(&a, 1, 4, 0).is_some());
+        assert!(c.cached_block(&a, 1, 4, blk(4, 0)).is_some());
         std::thread::sleep(std::time::Duration::from_millis(10));
-        c.store_block(&d, 1, 4, 0, b"cccc").unwrap();
+        c.store_block(&d, 1, 4, blk(4, 0), b"cccc").unwrap();
         assert!(
-            c.cached_block(&a, 1, 4, 0).is_some(),
+            c.cached_block(&a, 1, 4, blk(4, 0)).is_some(),
             "recently-read survives"
         );
-        assert!(c.cached_block(&b, 1, 4, 0).is_none(), "LRU block evicted");
-        assert!(c.cached_block(&d, 1, 4, 0).is_some(), "newest survives");
+        assert!(
+            c.cached_block(&b, 1, 4, blk(4, 0)).is_none(),
+            "LRU block evicted"
+        );
+        assert!(
+            c.cached_block(&d, 1, 4, blk(4, 0)).is_some(),
+            "newest survives"
+        );
     }
 
     /// A failed upload must never cost the user their bytes (offline.md Phase 2):
@@ -2632,6 +3054,379 @@ mod tests {
         drop(c);
         let c2 = ContentCache::open(content, pins, 0, db).unwrap();
         assert!(c2.recovered_writes().is_empty());
+    }
+
+    /// A directory on a *different* filesystem from the cache, so the
+    /// cross-device fallbacks can be driven for real rather than reasoned
+    /// about. `None` when this machine offers no second filesystem to use, in
+    /// which case the callers skip rather than fail — the fallback is still
+    /// covered by the same-device paths, and a green suite that quietly means
+    /// "not checked" is worse than a skip that says so.
+    fn other_device_dir(label: &str) -> Option<PathBuf> {
+        use std::os::unix::fs::MetadataExt as _;
+        let here = std::fs::metadata(std::env::temp_dir()).ok()?.dev();
+        let candidate = Path::new("/dev/shm");
+        if std::fs::metadata(candidate).ok()?.dev() == here {
+            return None;
+        }
+        let dir = candidate.join(format!("pdfs-xdev-{label}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).ok()?;
+        Some(dir)
+    }
+
+    // ---- B50: an orphaned write's only copy is never the one deleted -------
+
+    /// A staging directory that cannot be written to at all. Rename fails, the
+    /// copy fallback fails, and there is nowhere else to put the bytes — so the
+    /// scratch file, which is the only copy, has to still be there and still be
+    /// the bytes the user wrote.
+    #[test]
+    fn orphan_preservation_keeps_the_scratch_copy_when_staging_is_unwritable() {
+        use std::io::Write as _;
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let (c, _dir) = cache();
+        let (mut file, scratch) = c.create_scratch().unwrap();
+        file.write_all(b"the only copy there is").unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+
+        std::fs::set_permissions(&c.staging_dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let error = c
+            .preserve_write(&preservation_meta(), &scratch)
+            .unwrap_err();
+        std::fs::set_permissions(&c.staging_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        assert_eq!(error.surviving_path, scratch);
+        assert_eq!(
+            std::fs::read(&scratch).unwrap(),
+            b"the only copy there is",
+            "byte-identical, and still where the error says it is"
+        );
+        assert!(
+            error.marker_path.is_some(),
+            "and carrying the marker that makes it recoverable"
+        );
+    }
+
+    /// The same failure, seen from the next startup: the retained scratch file
+    /// is not just present, it is *discoverable* — recovery finds it with its
+    /// metadata, which is what makes it a preserved write rather than debris.
+    #[test]
+    fn a_retained_orphan_write_is_discoverable_after_a_restart() {
+        use std::io::Write as _;
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = TempDir::new();
+        let db = Arc::new(Db::open_in_memory().unwrap());
+        let content = dir.path().join("content");
+        let pins = dir.path().join("pins.json");
+        let c = ContentCache::open(content.clone(), pins.clone(), 0, db.clone()).unwrap();
+
+        let (mut file, scratch) = c.create_scratch().unwrap();
+        file.write_all(b"accepted bytes").unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+
+        std::fs::set_permissions(&c.staging_dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+        assert!(c.preserve_write(&preservation_meta(), &scratch).is_err());
+        std::fs::set_permissions(&c.staging_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        drop(c);
+
+        let reopened = ContentCache::open(content, pins, 0, db).unwrap();
+        let recovered = reopened.recovered_writes();
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(std::fs::read(&recovered[0].0).unwrap(), b"accepted bytes");
+        assert_eq!(recovered[0].1.uid, preservation_meta().uid);
+        assert_eq!(recovered[0].1.authored, preservation_meta().authored);
+    }
+
+    /// The copy fallback, driven across a real device boundary. Its whole point
+    /// is ordering: the destination and its sidecar are published and synced
+    /// *first*, and only then is the source removed.
+    #[test]
+    fn orphan_preservation_across_a_device_boundary_publishes_before_removing() {
+        use std::io::Write as _;
+
+        let Some(elsewhere) = other_device_dir("preserve") else {
+            eprintln!("skipped: no second filesystem available to cross");
+            return;
+        };
+        let (c, _dir) = cache();
+        let scratch = elsewhere.join("scratch-blob");
+        {
+            let mut file = std::fs::File::create(&scratch).unwrap();
+            file.write_all(b"accepted bytes").unwrap();
+            file.sync_all().unwrap();
+        }
+
+        let preserved = c.preserve_write(&preservation_meta(), &scratch).unwrap();
+
+        assert_eq!(std::fs::read(&preserved).unwrap(), b"accepted bytes");
+        assert!(
+            preserved.with_extension("json").is_file(),
+            "the sidecar is published before the source is dropped"
+        );
+        assert!(!scratch.exists(), "and only then is the source removed");
+        assert!(
+            !ContentCache::scratch_sidecar(&scratch).exists(),
+            "the source's durability marker goes with it"
+        );
+        let _ = std::fs::remove_dir_all(&elsewhere);
+    }
+
+    /// And when publication across that boundary fails partway, the marked
+    /// source stays put. This is the case B50 was: the old code removed it.
+    #[test]
+    fn a_failed_cross_device_preservation_keeps_the_marked_source() {
+        use std::io::Write as _;
+
+        let Some(elsewhere) = other_device_dir("preserve-fail") else {
+            eprintln!("skipped: no second filesystem available to cross");
+            return;
+        };
+        let (c, _dir) = cache();
+        let scratch = elsewhere.join("scratch-blob");
+        {
+            let mut file = std::fs::File::create(&scratch).unwrap();
+            file.write_all(b"only surviving copy").unwrap();
+            file.sync_all().unwrap();
+        }
+
+        let destination = c.staging_dir.join("cross-device-failure");
+        std::fs::create_dir(destination.with_extension("json")).unwrap();
+
+        let error = c
+            .preserve_write_at(&preservation_meta(), &scratch, &destination)
+            .unwrap_err();
+
+        assert_eq!(error.surviving_path, scratch);
+        assert_eq!(
+            std::fs::read(&scratch).unwrap(),
+            b"only surviving copy",
+            "the source outlives a publication that did not finish"
+        );
+        assert_eq!(
+            error.marker_path,
+            Some(ContentCache::scratch_sidecar(&scratch)),
+            "and is marked, so the next startup rescues it"
+        );
+        let _ = std::fs::remove_dir_all(&elsewhere);
+    }
+
+    // ---- B51: the scratch sidecar is a durable, self-validating record -----
+
+    /// A sidecar is published by rename, so a crash leaves either the whole
+    /// record or none of it — never a half-written one under the real name.
+    /// The temporary it is renamed from must also not be mistaken for a record.
+    #[test]
+    fn a_half_written_scratch_sidecar_is_never_read_as_a_record() {
+        use std::io::Write as _;
+
+        let dir = TempDir::new();
+        let db = Arc::new(Db::open_in_memory().unwrap());
+        let content = dir.path().join("content");
+        let pins = dir.path().join("pins.json");
+        let c = ContentCache::open(content.clone(), pins.clone(), 0, db.clone()).unwrap();
+
+        let (mut file, scratch) = c.create_scratch().unwrap();
+        file.write_all(b"authored bytes").unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+
+        // A crash between writing the temporary and renaming it: exactly what
+        // is on disk if the process dies inside `mark_scratch_durable`.
+        let side = ContentCache::scratch_sidecar(&scratch);
+        std::fs::write(side.with_extension("json.tmp"), b"{\"uid\":\"prot").unwrap();
+        assert!(!side.exists(), "no record was ever published");
+
+        drop(c);
+        let reopened = ContentCache::open(content, pins, 0, db).unwrap();
+        assert!(
+            reopened.recovered_writes().is_empty(),
+            "an unpublished temporary describes no write"
+        );
+    }
+
+    /// A sidecar that survived but does not parse — a torn tail, a truncated
+    /// file — must not take its blob down with it. The bytes are the user's
+    /// work; the metadata only says what to do with them.
+    #[test]
+    fn a_corrupt_scratch_sidecar_still_rescues_its_bytes() {
+        use std::io::Write as _;
+
+        let dir = TempDir::new();
+        let db = Arc::new(Db::open_in_memory().unwrap());
+        let content = dir.path().join("content");
+        let pins = dir.path().join("pins.json");
+        let c = ContentCache::open(content.clone(), pins.clone(), 0, db.clone()).unwrap();
+
+        let (mut file, scratch) = c.create_scratch().unwrap();
+        file.write_all(b"user work").unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+        let meta = StagedWrite {
+            uid: uid("corrupt").to_string(),
+            len: 9,
+            base_size: 0,
+            base_mtime: 0,
+            authored: vec![(0, 9)],
+            complete: true,
+            based_on: None,
+        };
+        c.mark_scratch_durable(&scratch, &meta).unwrap();
+
+        // Truncate the published sidecar to a valid JSON prefix.
+        let side = ContentCache::scratch_sidecar(&scratch);
+        let full = std::fs::read(&side).unwrap();
+        std::fs::write(&side, &full[..full.len() / 2]).unwrap();
+
+        drop(c);
+        let reopened = ContentCache::open(content.clone(), pins, 0, db).unwrap();
+
+        assert!(
+            reopened.recovered_writes().is_empty(),
+            "an unparseable record cannot be replayed"
+        );
+        let rescued: Vec<PathBuf> = std::fs::read_dir(content.join("recovery"))
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_none_or(|e| e != "json"))
+            .collect();
+        assert_eq!(rescued.len(), 1, "the blob is still moved to recovery");
+        assert_eq!(std::fs::read(&rescued[0]).unwrap(), b"user work");
+    }
+
+    /// `mark_scratch_durable` is called repeatedly as a file is fsynced. Each
+    /// call has to leave one complete, parseable record and no debris.
+    #[test]
+    fn remarking_a_scratch_file_replaces_its_record_atomically() {
+        use std::io::Write as _;
+
+        let (c, _dir) = cache();
+        let (mut file, scratch) = c.create_scratch().unwrap();
+        file.write_all(b"first").unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+
+        let mut meta = StagedWrite {
+            uid: uid("remark").to_string(),
+            len: 5,
+            base_size: 0,
+            base_mtime: 0,
+            authored: vec![(0, 5)],
+            complete: true,
+            based_on: None,
+        };
+        c.mark_scratch_durable(&scratch, &meta).unwrap();
+        meta.len = 11;
+        meta.authored = vec![(0, 11)];
+        c.mark_scratch_durable(&scratch, &meta).unwrap();
+
+        let side = ContentCache::scratch_sidecar(&scratch);
+        let got: StagedWrite = serde_json::from_slice(&std::fs::read(&side).unwrap()).unwrap();
+        assert_eq!(got.len, 11);
+        assert_eq!(got.authored, vec![(0, 11)]);
+        assert!(
+            !side.with_extension("json.tmp").exists(),
+            "the temporary is renamed, not left behind"
+        );
+    }
+
+    // ---- B52: staged-write publication is crash-safe -----------------------
+
+    /// The cross-filesystem half of `stage_write`. The source is copied, not
+    /// renamed, and must not be removed until the destination and its sidecar
+    /// are both on disk.
+    #[test]
+    fn staging_across_a_device_boundary_removes_the_source_last() {
+        use std::io::Write as _;
+
+        let Some(elsewhere) = other_device_dir("stage") else {
+            eprintln!("skipped: no second filesystem available to cross");
+            return;
+        };
+        let (c, _dir) = cache();
+        let scratch = elsewhere.join("scratch-blob");
+        {
+            let mut file = std::fs::File::create(&scratch).unwrap();
+            file.write_all(b"staged across devices").unwrap();
+            file.sync_all().unwrap();
+        }
+
+        let meta = preservation_meta();
+        let staged = c.stage_write(&meta, &scratch).unwrap();
+
+        assert_eq!(std::fs::read(&staged).unwrap(), b"staged across devices");
+        let sidecar: StagedWrite =
+            serde_json::from_slice(&std::fs::read(staged.with_extension("json")).unwrap()).unwrap();
+        assert_eq!(sidecar.uid, meta.uid);
+        assert!(
+            !scratch.exists(),
+            "the source goes last, and only on success"
+        );
+        let _ = std::fs::remove_dir_all(&elsewhere);
+    }
+
+    /// And when the sidecar cannot be published, the copied source stays: a
+    /// staged blob nothing describes is not a substitute for the bytes.
+    #[test]
+    fn a_failed_staging_sidecar_keeps_the_cross_device_source() {
+        use std::io::Write as _;
+
+        let Some(elsewhere) = other_device_dir("stage-fail") else {
+            eprintln!("skipped: no second filesystem available to cross");
+            return;
+        };
+        let (c, _dir) = cache();
+        let scratch = elsewhere.join("scratch-blob");
+        {
+            let mut file = std::fs::File::create(&scratch).unwrap();
+            file.write_all(b"still the source").unwrap();
+            file.sync_all().unwrap();
+        }
+
+        // Block the sidecar's temporary name with a directory, so the copy
+        // lands and only publication fails.
+        let meta = preservation_meta();
+        let destination = c.staging_dir.join("blocked-sidecar");
+        std::fs::create_dir(destination.with_extension("json.tmp")).unwrap();
+
+        assert!(c.stage_write_at(&meta, &scratch, &destination).is_err());
+        assert_eq!(
+            std::fs::read(&scratch).unwrap(),
+            b"still the source",
+            "an unpublished staging blob does not authorise deleting the source"
+        );
+        let _ = std::fs::remove_dir_all(&elsewhere);
+    }
+
+    /// A staged blob whose sidecar never landed is still user data. Startup
+    /// must leave both it and the leftover temporary alone rather than tidying
+    /// the bytes away.
+    #[test]
+    fn an_unaccompanied_staged_blob_survives_a_restart() {
+        let dir = TempDir::new();
+        let db = Arc::new(Db::open_in_memory().unwrap());
+        let content = dir.path().join("content");
+        let pins = dir.path().join("pins.json");
+        let c = ContentCache::open(content.clone(), pins.clone(), 0, db.clone()).unwrap();
+
+        let orphan = c.staging_dir.join("unaccompanied-bytes");
+        std::fs::write(&orphan, b"nobody describes me").unwrap();
+        let leftover = c.staging_dir.join("interrupted.json.tmp");
+        std::fs::write(&leftover, b"{\"uid\":\"prot").unwrap();
+
+        drop(c);
+        let _reopened = ContentCache::open(content, pins, 0, db).unwrap();
+        assert_eq!(
+            std::fs::read(&orphan).unwrap(),
+            b"nobody describes me",
+            "staging is never cleared on startup"
+        );
+        assert!(leftover.exists());
     }
 
     #[test]

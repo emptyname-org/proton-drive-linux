@@ -1895,6 +1895,123 @@ fn failed_superseding_insert_keeps_the_old_pending_op() {
     assert_eq!(ops[0].blob_path.as_deref(), Some("/staging/original"));
 }
 
+/// B53's remaining half. The insert-failure regression above proves the *row*
+/// rolls back; this proves the two things that make the rollback usable — the
+/// old blob is not reported as superseded (so the caller does not delete the
+/// bytes the surviving row still points at), and the rollback survives a
+/// restart rather than living only in the connection that failed.
+#[test]
+fn a_rolled_back_supersede_keeps_its_blob_and_survives_reopen() {
+    let dir = std::env::temp_dir().join(format!("pdfs-db-b53-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("queue.sqlite");
+    let op = |blob: &str| PendingOp {
+        id: 0,
+        kind: OP_REVISION.to_string(),
+        uid: uid("durable").to_string(),
+        parent_uid: None,
+        name: None,
+        blob_path: Some(blob.to_string()),
+        meta_json: Some("{}".to_string()),
+        created_at: 1,
+        attempts: 0,
+        last_error: None,
+        next_attempt_at: 0,
+    };
+
+    {
+        let db = Db::open(&path).unwrap();
+        db.enqueue_op(&op("/staging/original")).unwrap();
+        db.with_conn(|conn| {
+            conn.execute_batch(
+                "CREATE TRIGGER reject_replacement BEFORE INSERT ON pending_op
+                 WHEN NEW.blob_path = '/staging/replacement'
+                 BEGIN SELECT RAISE(ABORT, 'injected insert failure'); END;",
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+        // The failure must not hand back the old blob path. That value is the
+        // caller's instruction to delete those bytes, and the row that owns
+        // them is still queued.
+        assert!(db.enqueue_op(&op("/staging/replacement")).is_err());
+        db.with_conn(|conn| {
+            conn.execute_batch("DROP TRIGGER reject_replacement")?;
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    let db = Db::open(&path).unwrap();
+    let ops = db.pending_ops().unwrap();
+    assert_eq!(ops.len(), 1, "old or new — never neither");
+    assert_eq!(ops[0].blob_path.as_deref(), Some("/staging/original"));
+
+    // And once the injected failure is gone, superseding works and *does*
+    // report the blob it retired.
+    let (_, superseded) = db.enqueue_op(&op("/staging/replacement")).unwrap();
+    assert_eq!(superseded.as_deref(), Some("/staging/original"));
+    assert_eq!(db.pending_ops().unwrap().len(), 1);
+
+    drop(db);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// A full disk, as SQLite reports it. `max_page_count` makes the database
+/// refuse to grow, which is the same `SQLITE_FULL` an out-of-space filesystem
+/// produces — and the queue must come out of it with the acknowledged work
+/// still in it (B53).
+#[test]
+fn a_full_database_rolls_the_supersede_back_rather_than_erasing_it() {
+    let db = Db::open_in_memory().unwrap();
+    let op = |blob: &str| PendingOp {
+        id: 0,
+        kind: OP_REVISION.to_string(),
+        uid: uid("full").to_string(),
+        parent_uid: None,
+        name: None,
+        blob_path: Some(blob.to_string()),
+        meta_json: Some("{}".to_string()),
+        created_at: 1,
+        attempts: 0,
+        last_error: None,
+        next_attempt_at: 0,
+    };
+    db.enqueue_op(&op("/staging/original")).unwrap();
+
+    // Cap the file at its current size, so any page the insert needs fails.
+    let pages: i64 = db
+        .with_conn(|conn| Ok(conn.query_row("PRAGMA page_count", [], |r| r.get(0))?))
+        .unwrap();
+    db.with_conn(|conn| {
+        conn.execute_batch(&format!("PRAGMA max_page_count = {pages}"))?;
+        Ok(())
+    })
+    .unwrap();
+
+    // A payload far larger than one page, so growth is unavoidable.
+    let mut fat = op("/staging/replacement");
+    fat.meta_json = Some("x".repeat(512 * 1024));
+    let result = db.enqueue_op(&fat);
+
+    db.with_conn(|conn| {
+        conn.execute_batch("PRAGMA max_page_count = 1073741823")?;
+        Ok(())
+    })
+    .unwrap();
+
+    assert!(result.is_err(), "a database that cannot grow must refuse");
+    let ops = db.pending_ops().unwrap();
+    assert_eq!(ops.len(), 1);
+    assert_eq!(
+        ops[0].blob_path.as_deref(),
+        Some("/staging/original"),
+        "the acknowledged upload is still queued and still owns its bytes"
+    );
+}
+
 #[test]
 fn atomic_trash_replacement_returns_owned_blobs_after_commit() {
     let db = Db::open_in_memory().unwrap();

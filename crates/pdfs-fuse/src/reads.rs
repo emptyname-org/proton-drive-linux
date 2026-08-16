@@ -102,22 +102,38 @@ static NEXT_OPEN_ID: AtomicU64 = AtomicU64::new(0);
 /// Validated by the same `(mtime, size)` pair the on-disk caches use: a node
 /// whose tag no longer matches has its blocks dropped rather than served, so a
 /// new revision can never be stitched together from the old one.
+/// A ring entry's identity: the node, and the plaintext range the block covers.
+///
+/// The range, rather than the block index, because the index alone stopped
+/// naming one range when the geometry started coming from the revision — a
+/// block cached under the [`BlockGeometry::uniform`] fallback and the block at
+/// the same index under the real geometry are different bytes
+/// (`docs/BUGS.md` B85). A range is the same identity under either plan, so a
+/// re-planned read misses rather than being served the wrong bytes.
+type RingKey = (NodeUid, BlockSpan);
+
 #[derive(Default)]
 pub(super) struct BlockRing {
-    blocks: HashMap<(NodeUid, u64), Arc<Vec<u8>>>,
+    blocks: HashMap<RingKey, Arc<Vec<u8>>>,
     /// Keys least-recently-used first, for eviction.
-    order: VecDeque<(NodeUid, u64)>,
+    order: VecDeque<RingKey>,
     /// Per-node validity tag, `(mtime, size)`.
     tags: HashMap<NodeUid, (i64, u64)>,
     bytes: u64,
 }
 
 impl BlockRing {
-    fn get(&mut self, uid: &NodeUid, mtime: i64, size: u64, idx: u64) -> Option<Arc<Vec<u8>>> {
+    fn get(
+        &mut self,
+        uid: &NodeUid,
+        mtime: i64,
+        size: u64,
+        span: BlockSpan,
+    ) -> Option<Arc<Vec<u8>>> {
         if self.tags.get(uid) != Some(&(mtime, size)) {
             return None;
         }
-        let key = (uid.clone(), idx);
+        let key = (uid.clone(), span);
         let hit = self.blocks.get(&key).cloned()?;
         // Move to the young end: a block being read repeatedly (the whole reason
         // this exists) must not age out under a sequential read passing through.
@@ -128,14 +144,21 @@ impl BlockRing {
         Some(hit)
     }
 
-    fn insert(&mut self, uid: &NodeUid, mtime: i64, size: u64, idx: u64, bytes: Arc<Vec<u8>>) {
+    fn insert(
+        &mut self,
+        uid: &NodeUid,
+        mtime: i64,
+        size: u64,
+        span: BlockSpan,
+        bytes: Arc<Vec<u8>>,
+    ) {
         if self.tags.get(uid) != Some(&(mtime, size)) {
             // Revision changed under us (or first sight): anything held for this
             // node describes the old one.
             self.drop_node(uid);
             self.tags.insert(uid.clone(), (mtime, size));
         }
-        let key = (uid.clone(), idx);
+        let key = (uid.clone(), span);
         if self.blocks.contains_key(&key) {
             return;
         }
@@ -176,8 +199,10 @@ impl BlockRing {
 /// The result of fetching one block, shared between everyone who wanted it.
 type BlockResult = Result<Arc<Vec<u8>>, Errno>;
 
-/// Identifies a block *of a revision*: node, validity tag, index.
-type BlockKey = (NodeUid, i64, u64, u64);
+/// Identifies a block *of a revision*: node, validity tag, and the plaintext
+/// range the block covers — see [`RingKey`] for why it is the range and not the
+/// index.
+type BlockKey = (NodeUid, i64, u64, BlockSpan);
 
 /// A claim on a block key: who owns the fetch, and where its result is published.
 type Claim = (u64, tokio::sync::watch::Receiver<Option<BlockResult>>);
@@ -417,11 +442,30 @@ impl Core {
         self.prefetch.streams.lock().remove(uid);
     }
 
+    /// How this revision's plaintext is divided into content blocks.
+    ///
+    /// The revision's own geometry when a previous read has learned and recorded
+    /// it, and the [`BLOCK_SIZE`] assumption when it has not — which is every
+    /// first read, because learning it means opening a `RevisionReader`, and
+    /// opening one per read is precisely the per-file key derivation the block
+    /// cache exists to avoid (bugs.md B12, B85).
+    ///
+    /// Being wrong here is not a correctness problem: `read_at` plans over the
+    /// real sizes and clamps to what was asked for either way. It costs a
+    /// straddling fetch and a cached block the next read will not ask for, and
+    /// both settle once the geometry is known.
+    fn block_geometry(&self, uid: &NodeUid, mtime: i64, fsize: u64) -> BlockGeometry {
+        self.cache
+            .block_geometry(uid, mtime, fsize)
+            .unwrap_or_else(|| BlockGeometry::uniform(fsize))
+    }
+
     /// Serve bytes `[offset, offset + len)` of `uid`'s active revision, hitting
     /// the on-disk caches before the network: a whole-file blob (pinned files)
-    /// first, then the block cache — fetching only the [`BLOCK_SIZE`]-aligned
-    /// blocks that overlap the request and caching each. `mtime`/`fsize` validate
-    /// both caches. Network I/O runs without any lock held.
+    /// first, then the block cache — fetching only the blocks that overlap the
+    /// request, on the revision's own boundaries ([`Core::block_geometry`]), and
+    /// caching each. `mtime`/`fsize` validate both caches. Network I/O runs
+    /// without any lock held.
     pub(super) fn read_range(
         &self,
         uid: &NodeUid,
@@ -500,7 +544,7 @@ impl Core {
         Ok(out)
     }
 
-    /// Fetch block `bidx`, joining a fetch already in flight for it rather than
+    /// Fetch the block at `span`, joining a fetch already in flight rather than
     /// issuing a second one, and publish the result to everyone who joined.
     ///
     /// See [`BlockFlight`]. A follower whose leader disappears (a panic, or a
@@ -512,10 +556,10 @@ impl Core {
         uid: &NodeUid,
         mtime: i64,
         fsize: u64,
-        bidx: u64,
+        span: BlockSpan,
         cache_blocks: bool,
     ) -> BlockResult {
-        let key: BlockKey = (uid.clone(), mtime, fsize, bidx);
+        let key: BlockKey = (uid.clone(), mtime, fsize, span);
         let claim = {
             let mut inflight = self.block_flight.inflight.lock();
             match inflight.get(&key) {
@@ -547,12 +591,12 @@ impl Core {
                     }
                 }
                 return self
-                    .read_block(reader, uid, mtime, fsize, bidx, cache_blocks)
+                    .read_block(reader, uid, mtime, fsize, span, cache_blocks)
                     .await;
             }
         };
         let result = self
-            .read_block(reader, uid, mtime, fsize, bidx, cache_blocks)
+            .read_block(reader, uid, mtime, fsize, span, cache_blocks)
             .await;
         // Retire the claim before publishing, so a racer that wakes and re-enters
         // finds no stale entry to join.
@@ -578,11 +622,9 @@ impl Core {
         uid: &NodeUid,
         mtime: i64,
         fsize: u64,
-        bidx: u64,
+        span: BlockSpan,
         cache_blocks: bool,
     ) -> BlockResult {
-        let bstart = bidx * BLOCK_SIZE;
-        let blen = block_len(fsize, bidx);
         // The reader derives every block boundary from the revision's recorded
         // block sizes. If they do not add up to the size the node reports, this
         // file's boundaries are wrong, and the failure is not confined to short
@@ -591,25 +633,33 @@ impl Core {
         // kind takes the file off the range path entirely (bugs.md B84).
         let bytes = if reader.size() != fsize {
             warn!(
-                %uid, bidx, fsize,
+                %uid, bidx = span.idx, fsize,
                 reader_size = reader.size(),
                 reader_blocks = reader.block_sizes().len(),
                 "the revision's block table disagrees with the node size"
             );
-            self.repair_block(uid, mtime, fsize, bidx).await?
+            self.repair_block(uid, mtime, fsize, span).await?
         } else {
-            let bytes = reader.read_at(bstart, blen).await.map_err(|e| {
-                warn!(%uid, bstart, blen, error = %e, "block read failed");
+            // Learned here rather than on a path of its own: this is where a
+            // reader is open anyway, and recording the real geometry is what
+            // lets the *next* read plan its blocks on the revision's own
+            // boundaries instead of the 4 MiB fallback (bugs.md B85).
+            if cache_blocks {
+                self.cache
+                    .store_block_geometry(uid, mtime, fsize, reader.block_sizes());
+            }
+            let bytes = reader.read_at(span.start, span.len).await.map_err(|e| {
+                warn!(%uid, start = span.start, len = span.len, error = %e, "block read failed");
                 Errno::EIO
             })?;
-            if bytes.len() as u64 == blen {
+            if bytes.len() as u64 == span.len {
                 bytes
             } else {
                 warn!(
-                    %uid, bidx, blen, got = bytes.len(), fsize,
-                    "block came back shorter than the file's size implies"
+                    %uid, bidx = span.idx, blen = span.len, got = bytes.len(), fsize,
+                    "block came back shorter than the range asked for"
                 );
-                self.repair_block(uid, mtime, fsize, bidx).await?
+                self.repair_block(uid, mtime, fsize, span).await?
             }
         };
         let bytes = Arc::new(bytes);
@@ -618,16 +668,16 @@ impl Core {
             let uid = uid.clone();
             let bytes = bytes.clone();
             tokio::task::spawn_blocking(move || {
-                let _ = cache.store_block(&uid, mtime, fsize, bidx, &bytes);
+                let _ = cache.store_block(&uid, mtime, fsize, span, &bytes);
             });
         }
         self.block_ring
             .lock()
-            .insert(uid, mtime, fsize, bidx, bytes.clone());
+            .insert(uid, mtime, fsize, span, bytes.clone());
         Ok(bytes)
     }
 
-    /// Recover block `bidx` of a file whose per-block reads cannot be trusted,
+    /// Recover the block at `span` of a file whose per-block reads cannot be
     /// by fetching the whole revision through the manifest-verified download and
     /// serving the block out of that.
     ///
@@ -648,10 +698,9 @@ impl Core {
         uid: &NodeUid,
         mtime: i64,
         fsize: u64,
-        bidx: u64,
+        span: BlockSpan,
     ) -> Result<Vec<u8>, Errno> {
-        let blen = block_len(fsize, bidx);
-        let bstart = bidx * BLOCK_SIZE;
+        let (bstart, blen) = (span.start, span.len);
         if fsize > REPAIR_MAX {
             warn!(
                 %uid, fsize,
@@ -683,11 +732,11 @@ impl Core {
         }
         match self.cache.read_range(uid, mtime, fsize, bstart, blen) {
             Some(bytes) if bytes.len() as u64 == blen => {
-                info!(%uid, bidx, "served a short block from a repaired whole-file download");
+                info!(%uid, bidx = span.idx, "served a short block from a repaired whole-file download");
                 Ok(bytes)
             }
             _ => {
-                error!(%uid, bidx, fsize, "repairing a short block did not produce the block");
+                error!(%uid, bidx = span.idx, fsize, "repairing a short block did not produce the block");
                 Err(Errno::EIO)
             }
         }
@@ -776,17 +825,19 @@ impl Core {
         if depth == 0 {
             return;
         }
-        let last_block = fsize.saturating_sub(1) / BLOCK_SIZE;
-        let wanted: Vec<u64> = ((last + 1)..=(last + depth).min(last_block))
-            .filter(|&bidx| {
+        let geometry = self.block_geometry(uid, mtime, fsize);
+        let last_block = geometry.blocks().saturating_sub(1);
+        let wanted: Vec<BlockSpan> = ((last + 1)..=(last + depth).min(last_block))
+            .filter_map(|bidx| geometry.span(bidx))
+            .filter(|&span| {
                 // Blocks already in memory need nothing; blocks already on disk
                 // are cheap enough to serve that spending a round-trip to move
                 // them into the ring would be the wrong trade.
                 self.block_ring
                     .lock()
-                    .get(uid, mtime, fsize, bidx)
+                    .get(uid, mtime, fsize, span)
                     .is_none()
-                    && !(cache_blocks && self.cache.has_block(uid, mtime, fsize, bidx))
+                    && !(cache_blocks && self.cache.has_block(uid, mtime, fsize, span))
             })
             .collect();
         if wanted.is_empty() {
@@ -803,7 +854,7 @@ impl Core {
             // round-trips, and the reader catches up with the window before it
             // finishes.
             let mut set = tokio::task::JoinSet::new();
-            for bidx in wanted {
+            for span in wanted {
                 let Ok(permit) = core.prefetch_budget.clone().try_acquire_owned() else {
                     break; // the budget is spent; the demand path can have it
                 };
@@ -811,10 +862,10 @@ impl Core {
                 set.spawn(async move {
                     let _permit = permit;
                     if let Err(error) = core
-                        .fetch_block(&reader, &uid, mtime, fsize, bidx, cache_blocks)
+                        .fetch_block(&reader, &uid, mtime, fsize, span, cache_blocks)
                         .await
                     {
-                        debug!(%uid, bidx, ?error, "prefetch failed");
+                        debug!(%uid, bidx = span.idx, ?error, "prefetch failed");
                     }
                 });
             }
@@ -844,8 +895,13 @@ impl Core {
         }
         let end = offset.saturating_add(len).min(fsize);
         let mut out = Vec::with_capacity((end - offset) as usize);
-        let first = offset / BLOCK_SIZE;
-        let last = (end - 1) / BLOCK_SIZE;
+        // On the revision's own boundaries where they are known, and on the
+        // 4 MiB fallback where they are not (bugs.md B85).
+        let wanted = self.block_geometry(uid, mtime, fsize).spans(offset, end);
+        let (Some(&head), Some(&tail)) = (wanted.first(), wanted.last()) else {
+            return Ok(out);
+        };
+        let (first, last) = (head.idx, tail.idx);
 
         // Collect the blocks overlapping the request, serving any already cached
         // and fetching the rest concurrently. A multi-block read (e.g. a media
@@ -853,31 +909,31 @@ impl Core {
         // would otherwise stall on each block round-trip in turn; downloading the
         // misses in parallel saturates the connection and bounds latency at the
         // slowest single block instead of their sum.
-        let mut blocks: Vec<Option<Arc<Vec<u8>>>> = Vec::with_capacity((last - first + 1) as usize);
-        let mut misses: Vec<u64> = Vec::new();
-        for bidx in first..=last {
+        let mut blocks: Vec<Option<Arc<Vec<u8>>>> = Vec::with_capacity(wanted.len());
+        let mut misses: Vec<BlockSpan> = Vec::new();
+        for &span in &wanted {
             // The in-memory ring comes first on both paths: a streaming read has
             // no other cache at all, and a cached one would otherwise pay two
             // opens, a JSON parse and a 4 MiB read+alloc for every 128 KiB the
             // kernel asks for (audit T3).
-            let hit = self.block_ring.lock().get(uid, mtime, fsize, bidx);
+            let hit = self.block_ring.lock().get(uid, mtime, fsize, span);
             let hit = hit.or_else(|| {
                 if !cache_blocks {
                     return None;
                 }
-                let bytes = Arc::new(self.cache.cached_block(uid, mtime, fsize, bidx)?);
+                let bytes = Arc::new(self.cache.cached_block(uid, mtime, fsize, span)?);
                 // Promote it, so the other ~31 reads of this block are answered
                 // from memory.
                 self.block_ring
                     .lock()
-                    .insert(uid, mtime, fsize, bidx, bytes.clone());
+                    .insert(uid, mtime, fsize, span, bytes.clone());
                 Some(bytes)
             });
             match hit {
                 Some(b) => blocks.push(Some(b)),
                 None => {
                     blocks.push(None);
-                    misses.push(bidx);
+                    misses.push(span);
                 }
             }
         }
@@ -890,12 +946,12 @@ impl Core {
                 let reader = self.revision_reader(uid, mtime, fsize).await?;
 
                 let mut set = tokio::task::JoinSet::new();
-                for &bidx in &misses {
+                for &span in &misses {
                     let (core, reader, uid) = (self.clone(), reader.clone(), uid.clone());
                     set.spawn(async move {
-                        core.fetch_block(&reader, &uid, mtime, fsize, bidx, cache_blocks)
+                        core.fetch_block(&reader, &uid, mtime, fsize, span, cache_blocks)
                             .await
-                            .map(|bytes| (bidx, bytes))
+                            .map(|bytes| (span.idx, bytes))
                     });
                 }
                 let mut out = Vec::with_capacity(misses.len());
@@ -913,18 +969,20 @@ impl Core {
         // ahead of a sequential reader instead of stalling once it catches up.
         self.prefetch_ahead(uid, mtime, fsize, first, last, cache_blocks);
 
-        for (i, block) in blocks.into_iter().enumerate() {
-            let bidx = first + i as u64;
-            let bstart = bidx * BLOCK_SIZE;
+        for (span, block) in wanted.into_iter().zip(blocks) {
+            let bstart = span.start;
             // Every slot is populated: cache hits up front, misses by the fetch above.
             let block = block.expect("block fetched or cached");
-            // Both sources guarantee the length the file's size implies — the
-            // cache validates it on read, the network path in `read_block` — so
-            // this refuses rather than quietly contributing fewer bytes than the
-            // range covers, which is what turned a bad block into a truncated
-            // file (bugs.md B84).
-            if block.len() as u64 != block_len(fsize, bidx) {
-                error!(%uid, bidx, len = block.len(), fsize, "assembling a read hit a short block");
+            // Both sources guarantee the length the geometry says the block has
+            // — the cache validates it on read, the network path in `read_block`
+            // — so this refuses rather than quietly contributing fewer bytes
+            // than the range covers, which is what turned a bad block into a
+            // truncated file (bugs.md B84).
+            if block.len() as u64 != span.len {
+                error!(
+                    %uid, bidx = span.idx, len = block.len(), expected = span.len, fsize,
+                    "assembling a read hit a short block"
+                );
                 return Err(Errno::EIO);
             }
             let s = (offset.max(bstart) - bstart) as usize;
@@ -1016,13 +1074,13 @@ impl Core {
             return None;
         }
         let mut out = Vec::with_capacity((end - offset) as usize);
-        for bidx in (offset / BLOCK_SIZE)..=((end - 1) / BLOCK_SIZE) {
-            let ring = self.block_ring.lock().get(uid, mtime, fsize, bidx);
+        for span in self.block_geometry(uid, mtime, fsize).spans(offset, end) {
+            let ring = self.block_ring.lock().get(uid, mtime, fsize, span);
             let block = match ring {
                 Some(bytes) => bytes,
-                None => Arc::new(self.cache.cached_block(uid, mtime, fsize, bidx)?),
+                None => Arc::new(self.cache.cached_block(uid, mtime, fsize, span)?),
             };
-            let bstart = bidx * BLOCK_SIZE;
+            let bstart = span.start;
             let s = (offset.max(bstart) - bstart) as usize;
             let e = (end.min(bstart + block.len() as u64) - bstart) as usize;
             if s >= e {
@@ -1142,31 +1200,42 @@ mod block_ring_tests {
         RING_BYTES / BLOCK_SIZE
     }
 
+    /// Block `idx` under the uniform geometry — the shape these tests are
+    /// written against, since what they exercise is tagging and eviction rather
+    /// than block layout.
+    fn span(idx: u64) -> BlockSpan {
+        BlockSpan {
+            idx,
+            start: idx * BLOCK_SIZE,
+            len: BLOCK_SIZE,
+        }
+    }
+
     #[test]
     fn a_stored_block_is_served_back() {
         let mut ring = BlockRing::default();
         let node = uid("a");
-        ring.insert(&node, 7, 100, 3, block(0xab));
-        assert_eq!(ring.get(&node, 7, 100, 3).map(|b| b[0]), Some(0xab));
+        ring.insert(&node, 7, 100, span(3), block(0xab));
+        assert_eq!(ring.get(&node, 7, 100, span(3)).map(|b| b[0]), Some(0xab));
     }
 
     #[test]
     fn a_block_of_another_revision_is_never_served() {
         let mut ring = BlockRing::default();
         let node = uid("a");
-        ring.insert(&node, 7, 100, 0, block(1));
+        ring.insert(&node, 7, 100, span(0), block(1));
         // Same node, newer revision: the tag moved, so the old bytes go.
-        assert!(ring.get(&node, 8, 100, 0).is_none());
-        assert!(ring.get(&node, 7, 101, 0).is_none());
+        assert!(ring.get(&node, 8, 100, span(0)).is_none());
+        assert!(ring.get(&node, 7, 101, span(0)).is_none());
     }
 
     #[test]
     fn a_new_revision_drops_what_the_old_one_left() {
         let mut ring = BlockRing::default();
         let node = uid("a");
-        ring.insert(&node, 7, 100, 0, block(1));
-        ring.insert(&node, 8, 100, 0, block(2));
-        assert_eq!(ring.get(&node, 8, 100, 0).map(|b| b[0]), Some(2));
+        ring.insert(&node, 7, 100, span(0), block(1));
+        ring.insert(&node, 8, 100, span(0), block(2));
+        assert_eq!(ring.get(&node, 8, 100, span(0)).map(|b| b[0]), Some(2));
         assert_eq!(ring.bytes, BLOCK_SIZE);
     }
 
@@ -1175,13 +1244,13 @@ mod block_ring_tests {
         let mut ring = BlockRing::default();
         let node = uid("a");
         for idx in 0..capacity() {
-            ring.insert(&node, 1, u64::MAX, idx, block(idx as u8));
+            ring.insert(&node, 1, u64::MAX, span(idx), block(idx as u8));
         }
         // Re-reading block 0 makes block 1 the oldest instead.
-        assert!(ring.get(&node, 1, u64::MAX, 0).is_some());
-        ring.insert(&node, 1, u64::MAX, capacity(), block(0xff));
-        assert!(ring.get(&node, 1, u64::MAX, 0).is_some());
-        assert!(ring.get(&node, 1, u64::MAX, 1).is_none());
+        assert!(ring.get(&node, 1, u64::MAX, span(0)).is_some());
+        ring.insert(&node, 1, u64::MAX, span(capacity()), block(0xff));
+        assert!(ring.get(&node, 1, u64::MAX, span(0)).is_some());
+        assert!(ring.get(&node, 1, u64::MAX, span(1)).is_none());
         assert_eq!(ring.bytes, RING_BYTES);
     }
 
@@ -1189,9 +1258,9 @@ mod block_ring_tests {
     fn a_node_whose_last_block_ages_out_keeps_no_tag() {
         let mut ring = BlockRing::default();
         let (old, new) = (uid("old"), uid("new"));
-        ring.insert(&old, 1, u64::MAX, 0, block(1));
+        ring.insert(&old, 1, u64::MAX, span(0), block(1));
         for idx in 0..capacity() {
-            ring.insert(&new, 1, u64::MAX, idx, block(2));
+            ring.insert(&new, 1, u64::MAX, span(idx), block(2));
         }
         assert!(!ring.tags.contains_key(&old));
         assert!(ring.tags.contains_key(&new));
@@ -1201,11 +1270,11 @@ mod block_ring_tests {
     fn dropping_a_node_frees_only_its_own_bytes() {
         let mut ring = BlockRing::default();
         let (a, b) = (uid("a"), uid("b"));
-        ring.insert(&a, 1, 100, 0, block(1));
-        ring.insert(&b, 1, 100, 0, block(2));
+        ring.insert(&a, 1, 100, span(0), block(1));
+        ring.insert(&b, 1, 100, span(0), block(2));
         ring.drop_node(&a);
-        assert!(ring.get(&a, 1, 100, 0).is_none());
-        assert_eq!(ring.get(&b, 1, 100, 0).map(|x| x[0]), Some(2));
+        assert!(ring.get(&a, 1, 100, span(0)).is_none());
+        assert_eq!(ring.get(&b, 1, 100, span(0)).map(|x| x[0]), Some(2));
         assert_eq!(ring.bytes, BLOCK_SIZE);
     }
 }

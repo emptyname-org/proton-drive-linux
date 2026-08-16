@@ -55,7 +55,7 @@ use fuser::{
 };
 use futures::StreamExt as _;
 use pdfs_core::batch;
-use pdfs_core::cache::{BLOCK_SIZE, Baseline, ContentCache, StagedWrite, block_len};
+use pdfs_core::cache::{BLOCK_SIZE, Baseline, BlockGeometry, BlockSpan, ContentCache, StagedWrite};
 use pdfs_core::config::{AppDirs, SweepMode};
 use pdfs_core::control::{
     ActivityEntry, ActivityKind, DirEntry, ErrorKind, LocalHit, PhotoKind, PublicLinkInfo,
@@ -715,6 +715,26 @@ struct MountedState {
     /// [`Core::notifier`], still empty until its session is spawned.
     notifier: Arc<OnceLock<Notifier>>,
     session_live: Arc<AtomicBool>,
+    /// This mount's in-flight size upgrades, keyed by *its* folder inodes — so
+    /// a `Core` rebuilt onto this inode space by [`Core::rooted_at`] shares the
+    /// batch the mount's own session is already running rather than starting a
+    /// second one against inode numbers that mean nothing to it.
+    size_upgrades: Arc<Mutex<HashMap<u64, Arc<SizeUpgrade>>>>,
+}
+
+/// The per-mount half of a [`Core`] — every field [`Core::fork_state`] gives a
+/// fork a fresh copy of — recovered from the registry.
+///
+/// This is what lets a control request naming a path under a secondary mount be
+/// answered *in that mount's inode space* instead of being rejected for not
+/// being under the primary mountpoint (`docs/BUGS.md` B86). See
+/// [`Core::rooted_at`].
+struct MountParts {
+    mountpoint: PathBuf,
+    state: Arc<Mutex<State>>,
+    notifier: Arc<OnceLock<Notifier>>,
+    session_live: Arc<AtomicBool>,
+    size_upgrades: Arc<Mutex<HashMap<u64, Arc<SizeUpgrade>>>>,
 }
 
 /// Every mounted inode space in the daemon, shared by the primary `Core` and
@@ -737,6 +757,7 @@ impl StateRegistry {
         state: &Arc<Mutex<State>>,
         notifier: Arc<OnceLock<Notifier>>,
         session_live: Arc<AtomicBool>,
+        size_upgrades: Arc<Mutex<HashMap<u64, Arc<SizeUpgrade>>>>,
     ) {
         let mut states = self.0.lock();
         states.retain(|m| m.state.strong_count() > 0);
@@ -751,6 +772,7 @@ impl StateRegistry {
             state: Arc::downgrade(state),
             notifier,
             session_live,
+            size_upgrades,
         });
     }
 
@@ -777,9 +799,9 @@ impl StateRegistry {
     ///
     /// On-demand roots can be nested below another location. Selecting by the
     /// longest component prefix ensures the nested session wins rather than the
-    /// broader primary mount. Callers currently need the selected mount only;
-    /// a future path router can derive a relative suffix with
-    /// `path.strip_prefix(mountpoint)` without storing a second path value here.
+    /// broader primary mount. Callers that need the relative suffix derive it
+    /// with `path.strip_prefix(mountpoint)`; [`StateRegistry::covering_parts`]
+    /// is the variant that also hands back enough to *serve* a request there.
     fn covering(&self, path: &Path) -> Option<LiveMount> {
         self.live()
             .into_iter()
@@ -787,6 +809,48 @@ impl StateRegistry {
                 live.load(Ordering::Acquire) && path.starts_with(mountpoint)
             })
             .max_by_key(|(mountpoint, _, _, _)| mountpoint.components().count())
+    }
+
+    /// [`StateRegistry::register`] with an empty size-upgrade map, for the
+    /// tests that exercise the reap-and-route rules and nothing else.
+    #[cfg(test)]
+    fn register_bare(
+        &self,
+        mountpoint: &Path,
+        state: &Arc<Mutex<State>>,
+        notifier: Arc<OnceLock<Notifier>>,
+        session_live: Arc<AtomicBool>,
+    ) {
+        self.register(
+            mountpoint,
+            state,
+            notifier,
+            session_live,
+            Arc::new(Mutex::new(HashMap::new())),
+        );
+    }
+
+    /// [`StateRegistry::covering`], but returning every per-mount field a
+    /// [`Core`] needs to be re-rooted onto that inode space.
+    ///
+    /// Kept separate from `covering` so the common callers — which only ask
+    /// *whether* a path is mounted — keep the cheaper tuple.
+    fn covering_parts(&self, path: &Path) -> Option<MountParts> {
+        let mut states = self.0.lock();
+        states.retain(|m| m.state.strong_count() > 0);
+        states
+            .iter()
+            .filter(|m| m.session_live.load(Ordering::Acquire) && path.starts_with(&m.mountpoint))
+            .max_by_key(|m| m.mountpoint.components().count())
+            .and_then(|m| {
+                Some(MountParts {
+                    mountpoint: m.mountpoint.clone(),
+                    state: m.state.upgrade()?,
+                    notifier: m.notifier.clone(),
+                    session_live: m.session_live.clone(),
+                    size_upgrades: m.size_upgrades.clone(),
+                })
+            })
     }
 
     fn is_mounted_at(&self, path: &Path) -> bool {
@@ -908,7 +972,39 @@ impl Core {
             &self.state,
             self.notifier.clone(),
             self.session_live.clone(),
+            self.size_upgrades.clone(),
         );
+    }
+
+    /// This `Core`, re-rooted onto whichever live mount most specifically covers
+    /// the absolute path `abs`, together with `abs` relative to that mount's
+    /// root.
+    ///
+    /// Everything a `Core` holds is per-daemon except the five fields
+    /// [`Core::fork_state`] replaces, so swapping exactly those turns the
+    /// primary `Core` into the fork that owns the path — sharing the fork's
+    /// inode space, notification channel and size-upgrade batches rather than
+    /// shadowing them. Without this, every path-addressed control request is
+    /// answered against the primary inode space, so anything under a secondary
+    /// on-demand mount is rejected as "not under the mountpoint" and the user
+    /// has no way to re-enumerate a folder they can see (`docs/BUGS.md` B86).
+    ///
+    /// `None` when no live mount covers `abs`.
+    fn rooted_at(&self, abs: &Path) -> Option<(Core, PathBuf)> {
+        let parts = self.states.covering_parts(abs)?;
+        let rel = abs.strip_prefix(&parts.mountpoint).ok()?.to_path_buf();
+        let mut core = self.clone();
+        if !Arc::ptr_eq(&parts.state, &self.state) {
+            // A different inode space, so adopt its per-mount half wholesale.
+            // `primary` is a property of the mount, and the only mount this
+            // `Core` can be the primary of is the one it was built for.
+            core.primary = false;
+            core.state = parts.state;
+            core.notifier = parts.notifier;
+            core.session_live = parts.session_live;
+            core.size_upgrades = parts.size_upgrades;
+        }
+        Some((core, rel))
     }
 
     /// Run `apply` against every live inode space — this daemon's primary mount
@@ -3934,6 +4030,33 @@ impl Core {
         }
     }
 
+    /// Drop the cached child listing of the folder `parent`, everywhere it is
+    /// held — naming the folder by uid rather than by inode.
+    ///
+    /// [`Core::invalidate_parent_listing`] is the path-based sibling, and it
+    /// only reaches *this* mount's inode space. A remote mutation made by the
+    /// sync engine needs more than that, for two reasons. The folder it changed
+    /// is usually not resident in any inode space at the time — a mirror folder
+    /// has no FUSE session at all — so there is no inode to name. And the stale
+    /// listing that outlives the pass is not a hot-cache map but the `listed`
+    /// flag on the folder's DB row, which survives a daemon restart and is what
+    /// a later `ensure_children` trusts.
+    ///
+    /// So the flag is cleared unconditionally, and the resident inode spaces are
+    /// invalidated on top of it. That is what makes a mirror folder switched to
+    /// on-demand re-enumerate instead of serving a snapshot that predates the
+    /// engine's own uploads — `docs/BUGS.md` B86.
+    pub(crate) fn invalidate_children_of(&self, parent: &NodeUid) {
+        if let Err(e) = self.db.set_listed(parent, false) {
+            warn!(uid = %parent, error = ?e, "could not clear cached listing");
+        }
+        self.for_each_state(|st| {
+            if let Some(&ino) = st.by_uid.get(parent) {
+                st.invalidate_listing(ino);
+            }
+        });
+    }
+
     /// Rename a file or folder to `new_name`. `rel` is mountpoint-relative.
     /// Mirrors the FUSE `rename` write path: rename on the remote, forget the
     /// node so it re-interns under its new name, and drop the parent listing so
@@ -5853,7 +5976,7 @@ mod tests {
             ("/mnt/fork-a", &fork_a),
             ("/mnt/fork-b", &fork_b),
         ] {
-            registry.register(
+            registry.register_bare(
                 std::path::Path::new(mountpoint),
                 state,
                 std::sync::Arc::new(std::sync::OnceLock::new()),
@@ -5904,19 +6027,19 @@ mod tests {
         let nested_live = session_flag(false);
         let sibling_live = session_flag(true);
 
-        registry.register(
+        registry.register_bare(
             primary_path,
             &primary,
             std::sync::Arc::new(std::sync::OnceLock::new()),
             primary_live.clone(),
         );
-        registry.register(
+        registry.register_bare(
             nested_path,
             &nested,
             std::sync::Arc::new(std::sync::OnceLock::new()),
             nested_live.clone(),
         );
-        registry.register(
+        registry.register_bare(
             sibling_path,
             &sibling,
             std::sync::Arc::new(std::sync::OnceLock::new()),
@@ -5994,6 +6117,71 @@ mod tests {
         assert_eq!(registry.live().len(), 2);
     }
 
+    /// The routing half of `docs/BUGS.md` B86: a path under a secondary mount
+    /// has to resolve to *that* mount's inode space and a suffix relative to
+    /// *its* root, or `pdfs ls` and `pdfs refresh` can only ever name the
+    /// primary mount and a stale on-demand folder has no escape hatch.
+    #[test]
+    fn covering_parts_route_a_path_to_the_mount_that_owns_it() {
+        let registry = StateRegistry::default();
+        let (primary, _primary_dir) = rooted_state("primary-volume", "primary");
+        let (nested, _nested_dir) = rooted_state("nested-volume", "nested");
+        let primary = std::sync::Arc::new(parking_lot::Mutex::new(primary));
+        let nested = std::sync::Arc::new(parking_lot::Mutex::new(nested));
+        let primary_path = std::path::Path::new("/home/me/ProtonDrive");
+        let nested_path = std::path::Path::new("/home/me/ProtonDrive/Device");
+        let primary_upgrades = std::sync::Arc::new(parking_lot::Mutex::new(HashMap::new()));
+        let nested_upgrades = std::sync::Arc::new(parking_lot::Mutex::new(HashMap::new()));
+
+        registry.register(
+            primary_path,
+            &primary,
+            std::sync::Arc::new(std::sync::OnceLock::new()),
+            session_flag(true),
+            primary_upgrades.clone(),
+        );
+        registry.register(
+            nested_path,
+            &nested,
+            std::sync::Arc::new(std::sync::OnceLock::new()),
+            session_flag(true),
+            nested_upgrades.clone(),
+        );
+
+        let deep = nested_path.join("sub/file.txt");
+        let parts = registry.covering_parts(&deep).expect("nested mount covers");
+        assert_eq!(parts.mountpoint, nested_path, "the nested mount wins");
+        assert!(
+            std::sync::Arc::ptr_eq(&parts.state, &nested),
+            "the request must be answered in the nested inode space"
+        );
+        assert!(
+            std::sync::Arc::ptr_eq(&parts.size_upgrades, &nested_upgrades),
+            "and share that mount's in-flight size upgrades, not the primary's"
+        );
+        assert_eq!(
+            deep.strip_prefix(&parts.mountpoint).unwrap(),
+            std::path::Path::new("sub/file.txt"),
+            "the suffix is relative to the mount that owns it, not the primary"
+        );
+
+        let shallow = primary_path.join("Documents");
+        let parts = registry
+            .covering_parts(&shallow)
+            .expect("primary mount covers");
+        assert!(
+            std::sync::Arc::ptr_eq(&parts.state, &primary),
+            "a path outside the nested root still routes to the primary"
+        );
+
+        assert!(
+            registry
+                .covering_parts(std::path::Path::new("/tmp/outside"))
+                .is_none(),
+            "a path under no mount routes nowhere, and the caller reports that"
+        );
+    }
+
     #[test]
     fn state_registry_resolves_uids_from_any_resident_mount() {
         let registry = StateRegistry::default();
@@ -6007,13 +6195,13 @@ mod tests {
         fork.children.insert(super::ROOT_INO, vec![fork_ino]);
         let primary = std::sync::Arc::new(parking_lot::Mutex::new(primary));
         let fork = std::sync::Arc::new(parking_lot::Mutex::new(fork));
-        registry.register(
+        registry.register_bare(
             std::path::Path::new("/mnt/primary"),
             &primary,
             std::sync::Arc::new(std::sync::OnceLock::new()),
             session_flag(true),
         );
-        registry.register(
+        registry.register_bare(
             std::path::Path::new("/mnt/device"),
             &fork,
             std::sync::Arc::new(std::sync::OnceLock::new()),
@@ -6041,7 +6229,7 @@ mod tests {
         let child_ino = state.intern(super::ROOT_INO, child_node);
         state.children.insert(super::ROOT_INO, vec![child_ino]);
         let state = std::sync::Arc::new(parking_lot::Mutex::new(state));
-        registry.register(
+        registry.register_bare(
             std::path::Path::new("/mnt/device"),
             &state,
             std::sync::Arc::new(std::sync::OnceLock::new()),
@@ -6104,7 +6292,7 @@ mod tests {
         );
 
         let state = std::sync::Arc::new(parking_lot::Mutex::new(state));
-        registry.register(
+        registry.register_bare(
             std::path::Path::new("/mnt/device"),
             &state,
             std::sync::Arc::new(std::sync::OnceLock::new()),
@@ -6372,7 +6560,7 @@ mod tests {
         state.children.insert(revoked_ino, vec![child_ino]);
 
         let state = std::sync::Arc::new(parking_lot::Mutex::new(state));
-        registry.register(
+        registry.register_bare(
             std::path::Path::new("/mnt/device"),
             &state,
             std::sync::Arc::new(std::sync::OnceLock::new()),
@@ -6426,7 +6614,7 @@ mod tests {
         state.children.insert(cycle_b, vec![cycle_a]);
 
         let state = std::sync::Arc::new(parking_lot::Mutex::new(state));
-        registry.register(
+        registry.register_bare(
             std::path::Path::new("/mnt/device"),
             &state,
             std::sync::Arc::new(std::sync::OnceLock::new()),

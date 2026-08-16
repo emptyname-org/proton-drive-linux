@@ -104,6 +104,31 @@ fn read_request_line(reader: &mut impl BufRead) -> std::io::Result<Option<String
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
 }
 
+/// Turn a CLI-supplied path into the mount that owns it and the path relative
+/// to *that* mount's root.
+///
+/// [`rel_to_mount`] is the older, primary-only reading, and it is what every
+/// mutating request still uses. It rejects anything outside the primary
+/// mountpoint, which leaves a secondary on-demand mount — a synced folder
+/// switched out of mirror mode — with no way to be named at all: `pdfs ls` and
+/// `pdfs refresh` both answered "is not under the mountpoint", so a folder
+/// serving a stale listing had no manual escape hatch (`docs/BUGS.md` B86).
+///
+/// A relative path keeps the old meaning, relative to the primary mount, since
+/// there is nothing in it to choose a mount by.
+fn route_to_mount(core: &Core, mountpoint: &Path, path: &str) -> CoreResult<(Core, PathBuf)> {
+    let p = Path::new(path);
+    if !p.is_absolute() {
+        return Ok((core.clone(), p.to_path_buf()));
+    }
+    if let Some(routed) = core.rooted_at(p) {
+        return Ok(routed);
+    }
+    // Fall back to the primary reading so the error text stays the familiar one
+    // when the path is simply outside everything this daemon has mounted.
+    rel_to_mount(mountpoint, path).map(|rel| (core.clone(), rel))
+}
+
 /// Turn a CLI-supplied path into a mountpoint-relative path. An absolute path
 /// must live under `mountpoint`; a relative path is taken as already relative to
 /// the mount root.
@@ -193,8 +218,8 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
         Ok(CtlRequest::ListPins) => CtlResponse::Pins {
             pins: core.cache.list_pins(),
         },
-        Ok(CtlRequest::ListDir { path }) => match rel_to_mount(mountpoint, &path) {
-            Ok(rel) => match core.list_dir(&rel) {
+        Ok(CtlRequest::ListDir { path }) => match route_to_mount(core, mountpoint, &path) {
+            Ok((core, rel)) => match core.list_dir(&rel) {
                 Ok(entries) => CtlResponse::Entries { entries },
                 Err(e) => CtlResponse::error(e),
             },
@@ -202,9 +227,8 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
         },
         Ok(CtlRequest::Refresh { scope }) => {
             let result = match &scope {
-                RefreshScope::Dir { path } => {
-                    rel_to_mount(mountpoint, path).and_then(|rel| core.refresh_dir(&rel))
-                }
+                RefreshScope::Dir { path } => route_to_mount(core, mountpoint, path)
+                    .and_then(|(core, rel)| core.refresh_dir(&rel)),
                 RefreshScope::Trash => {
                     core.invalidate_trash();
                     Ok(())
