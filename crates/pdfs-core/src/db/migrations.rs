@@ -9,7 +9,7 @@ use super::Db;
 use crate::Result;
 
 /// Current schema version. Bump on every forward migration added below.
-pub(super) const SCHEMA_VERSION: i64 = 26;
+pub(super) const SCHEMA_VERSION: i64 = 27;
 
 impl Db {
     pub(super) fn migrate(&self) -> Result<()> {
@@ -180,6 +180,25 @@ impl Db {
             )? > 0;
             if has_ops && !has_column {
                 tx.execute_batch(MIGRATION_V26)?;
+            }
+        }
+        if current < 27 {
+            // Same guards as V26, for the same two reasons: the table may not
+            // exist in an old fixture, and a fixture rewound from the current
+            // schema already has the column.
+            let has_column: bool = tx.query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('pending_op') \
+                 WHERE name = 'access_deferred_since'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )? > 0;
+            let has_ops: bool = tx.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'pending_op'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )? > 0;
+            if has_ops && !has_column {
+                tx.execute_batch(MIGRATION_V27)?;
             }
         }
         tx.execute(
@@ -768,4 +787,24 @@ ALTER TABLE pending_op ADD COLUMN claimed_at INTEGER NOT NULL DEFAULT 0;
 
 CREATE INDEX IF NOT EXISTS idx_pending_op_claimed
     ON pending_op(uid) WHERE claimed_at <> 0;
+";
+
+/// Schema v27: when an op was first deferred by the local access check.
+///
+/// An access deferral consumes no attempt and records no error — the op has not
+/// failed remotely, it has not been sent at all. That is right for a permission
+/// change the user is about to undo, and wrong for a condition that never
+/// clears: the row is re-deferred every
+/// [`DRAIN_ACCESS_RECHECK`](../../../pdfs_fuse/drain/constant.DRAIN_ACCESS_RECHECK.html)
+/// forever while `attempts`, `last_error`, `failing` and the logs all stay
+/// empty, so a queue that can never drain is indistinguishable from a busy one.
+/// Found in the field as 28 revision ops holding 18 GiB of accepted writes for
+/// 30 days, none of them visible anywhere.
+///
+/// `0` means "not currently access-deferred"; anything else is the ms at which
+/// the first consecutive deferral happened, which is what
+/// [`Db::defer_op_for_access`](super::Db::defer_op_for_access) measures the
+/// deferral against.
+const MIGRATION_V27: &str = "
+ALTER TABLE pending_op ADD COLUMN access_deferred_since INTEGER NOT NULL DEFAULT 0;
 ";

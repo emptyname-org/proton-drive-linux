@@ -3491,6 +3491,60 @@ fn migration_v25_backfills_paths_for_an_existing_tree() {
     let _ = std::fs::remove_file(format!("{}.lock", path.display()));
 }
 
+/// A queue carried over from V26 keeps its rows, and every one of them starts
+/// out not access-deferred — a migration must not invent a deferral window that
+/// would report an ordinary queued upload as blocked.
+#[test]
+fn migration_v27_adds_the_access_deferral_column_to_a_v26_queue() {
+    let path = std::env::temp_dir().join(format!(
+        "pdfs-db-v26-fixture-{}-{}.db",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    {
+        let db = Db::open(&path).unwrap();
+        db.enqueue_op(&crate::db::PendingOp {
+            id: 0,
+            kind: crate::db::OP_REVISION.to_string(),
+            uid: "v~l".to_string(),
+            parent_uid: None,
+            name: None,
+            blob_path: Some("/tmp/blob".to_string()),
+            meta_json: Some("{}".to_string()),
+            created_at: 1,
+            attempts: 0,
+            last_error: None,
+            next_attempt_at: 0,
+        })
+        .unwrap();
+    }
+    {
+        // Put the file back in the state a released V26 database was in.
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "ALTER TABLE pending_op DROP COLUMN access_deferred_since;
+             UPDATE sync_state SET value = '26' WHERE key = 'schema_version';",
+        )
+        .unwrap();
+    }
+
+    let db = Db::open(&path).unwrap();
+    let ops = db.pending_ops().unwrap();
+    assert_eq!(ops.len(), 1, "the migration keeps the queued write");
+    let now = 5_000i64;
+    assert_eq!(
+        db.defer_op_for_access(ops[0].id, now, now + 5_000).unwrap(),
+        now,
+        "a carried-over op is not already deferred"
+    );
+
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(format!("{}.lock", path.display()));
+}
+
 // --- read-only connection pool (DB2) ---------------------------------------
 
 /// A read must not queue behind whatever happens to be writing.

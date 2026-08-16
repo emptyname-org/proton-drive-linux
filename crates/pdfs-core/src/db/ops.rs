@@ -721,11 +721,16 @@ impl Db {
 
     /// Record a failed attempt and when to next try. Leaves the row in place —
     /// the staged bytes are still the only copy of the user's write.
+    ///
+    /// Clears any access-deferral window: whatever the op was waiting for has
+    /// now been reported, so the next uncleared deferral starts its own window
+    /// rather than escalating again on the following recheck.
     pub fn record_op_failure(&self, id: i64, error: &str, next_attempt_at: i64) -> Result<()> {
         let conn = self.conn.lock();
         conn.execute(
             "UPDATE pending_op
-             SET attempts = attempts + 1, last_error = ?2, next_attempt_at = ?3
+             SET attempts = attempts + 1, last_error = ?2, next_attempt_at = ?3,
+                 access_deferred_since = 0
              WHERE id = ?1",
             params![id, error, next_attempt_at],
         )?;
@@ -747,6 +752,60 @@ impl Db {
              END
              WHERE id = ?1",
             params![id, next_attempt_at, PARK_UNTIL],
+        )?;
+        Ok(())
+    }
+
+    /// Defer an op the local access check refused, and report how long it has
+    /// been refused for.
+    ///
+    /// Identical to [`defer_op_without_attempt`](Self::defer_op_without_attempt)
+    /// on the retry clock, plus the one thing that was missing: the first
+    /// deferral of a run stamps `access_deferred_since`, and every deferral
+    /// returns that stamp. A caller can therefore tell a deferral that is one
+    /// recheck old from one that has been repeating unchanged for days, which is
+    /// the difference between a permission the user is mid-way through changing
+    /// and a queue that will never drain.
+    ///
+    /// Returns the ms at which the current run of deferrals began — `now` on the
+    /// first one.
+    pub fn defer_op_for_access(&self, id: i64, now: i64, next_attempt_at: i64) -> Result<i64> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "UPDATE pending_op
+             SET next_attempt_at = CASE
+                 WHEN next_attempt_at >= ?4 THEN next_attempt_at
+                 ELSE ?3
+             END,
+             access_deferred_since = CASE
+                 WHEN access_deferred_since = 0 THEN ?2
+                 ELSE access_deferred_since
+             END
+             WHERE id = ?1",
+            params![id, now, next_attempt_at, PARK_UNTIL],
+        )?;
+        let since = conn
+            .query_row(
+                "SELECT access_deferred_since FROM pending_op WHERE id = ?1",
+                params![id],
+                |r| r.get::<_, i64>(0),
+            )
+            .optional()?;
+        // A row that drained out from under this call leaves nothing to measure;
+        // reporting `now` says "this run just started", which is the reading that
+        // never escalates something that no longer exists.
+        Ok(since.filter(|since| *since != 0).unwrap_or(now))
+    }
+
+    /// Forget an op's access-deferral window, after an attempt the access check
+    /// let through. The op is no longer blocked, so a later deferral is the
+    /// start of a new run rather than the continuation of an old one.
+    pub fn clear_op_access_deferral(&self, id: i64) -> Result<()> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "UPDATE pending_op SET access_deferred_since = 0
+             WHERE id = ?1 AND access_deferred_since <> 0",
+            params![id],
         )?;
         Ok(())
     }

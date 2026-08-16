@@ -48,6 +48,29 @@ use super::{
 
 const DRAIN_ACCESS_RECHECK: Duration = Duration::from_secs(5);
 
+/// How long an op may stay access-deferred before the deferral is reported as a
+/// failure instead of retried in silence.
+///
+/// An access deferral costs no attempt and records no error, which is right for
+/// the case it was written for: a share downgraded while the queue was moving,
+/// undone a moment later. It is wrong for anything that does not clear —
+/// notably a node the local tree no longer has a row for, which
+/// [`Db::effective_node_access`] cannot distinguish from a revoked permission
+/// and so reports as `EACCES` forever. Until this window existed such an op was
+/// re-deferred every [`DRAIN_ACCESS_RECHECK`] indefinitely with `attempts` at
+/// zero, `last_error` null and only a `debug!` line to show for it, so
+/// `pdfs status` counted it among ordinary queued uploads and nothing ever said
+/// otherwise.
+///
+/// Five minutes is far longer than a permission change takes to settle and far
+/// shorter than a user's patience with bytes that are not moving. Past it each
+/// recheck records a failure, so the op enters the ordinary backoff and, at
+/// [`FAILING_ATTEMPTS`], is counted and named by `Response::Status`.
+///
+/// [`Db::effective_node_access`]: pdfs_core::db::Db::effective_node_access
+/// [`FAILING_ATTEMPTS`]: pdfs_core::db::FAILING_ATTEMPTS
+const DRAIN_ACCESS_DEFER_LIMIT: Duration = Duration::from_secs(300);
+
 /// A registered cancellation flag for one in-flight upload, deregistered when
 /// dropped. See [`Core::begin_cancellable_upload`].
 struct UploadCancel {
@@ -235,24 +258,15 @@ impl Core {
                 || self.drain_op(&op),
             );
             if matches!(outcome, Ok(DrainDisposition::AccessDeferred)) {
-                let next_attempt_at = now_millis() + DRAIN_ACCESS_RECHECK.as_millis() as i64;
-                if let Err(error) = self.db.defer_op_without_attempt(op.id, next_attempt_at) {
-                    error!(
-                        uid = %op.uid,
-                        %error,
-                        "deferring access-blocked pending operation failed"
-                    );
-                    self.release_claim(&op);
-                    self.wait_for_drain_work();
-                } else {
-                    debug!(
-                        uid = %op.uid,
-                        next_attempt_at,
-                        "pending operation deferred until access is writable"
-                    );
-                    self.release_claim(&op);
-                }
+                self.defer_for_access(&op);
                 continue;
+            }
+            // The access check let this attempt through, so any earlier run of
+            // deferrals is over and must not be counted against the next one.
+            if matches!(outcome, Ok(DrainDisposition::Applied))
+                && let Err(error) = self.db.clear_op_access_deferral(op.id)
+            {
+                debug!(uid = %op.uid, %error, "clearing an access-deferral window failed");
             }
             if let Err(e) = outcome {
                 let attempts = op.attempts + 1;
@@ -283,6 +297,76 @@ impl Core {
             // must not leave the row claimed by a worker that has moved on.
             self.release_claim(&op);
         }
+    }
+
+    /// Put an op the access check refused back on the clock, and decide whether
+    /// its refusal is still news.
+    ///
+    /// Inside [`DRAIN_ACCESS_DEFER_LIMIT`] a deferral is what it always was: no
+    /// attempt consumed, no error recorded, retried in five seconds. Past it the
+    /// deferral is reported through [`Db::record_op_failure`] like any other
+    /// stuck op, which is what puts it in `attempts`, in `last_error`, and — at
+    /// [`FAILING_ATTEMPTS`] — in the `failing_ops` count and error text that
+    /// `pdfs status` and the GUI show. The row and its staged blob stay exactly
+    /// where they are either way; this changes only whether the user can see
+    /// them.
+    ///
+    /// [`Db::record_op_failure`]: pdfs_core::db::Db::record_op_failure
+    /// [`FAILING_ATTEMPTS`]: pdfs_core::db::FAILING_ATTEMPTS
+    fn defer_for_access(&self, op: &PendingOp) {
+        let now = now_millis();
+        let next_attempt_at = now + DRAIN_ACCESS_RECHECK.as_millis() as i64;
+        let since = match self.db.defer_op_for_access(op.id, now, next_attempt_at) {
+            Ok(since) => since,
+            Err(error) => {
+                error!(
+                    uid = %op.uid,
+                    %error,
+                    "deferring access-blocked pending operation failed"
+                );
+                self.release_claim(op);
+                self.wait_for_drain_work();
+                return;
+            }
+        };
+        let blocked = Duration::from_millis(now.saturating_sub(since).max(0) as u64);
+        if since == now {
+            // The first deferral of a run, at `warn!`: a write the mount accepted
+            // is not going anywhere for now, and that is worth a line even when
+            // the next recheck clears it.
+            warn!(
+                uid = %op.uid,
+                kind = %op.kind,
+                "pending operation deferred: its node is not writable"
+            );
+        }
+        if blocked >= DRAIN_ACCESS_DEFER_LIMIT {
+            let attempts = op.attempts + 1;
+            let backoff = DRAIN_BACKOFF_MIN
+                .saturating_mul(1u32 << attempts.min(6))
+                .min(DRAIN_BACKOFF_MAX);
+            let error = format!(
+                "not writable locally for {}s; the node is missing from the local tree or the \
+                 share is no longer writable. The staged bytes are kept.",
+                blocked.as_secs()
+            );
+            warn!(uid = %op.uid, attempts, blocked_secs = blocked.as_secs(),
+                  "pending operation has been access-blocked past the limit; reporting it");
+            if let Err(error) =
+                self.db
+                    .record_op_failure(op.id, &error, now_millis() + backoff.as_millis() as i64)
+            {
+                error!(uid = %op.uid, %error, "recording an access-deferral failure failed");
+            }
+        } else {
+            debug!(
+                uid = %op.uid,
+                next_attempt_at,
+                blocked_secs = blocked.as_secs(),
+                "pending operation deferred until access is writable"
+            );
+        }
+        self.release_claim(op);
     }
 
     /// Hand a claimed op back to the queue, logging rather than propagating —
@@ -1490,6 +1574,104 @@ mod tests {
         assert_eq!(retained[0].attempts, op.attempts);
         assert_eq!(after_count.uploads, before_count.uploads);
         assert_eq!(after_count.changes, before_count.changes);
+        drop(db);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A deferral that never clears has to stop being silent. Found in the field
+    /// as revision ops whose node had left the local tree: `require_uid_access`
+    /// reads an unknown node as `EACCES`, so they were re-deferred every five
+    /// seconds for thirty days with `attempts` at zero, `last_error` null and
+    /// `failing_ops` at zero — 18 GiB of accepted writes that `pdfs status`
+    /// reported as ordinary queued uploads.
+    #[test]
+    fn an_access_deferral_that_outlives_the_limit_is_reported_as_failing() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static N: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "pdfs-drain-defer-limit-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = Db::open(&dir.join("cache.db")).unwrap();
+        db.enqueue_op(&pending(OP_REVISION)).unwrap();
+        let op = db.pending_ops().unwrap().remove(0);
+
+        // Two deferrals a recheck apart: the window opens on the first and the
+        // second is measured against it, not against itself.
+        let now = 1_000_000i64;
+        let since = db.defer_op_for_access(op.id, now, now + 5_000).unwrap();
+        assert_eq!(since, now, "the first deferral opens the window");
+        let later = now + DRAIN_ACCESS_RECHECK.as_millis() as i64;
+        assert_eq!(
+            db.defer_op_for_access(op.id, later, later + 5_000).unwrap(),
+            now,
+            "a later deferral keeps the original stamp"
+        );
+        let queued = db.pending_ops().unwrap();
+        assert_eq!(queued[0].attempts, 0, "deferrals consume no attempt");
+        assert!(queued[0].last_error.is_none());
+
+        // Past the limit the same deferral is reported like any other stuck op.
+        let past = now + DRAIN_ACCESS_DEFER_LIMIT.as_millis() as i64;
+        assert_eq!(
+            db.defer_op_for_access(op.id, past, past + 5_000).unwrap(),
+            now
+        );
+        db.record_op_failure(op.id, "not writable locally", past + 10_000)
+            .unwrap();
+        let failed = db.pending_ops().unwrap();
+        assert_eq!(failed.len(), 1, "the row and its staged bytes stay queued");
+        assert_eq!(failed[0].attempts, 1);
+        assert_eq!(
+            failed[0].last_error.as_deref(),
+            Some("not writable locally")
+        );
+
+        // Reporting closes the window, so the next deferral starts a fresh one
+        // rather than escalating on every recheck from here on.
+        let after = past + 20_000;
+        assert_eq!(
+            db.defer_op_for_access(op.id, after, after + 5_000).unwrap(),
+            after,
+            "recording the failure re-armed the window"
+        );
+        drop(db);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// An op that gets through the access check is no longer blocked, so a
+    /// deferral after it must not inherit the earlier run's age and escalate
+    /// immediately.
+    #[test]
+    fn clearing_the_window_makes_the_next_deferral_a_fresh_run() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static N: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "pdfs-drain-defer-clear-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = Db::open(&dir.join("cache.db")).unwrap();
+        db.enqueue_op(&pending(OP_REVISION)).unwrap();
+        let op = db.pending_ops().unwrap().remove(0);
+
+        let now = 2_000_000i64;
+        assert_eq!(
+            db.defer_op_for_access(op.id, now, now + 5_000).unwrap(),
+            now
+        );
+        db.clear_op_access_deferral(op.id).unwrap();
+        let later = now + DRAIN_ACCESS_DEFER_LIMIT.as_millis() as i64;
+        assert_eq!(
+            db.defer_op_for_access(op.id, later, later + 5_000).unwrap(),
+            later,
+            "the window reopens at the new deferral, not the old one"
+        );
         drop(db);
         let _ = std::fs::remove_dir_all(dir);
     }
