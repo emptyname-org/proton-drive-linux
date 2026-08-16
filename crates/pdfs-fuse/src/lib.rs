@@ -973,6 +973,27 @@ impl Core {
     /// downgrade cannot be hidden by stale live state, and a live downgrade
     /// cannot be hidden by a restored DB row. Missing UIDs fail closed.
     fn require_uid_writable(&self, uid: &NodeUid) -> Result<(), Errno> {
+        match self.uid_write_authority(uid) {
+            WriteAuthority::Writable => Ok(()),
+            // A uid nobody can speak for is refused here just as a denied one
+            // is: a syscall is a live request against a live tree, and a stale
+            // handle must not be admitted because the tree forgot the node.
+            // The drain, which replays intent recorded long ago, is the one
+            // caller that has to tell the two apart — see
+            // [`Core::uid_write_authority`].
+            WriteAuthority::Denied | WriteAuthority::Unknown => Err(Errno::EACCES),
+        }
+    }
+
+    /// The full answer behind [`Core::require_uid_writable`]: whether every
+    /// authority agrees this node is writable, refuses it, or has never heard
+    /// of it.
+    ///
+    /// The third case is the one worth naming. A node absent from the local
+    /// tree yields no access row, and collapsing that into "denied" told the
+    /// drain to wait for a permission change that was never coming, because
+    /// nothing about the node's permissions was ever the problem (B83).
+    pub(crate) fn uid_write_authority(&self, uid: &NodeUid) -> WriteAuthority {
         let mut live_access = Vec::new();
         {
             let state = self.state();
@@ -988,22 +1009,38 @@ impl Core {
                 live_access.push(access);
             }
         }
-        require_uid_access(&self.db, uid, &live_access)
+        uid_write_authority(&self.db, uid, &live_access)
     }
 }
 
-fn require_uid_access(db: &Db, uid: &NodeUid, live_access: &[Access]) -> Result<(), Errno> {
+/// Whether a node may be written, as agreed by every authority that has an
+/// opinion — or the fact that none of them does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WriteAuthority {
+    /// The persisted tree and every resident mount agree: writable.
+    Writable,
+    /// At least one authority refuses it, or could not be consulted. Fails
+    /// closed, so a lookup error lands here.
+    Denied,
+    /// The node is not in the local tree, so there is no authority to consult.
+    /// Not the same as a refusal, and callers that can ask the remote should.
+    Unknown,
+}
+
+fn uid_write_authority(db: &Db, uid: &NodeUid, live_access: &[Access]) -> WriteAuthority {
     let persisted = match db.effective_node_access(uid) {
         Ok(Some(access)) => access,
-        Ok(None) => return Err(Errno::EACCES),
+        Ok(None) => return WriteAuthority::Unknown,
         Err(error) => {
             error!(%uid, %error, "db effective access lookup failed");
-            return Err(Errno::EACCES);
+            return WriteAuthority::Denied;
         }
     };
-    (persisted.writable() && live_access.iter().all(|access| access.writable()))
-        .then_some(())
-        .ok_or(Errno::EACCES)
+    if persisted.writable() && live_access.iter().all(|access| access.writable()) {
+        WriteAuthority::Writable
+    } else {
+        WriteAuthority::Denied
+    }
 }
 
 /// One kernel notification, recorded while the State lock is held so it can be
@@ -5754,9 +5791,19 @@ mod tests {
         preserve_on_access_denied, publish_virtual_root_in_listing,
         reconcile_virtual_root_in_listing, release_can_discard_unlinked,
         release_must_retain_queued_trash, release_unlinked_entry, rename_needs_queue,
-        require_node_parent_access, require_rename_access, require_uid_access,
-        resolve_anywhere_with, shared_with_me_uid, take_self_change, virtual_node,
+        require_node_parent_access, require_rename_access, resolve_anywhere_with,
+        shared_with_me_uid, take_self_change, uid_write_authority, virtual_node,
     };
+    use super::{Db, WriteAuthority};
+
+    /// The collapse [`Core::require_uid_writable`] performs, without a `Core`:
+    /// every non-writable authority is one `EACCES` on the syscall path.
+    fn require_uid_access(db: &Db, uid: &NodeUid, live: &[Access]) -> Result<(), Errno> {
+        match uid_write_authority(db, uid, live) {
+            WriteAuthority::Writable => Ok(()),
+            WriteAuthority::Denied | WriteAuthority::Unknown => Err(Errno::EACCES),
+        }
+    }
     use crate::filesystem::access_allowed;
     use pdfs_core::cache::{Baseline, StagedWrite};
     use pdfs_core::db::{OP_REVISION, OP_TRASH, PendingOp};
@@ -6762,6 +6809,19 @@ mod tests {
         assert_eq!(
             require_uid_access(&db, &stale, &[]).unwrap_err().code(),
             libc::EACCES
+        );
+        // Same refusal on the syscall path, but a distinguishable one
+        // underneath: the drain asks the remote about `Unknown` rather than
+        // waiting on a permission change (B83).
+        assert_eq!(
+            uid_write_authority(&db, &stale, &[]),
+            WriteAuthority::Unknown,
+            "a uid the tree has no row for is unknown, not denied"
+        );
+        assert_eq!(
+            uid_write_authority(&db, &uid, &[]),
+            WriteAuthority::Denied,
+            "a uid the tree knows and refuses is denied"
         );
         assert_eq!(db.pending_ops().unwrap().len(), before);
     }

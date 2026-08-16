@@ -14,9 +14,10 @@ Conventions:
 
 ## B83 — An access-deferred op retries forever and is reported as an ordinary queued upload
 
-**Status:** Partly fixed (unverified) 2026-08-16 — the reporting half is in and
-unit-tested; the cause (an unknown node reading as `EACCES`) is still open, see
-"Still open" below.
+**Status:** Fixed (partly verified) 2026-08-16 — both halves are in and
+unit-tested. The reporting half was confirmed against the live 28-op backlog on
+1.8.0 (schema migrated to v27, all 28 rows window-stamped, `WARN` lines per op);
+the resolution half has not yet been observed draining that backlog.
 **Found:** 2026-08-16, running `scripts/fuse-acceptance.sh --live` on a
 throwaway CLI-made mount. Four regression cases (B69, B70, B74, B79) failed with
 `TimeoutError: daemon mutation queue did not drain` — the suite's
@@ -25,7 +26,7 @@ been sitting at 28 for 30 days on the development machine. `pdfs status` called
 them 28 queued uploads holding 18.4 GiB; `pdfs transfers` showed nothing;
 `failing_ops` and `parked_uploads` were both 0.
 **Where:** `run_pending_drain` / `run_authorized_drain`
-(`crates/pdfs-fuse/src/drain.rs`), `require_uid_access`
+(`crates/pdfs-fuse/src/drain.rs`), `require_uid_writable`
 (`crates/pdfs-fuse/src/lib.rs`), `Db::effective_node_access`
 (`crates/pdfs-core/src/db/share_access.rs`),
 `Db::defer_op_without_attempt` (`crates/pdfs-core/src/db/ops.rs`).
@@ -48,7 +49,26 @@ select (select count(*) from pending_op p
 -- 0 | 28
 ```
 
-**Fix (this half).** Schema v27 adds `pending_op.access_deferred_since`.
+**Fix, part 1 — stop guessing.** `WriteAuthority { Writable, Denied, Unknown }`
+replaces the `Result<(), Errno>` the drain's access check used to return
+(`Core::uid_write_authority`). `require_uid_writable` still collapses both
+refusals to `EACCES`, which is right for a syscall: a stale handle must not be
+admitted because the tree forgot the node. The drain does not collapse them —
+`Unknown` becomes `DrainDisposition::AuthorityUnknown(uid)`, and
+`Core::resolve_unknown_authority` asks the remote:
+
+- node still there → `upsert_node` re-interns it and the op is deferred for one
+  recheck, so the next pass gets a real access answer;
+- node gone (`Ok(None)` / `is_gone`) → `record_op_failure` **immediately**, with
+  a message naming the vanished uid, rather than waiting out the 5-minute window
+  to say something vaguer;
+- could not ask → ordinary deferral.
+
+The authority asked about is the op's own (`pending_op_authorities`), so a
+`create`/`mkdir` refetches its *parent*, not the node it has not made yet. The
+row and its staged blob survive every branch.
+
+**Fix, part 2 — say something.** Schema v27 adds `pending_op.access_deferred_since`.
 `Db::defer_op_for_access` stamps it on the first deferral of a run and returns
 the stamp on every one; `Core::defer_for_access` warns on the first deferral and,
 once the run passes `DRAIN_ACCESS_DEFER_LIMIT` (5 min), reports it through
@@ -59,12 +79,14 @@ access check admits clears it too (`clear_op_access_deferral`). The row and its
 staged blob are untouched on every path — this changes only what the user can
 see.
 
-**Still open:** the conflation itself. A revision op whose node has left the
-local tree should refetch the node and either proceed or fail on a real remote
-answer (404/trashed), not be deferred on a local guess. Same trap applies to
-`create`/`mkdir`, whose authority is the parent uid. Also unaddressed: the
-acceptance runner waits on the *global* queue, so any unrelated stuck op fails
-those four cases on a machine that has one.
+The deferral window stays as the backstop for everything that does not resolve,
+including a refetch that keeps not helping, and `AccessDeferral` now carries the
+reason into both the log line and the recorded `last_error`.
+
+**Still open:** the acceptance runner waits on the *global* queue
+(`ManagedSyncPair.wait_for_queue`), so any unrelated stuck op fails those four
+cases on a machine that has one — that is what turned this backlog into four
+apparent FUSE regressions.
 
 ## B82 — A `parent_uid` cycle hangs the daemon on any short search
 

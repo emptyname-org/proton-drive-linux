@@ -41,9 +41,9 @@ use super::state::Intervals;
 use super::transfers::CountingReader;
 use super::{
     Core, DRAIN_BACKOFF_MAX, DRAIN_BACKOFF_MIN, DRAIN_IDLE_POLL, DRAIN_REVISION_DEBOUNCE,
-    DRAIN_REVISION_DEBOUNCE_MAX, ROOT_INO, UPLOAD_TIME_MEMORY, conflict_name, is_already_exists,
-    is_gone, is_local_uid_str, media_type_for, node_revision_id, node_size, now_millis, now_secs,
-    parse_node_uid,
+    DRAIN_REVISION_DEBOUNCE_MAX, ROOT_INO, UPLOAD_TIME_MEMORY, WriteAuthority, conflict_name,
+    is_already_exists, is_gone, is_local_uid_str, media_type_for, node_revision_id, node_size,
+    now_millis, now_secs, parse_node_uid,
 };
 
 const DRAIN_ACCESS_RECHECK: Duration = Duration::from_secs(5);
@@ -53,14 +53,18 @@ const DRAIN_ACCESS_RECHECK: Duration = Duration::from_secs(5);
 ///
 /// An access deferral costs no attempt and records no error, which is right for
 /// the case it was written for: a share downgraded while the queue was moving,
-/// undone a moment later. It is wrong for anything that does not clear —
-/// notably a node the local tree no longer has a row for, which
-/// [`Db::effective_node_access`] cannot distinguish from a revoked permission
-/// and so reports as `EACCES` forever. Until this window existed such an op was
-/// re-deferred every [`DRAIN_ACCESS_RECHECK`] indefinitely with `attempts` at
-/// zero, `last_error` null and only a `debug!` line to show for it, so
-/// `pdfs status` counted it among ordinary queued uploads and nothing ever said
-/// otherwise.
+/// undone a moment later. It is wrong for anything that does not clear. Until
+/// this window existed such an op was re-deferred every
+/// [`DRAIN_ACCESS_RECHECK`] indefinitely with `attempts` at zero, `last_error`
+/// null and only a `debug!` line to show for it, so `pdfs status` counted it
+/// among ordinary queued uploads and nothing ever said otherwise.
+///
+/// The condition that produced that in practice — a node absent from the local
+/// tree, which [`Db::effective_node_access`] used to report indistinguishably
+/// from a revoked permission — is now answered directly by
+/// [`Core::resolve_unknown_authority`]. This window remains the backstop for
+/// every deferral that does not resolve, including a refetch that keeps not
+/// helping.
 ///
 /// Five minutes is far longer than a permission change takes to settle and far
 /// shorter than a user's patience with bytes that are not moving. Past it each
@@ -116,10 +120,52 @@ fn adaptive_debounce(measured: Option<Duration>) -> Duration {
         .clamp(DRAIN_REVISION_DEBOUNCE, DRAIN_REVISION_DEBOUNCE_MAX)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum DrainDisposition {
     Applied,
     AccessDeferred,
+    /// An authority this op needs is missing from the local tree, so no access
+    /// answer exists for it yet. Carries the uid to ask the remote about.
+    AuthorityUnknown(NodeUid),
+}
+
+/// Why an op went back on the clock without consuming an attempt. Only affects
+/// what the user is told — every variant is deferred and reported identically.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AccessDeferral {
+    /// An authority the tree knows about refuses the write.
+    NotWritable,
+    /// An authority missing from the tree was just re-read from the remote and
+    /// re-interned; the access check gets another look on the next pass.
+    AuthorityRefetched,
+    /// An authority missing from the tree could not be asked about.
+    RemoteUnreachable,
+}
+
+impl AccessDeferral {
+    fn log_reason(self) -> &'static str {
+        match self {
+            Self::NotWritable => "the node is not writable",
+            Self::AuthorityRefetched => "the node was missing locally and has been re-read",
+            Self::RemoteUnreachable => "the node is missing locally and the remote is unreachable",
+        }
+    }
+
+    /// Phrased to complete "<reason> for 300s." in a recorded `last_error`, so
+    /// the text the user sees names the actual condition rather than the
+    /// permission question it used to be flattened into.
+    fn failure_reason(self) -> &'static str {
+        match self {
+            Self::NotWritable => "the share has not been writable",
+            Self::AuthorityRefetched => {
+                "the node has been missing from the local tree, and re-reading it from the remote \
+                 has not restored it"
+            }
+            Self::RemoteUnreachable => {
+                "the node has been missing from the local tree and the remote has been unreachable"
+            }
+        }
+    }
 }
 
 fn pending_op_authorities(op: &PendingOp) -> Result<Vec<NodeUid>, Box<dyn std::error::Error>> {
@@ -162,7 +208,7 @@ fn pending_op_authorities(op: &PendingOp) -> Result<Vec<NodeUid>, Box<dyn std::e
 
 fn run_authorized_drain(
     op: &PendingOp,
-    mut require: impl FnMut(&NodeUid) -> Result<(), fuser::Errno>,
+    mut authority_of: impl FnMut(&NodeUid) -> WriteAuthority,
     apply: impl FnOnce() -> Result<(), Box<dyn std::error::Error>>,
 ) -> Result<DrainDisposition, Box<dyn std::error::Error>> {
     // This check is the admission/linearization point. A downgrade that lands
@@ -170,15 +216,14 @@ fn run_authorized_drain(
     // attempt. Every later queued operation rechecks. No permission lock is
     // held across remote latency.
     for authority in pending_op_authorities(op)? {
-        match require(&authority) {
-            Ok(()) => {}
-            Err(error) if error.code() == libc::EACCES => {
-                return Ok(DrainDisposition::AccessDeferred);
-            }
-            Err(error) => {
-                return Err(
-                    format!("drain access check failed with errno {}", error.code()).into(),
-                );
+        match authority_of(&authority) {
+            WriteAuthority::Writable => {}
+            WriteAuthority::Denied => return Ok(DrainDisposition::AccessDeferred),
+            // Nothing in the tree can answer for this node. Deferring on it
+            // waits for a permission change that has no reason to come, so the
+            // caller asks the remote instead (B83).
+            WriteAuthority::Unknown => {
+                return Ok(DrainDisposition::AuthorityUnknown(authority));
             }
         }
     }
@@ -254,11 +299,15 @@ impl Core {
             };
             let outcome = run_authorized_drain(
                 &op,
-                |uid| self.require_uid_writable(uid),
+                |uid| self.uid_write_authority(uid),
                 || self.drain_op(&op),
             );
             if matches!(outcome, Ok(DrainDisposition::AccessDeferred)) {
-                self.defer_for_access(&op);
+                self.defer_for_access(&op, AccessDeferral::NotWritable);
+                continue;
+            }
+            if let Ok(DrainDisposition::AuthorityUnknown(ref authority)) = outcome {
+                self.resolve_unknown_authority(&op, authority);
                 continue;
             }
             // The access check let this attempt through, so any earlier run of
@@ -313,7 +362,7 @@ impl Core {
     ///
     /// [`Db::record_op_failure`]: pdfs_core::db::Db::record_op_failure
     /// [`FAILING_ATTEMPTS`]: pdfs_core::db::FAILING_ATTEMPTS
-    fn defer_for_access(&self, op: &PendingOp) {
+    fn defer_for_access(&self, op: &PendingOp, reason: AccessDeferral) {
         let now = now_millis();
         let next_attempt_at = now + DRAIN_ACCESS_RECHECK.as_millis() as i64;
         let since = match self.db.defer_op_for_access(op.id, now, next_attempt_at) {
@@ -337,7 +386,8 @@ impl Core {
             warn!(
                 uid = %op.uid,
                 kind = %op.kind,
-                "pending operation deferred: its node is not writable"
+                reason = reason.log_reason(),
+                "pending operation deferred"
             );
         }
         if blocked >= DRAIN_ACCESS_DEFER_LIMIT {
@@ -346,8 +396,8 @@ impl Core {
                 .saturating_mul(1u32 << attempts.min(6))
                 .min(DRAIN_BACKOFF_MAX);
             let error = format!(
-                "not writable locally for {}s; the node is missing from the local tree or the \
-                 share is no longer writable. The staged bytes are kept.",
+                "{} for {}s. The staged bytes are kept.",
+                reason.failure_reason(),
                 blocked.as_secs()
             );
             warn!(uid = %op.uid, attempts, blocked_secs = blocked.as_secs(),
@@ -363,10 +413,70 @@ impl Core {
                 uid = %op.uid,
                 next_attempt_at,
                 blocked_secs = blocked.as_secs(),
+                reason = reason.log_reason(),
                 "pending operation deferred until access is writable"
             );
         }
         self.release_claim(op);
+    }
+
+    /// Answer an authority the local tree has no row for by asking the remote,
+    /// rather than deferring on a permission question nobody asked (B83).
+    ///
+    /// Three outcomes, and the point of the whole exercise is that they are
+    /// three:
+    ///
+    /// * the node is still there — the tree simply lost it (a pruned subtree, a
+    ///   mount whose registration went away). Re-intern it and the next pass has
+    ///   a real access answer to work with.
+    /// * the node is gone remotely. That is a permanent, *known* condition, so
+    ///   it is recorded as a failure immediately instead of waiting out
+    ///   [`DRAIN_ACCESS_DEFER_LIMIT`] to say so. The row and its staged blob are
+    ///   kept, as on every other failure path — the bytes are still the user's,
+    ///   and `pdfs recover` is how they get them back.
+    /// * we could not ask. Ordinary deferral; the network is the network.
+    fn resolve_unknown_authority(&self, op: &PendingOp, authority: &NodeUid) {
+        match self.fetch_node_remote(authority) {
+            Ok(Some(node)) => {
+                if let Err(error) = self.db.upsert_node(&node) {
+                    error!(uid = %op.uid, %authority, %error,
+                           "re-interning a queued operation's missing authority failed");
+                } else {
+                    info!(uid = %op.uid, %authority,
+                          "re-interned an authority missing from the local tree; retrying");
+                }
+                // Deferred, not applied: the re-read has to go through the same
+                // access check as everything else, on the next pass. The window
+                // keeps running, so a refetch that never actually helps still
+                // gets reported instead of looping in silence.
+                self.defer_for_access(op, AccessDeferral::AuthorityRefetched);
+            }
+            Ok(None) => {
+                let attempts = op.attempts + 1;
+                let backoff = DRAIN_BACKOFF_MIN
+                    .saturating_mul(1u32 << attempts.min(6))
+                    .min(DRAIN_BACKOFF_MAX);
+                let error = format!(
+                    "{authority} no longer exists remotely, so this operation has nothing to \
+                     apply to. The staged bytes are kept."
+                );
+                warn!(uid = %op.uid, %authority, attempts,
+                      "a queued operation's authority is gone remotely; reporting it");
+                if let Err(error) = self.db.record_op_failure(
+                    op.id,
+                    &error,
+                    now_millis() + backoff.as_millis() as i64,
+                ) {
+                    error!(uid = %op.uid, %error, "recording a missing-authority failure failed");
+                }
+                self.release_claim(op);
+            }
+            Err(error) => {
+                debug!(uid = %op.uid, %authority, %error,
+                       "could not ask the remote about a missing authority");
+                self.defer_for_access(op, AccessDeferral::RemoteUnreachable);
+            }
+        }
     }
 
     /// Hand a claimed op back to the queue, logging rather than propagating —
@@ -1512,12 +1622,10 @@ mod tests {
         let applied = Cell::new(false);
         let disposition = run_authorized_drain(
             &op,
-            |uid| {
-                db.effective_node_access(uid)
-                    .unwrap()
-                    .filter(|access| access.writable())
-                    .map(|_| ())
-                    .ok_or(fuser::Errno::EACCES)
+            |uid| match db.effective_node_access(uid).unwrap() {
+                Some(access) if access.writable() => WriteAuthority::Writable,
+                Some(_) => WriteAuthority::Denied,
+                None => WriteAuthority::Unknown,
             },
             || {
                 applied.set(true);
@@ -1557,7 +1665,7 @@ mod tests {
 
         let disposition = run_authorized_drain(
             &op,
-            |_| Err(fuser::Errno::EACCES),
+            |_| WriteAuthority::Denied,
             || {
                 applied.set(true);
                 Ok(())
@@ -1677,12 +1785,58 @@ mod tests {
     }
 
     #[test]
+    fn an_authority_the_tree_does_not_have_is_reported_as_unknown_not_deferred() {
+        // The B83 distinction, at the point it is made: a uid with no row must
+        // not come back as `AccessDeferred`, because deferring waits on a
+        // permission change that nothing is going to make. The caller answers
+        // an `AuthorityUnknown` by asking the remote instead.
+        let op = pending(OP_REVISION);
+        let applied = Cell::new(false);
+        let disposition = run_authorized_drain(
+            &op,
+            |_| WriteAuthority::Unknown,
+            || {
+                applied.set(true);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            disposition,
+            DrainDisposition::AuthorityUnknown(parse_node_uid(&op.uid).unwrap())
+        );
+        assert!(!applied.get(), "an unresolved authority never applies");
+    }
+
+    #[test]
+    fn a_missing_parent_authority_names_the_parent_not_the_node() {
+        // A create's authority is its parent, so that is the uid the remote has
+        // to be asked about — reporting the node instead would refetch the
+        // thing that does not exist yet.
+        let mut op = pending(OP_CREATE);
+        let parent = folder_node("vanished-parent", None);
+        op.parent_uid = Some(parent.uid.to_string());
+        let disposition =
+            run_authorized_drain(&op, |_| WriteAuthority::Unknown, || Ok(())).unwrap();
+        assert_eq!(
+            disposition,
+            DrainDisposition::AuthorityUnknown(parent.uid.clone())
+        );
+    }
+
+    #[test]
     fn owner_and_editor_drain_authorities_apply_normally() {
         for access in [Access::Owner, Access::Editor] {
             let applied = Cell::new(false);
             let disposition = run_authorized_drain(
                 &pending(OP_REVISION),
-                |_| access.writable().then_some(()).ok_or(fuser::Errno::EACCES),
+                |_| {
+                    if access.writable() {
+                        WriteAuthority::Writable
+                    } else {
+                        WriteAuthority::Denied
+                    }
+                },
                 || {
                     applied.set(true);
                     Ok(())
