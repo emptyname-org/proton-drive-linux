@@ -9,6 +9,33 @@ release ships. Migrations are forward-only — a database written by a newer cli
 refuse-to-open, not a downgrade, so rolling back a release means restoring the cache from
 scratch (user data in `staging/` and `recovery/` is never touched by this).
 
+## [1.8.0] — 2026-08-16
+
+A queued write whose node had left the local tree was retried every five seconds forever and
+counted as an ordinary pending upload — 28 of them, holding 18.4 GiB, had been doing that for
+30 days on the machine that found it (`docs/BUGS.md` B83). Schema: 27 — migration V27 adds
+`pending_op.access_deferred_since`.
+
+### Fixed
+- The drain no longer reads "I have never heard of this node" as "you may not write this
+  node". A missing authority is now resolved against the remote: the node is re-interned if
+  it is still there, and reported as a real failure if it is gone. Ops that had been stuck
+  invisibly for weeks now say what is wrong with them on the first pass.
+- A create or mkdir resolves its *parent* as the authority, so the refetch asks about the
+  folder rather than the node it has not made yet.
+
+### Added
+- Access deferrals are bounded. A deferral still costs no attempt and records no error for
+  the first five minutes — the case it exists for is a share downgraded mid-queue and undone
+  a moment later — but past that window each recheck records a failure, so the op enters the
+  ordinary backoff and appears in `failing_ops` and the `pdfs status` error text like any
+  other stuck operation. The first deferral of a run is logged at `warn` rather than `debug`.
+
+### Notes
+- No staged data is touched by any of this. A reported failure keeps its `pending_op` row and
+  its staged blob exactly as before; the change is in what the user is told, and in the queue
+  no longer waiting on a permission change that was never coming.
+
 ## [1.7.1] — 2026-08-16
 
 Write-back throughput follow-up to 1.7.0, same audit
