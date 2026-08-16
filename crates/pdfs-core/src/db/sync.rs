@@ -35,6 +35,14 @@ pub struct StoredSyncEntry {
     pub remote_uid: Option<String>,
     pub local_mtime: i64,
     pub local_size: i64,
+    /// The same modification time to nanosecond precision, when it is known.
+    ///
+    /// `local_mtime` alone cannot tell an edit that landed inside the same
+    /// second as the last sync — and left the file the same length — from no
+    /// edit at all, so those never uploaded (bugs.md B25). `None` on a row
+    /// written before schema 28, which the comparison reads as "compare whole
+    /// seconds", so upgrading does not make an entire mirror look changed.
+    pub local_mtime_ns: Option<i64>,
     pub remote_rev: Option<String>,
     pub remote_hash: Option<String>,
 }
@@ -168,7 +176,8 @@ impl Db {
     pub fn sync_entries(&self, folder_id: i64) -> Result<HashMap<String, StoredSyncEntry>> {
         let conn = self.read();
         let mut stmt = conn.prepare(
-            "SELECT rel_path, remote_uid, local_mtime, local_size, remote_rev, remote_hash
+            "SELECT rel_path, remote_uid, local_mtime, local_size, remote_rev, remote_hash,
+                    local_mtime_ns
              FROM sync_entry WHERE folder_id = ?1",
         )?;
         let rows = stmt.query_map(params![folder_id], |r| {
@@ -179,6 +188,7 @@ impl Db {
                 local_size: r.get(3)?,
                 remote_rev: r.get(4)?,
                 remote_hash: r.get(5)?,
+                local_mtime_ns: r.get(6)?,
             })
         })?;
         let mut map = HashMap::new();
@@ -216,14 +226,16 @@ impl Db {
         let conn = self.conn.lock();
         conn.execute(
             "INSERT INTO sync_entry
-               (folder_id, rel_path, remote_uid, local_mtime, local_size, remote_rev, remote_hash)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+               (folder_id, rel_path, remote_uid, local_mtime, local_size, remote_rev,
+                remote_hash, local_mtime_ns)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
              ON CONFLICT(folder_id, rel_path) DO UPDATE SET
-               remote_uid  = excluded.remote_uid,
-               local_mtime = excluded.local_mtime,
-               local_size  = excluded.local_size,
-               remote_rev  = excluded.remote_rev,
-               remote_hash = excluded.remote_hash",
+               remote_uid     = excluded.remote_uid,
+               local_mtime    = excluded.local_mtime,
+               local_size     = excluded.local_size,
+               remote_rev     = excluded.remote_rev,
+               remote_hash    = excluded.remote_hash,
+               local_mtime_ns = excluded.local_mtime_ns",
             params![
                 folder_id,
                 e.rel_path,
@@ -232,6 +244,7 @@ impl Db {
                 e.local_size,
                 e.remote_rev,
                 e.remote_hash,
+                e.local_mtime_ns,
             ],
         )?;
         Ok(())

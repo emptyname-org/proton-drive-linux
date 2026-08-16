@@ -141,6 +141,11 @@ pub(crate) struct PendingRevision {
     pub(crate) meta: StagedWrite,
 }
 
+/// One directory's entries as `readdir` reports them: `(ino, is_dir, name)` per
+/// entry, in reply order. The kernel's file-type enum is mapped in at reply
+/// time so this module stays free of `fuser`.
+pub(crate) type DirListing = Vec<(u64, bool, String)>;
+
 /// Mutable inode bookkeeping, guarded by a mutex because fuser drives the
 /// `Filesystem` trait through `&self`.
 pub(crate) struct State {
@@ -158,6 +163,16 @@ pub(crate) struct State {
     /// have no entry here.
     pub(crate) handles: HashMap<u64, u64>,
     pub(crate) next_fh: u64,
+    /// One frozen listing per open directory handle, taken at `opendir`.
+    ///
+    /// `readdir` resumes from a byte offset into the listing it is walking, so
+    /// that listing has to stay the same across the calls of one `getdents`
+    /// sequence. Rebuilding it live meant a create or a trash landing between
+    /// two pages shifted every later entry, and the caller silently skipped or
+    /// repeated whatever crossed the page boundary. Each entry is
+    /// `(ino, is_dir, name)` — the kernel type is mapped at reply time so this
+    /// module stays free of `fuser` (bugs.md B43).
+    pub(crate) dir_snapshots: HashMap<u64, Arc<DirListing>>,
     /// Resident inode attributes whose effective access changed during an
     /// intern/root refresh. Core drains this set and notifies the matching
     /// kernel only after releasing the State lock.
@@ -317,6 +332,7 @@ impl State {
             active_writes: HashMap::new(),
             handles: HashMap::new(),
             next_fh: 1,
+            dir_snapshots: HashMap::new(),
             access_changes: HashSet::new(),
             share_access,
             db,

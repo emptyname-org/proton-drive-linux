@@ -54,7 +54,7 @@ use engine::{classify, settle_with};
 #[cfg(test)]
 use local_scan::is_write_mode;
 use local_scan::open_for_write_set;
-use model::{LocalItem, Outcome, PassAbort, Pending, RemoteItem};
+use model::{LocalItem, LocalSig, Outcome, PassAbort, Pending, RemoteItem};
 pub(crate) use planner::base_name;
 #[cfg(test)]
 use planner::conflict_path;
@@ -687,6 +687,7 @@ impl Core {
                             rel_path: rel.clone(),
                             remote_uid: Some(remote.uid.to_string()),
                             local_mtime: local.mtime,
+                            local_mtime_ns: local.mtime_ns,
                             local_size: local.size,
                             remote_rev: Some(remote.mtime.to_string()),
                             remote_hash: Some(remote.size.to_string()),
@@ -717,6 +718,9 @@ impl Core {
                         uid: remote.uid.clone(),
                         mtime: remote.mtime,
                         size: remote.size,
+                        // What the walk saw here, so the apply step can tell a
+                        // stale plan from a live one before it overwrites.
+                        local: l.map(LocalSig::from),
                     });
                 }
                 FilePlan::Conflict => {
@@ -739,7 +743,9 @@ impl Core {
                     }
                 },
                 FilePlan::DeleteLocal => {
-                    if let Err(e) = std::fs::remove_file(local_root.join(rel_to_path(rel))) {
+                    if let Err(e) =
+                        removed_locally(std::fs::remove_file(local_root.join(rel_to_path(rel))))
+                    {
                         warn!(rel, error = %e, "sync: remove local file failed");
                         self.log_activity(
                             ActivityKind::Trash,
@@ -797,7 +803,9 @@ impl Core {
         // Deferred folder deletions, deepest first.
         delete_local_dirs.sort_by_key(|p| std::cmp::Reverse(p.matches('/').count()));
         for rel in delete_local_dirs {
-            if let Err(e) = std::fs::remove_dir_all(local_root.join(rel_to_path(&rel))) {
+            if let Err(e) =
+                removed_locally(std::fs::remove_dir_all(local_root.join(rel_to_path(&rel))))
+            {
                 warn!(rel, error = %e, "sync: remove local folder failed");
                 self.log_activity(ActivityKind::Trash, base_name(&rel), e.to_string(), false);
                 outcome.errors += 1;
@@ -885,6 +893,7 @@ impl Core {
                     LocalItem {
                         is_dir: true,
                         mtime: 0,
+                        mtime_ns: None,
                         size: 0,
                         open_for_write: false,
                     },
@@ -903,6 +912,7 @@ impl Core {
                     LocalItem {
                         is_dir: false,
                         mtime: system_mtime(&meta),
+                        mtime_ns: system_mtime_ns(&meta),
                         size: meta.len() as i64,
                         open_for_write: ofw,
                     },
@@ -1069,6 +1079,7 @@ impl Core {
                     rel_path: rel.to_string(),
                     remote_uid: Some(uid.to_string()),
                     local_mtime: 0,
+                    local_mtime_ns: None,
                     local_size: 0,
                     remote_rev: None,
                     remote_hash: None,
@@ -1192,8 +1203,9 @@ impl Core {
                 uid,
                 mtime,
                 size,
+                local,
             } => {
-                self.download_file(folder_id, local_root, rel, uid, *mtime, *size)
+                self.download_file(folder_id, local_root, rel, uid, *mtime, *size, *local)
                     .await?;
                 Ok(Applied::Downloaded)
             }
@@ -1211,7 +1223,11 @@ impl Core {
                         .map_err(|e| format!("set aside conflict copy for {rel}: {e}"))?;
                     info!(rel, "sync: kept local changes as a conflict copy");
                 }
-                self.download_file(folder_id, local_root, rel, uid, *mtime, *size)
+                // The local copy has just been moved aside, so the state this
+                // download expects to find at the path is "nothing" — anything
+                // that appears while it runs is a *new* racing write, and gets
+                // its own conflict copy rather than being overwritten (B39).
+                self.download_file(folder_id, local_root, rel, uid, *mtime, *size, None)
                     .await?;
                 Ok(Applied::Conflict)
             }
@@ -1250,6 +1266,9 @@ impl Core {
         let file = std::fs::File::open(&path).map_err(|e| format!("open {rel}: {e}"))?;
         let meta = file.metadata().map_err(|e| format!("stat {rel}: {e}"))?;
         let mtime = system_mtime(&meta);
+        // Taken from the descriptor being streamed, so it names the content that
+        // actually goes up rather than whatever is at the path when we finish.
+        let streamed = LocalSig::from(&meta);
         // Count the bytes as they are read, so this upload shows up in
         // `GetQueueStatus` next to a manual one. The uid isn't known until the
         // draft is sealed, so the transfer registers without one.
@@ -1276,7 +1295,9 @@ impl Core {
             )
             .await
             .map_err(|e| format!("upload {rel}: {e}"))?;
-        self.record_file_baseline(folder_id, rel, &path, &uid).await
+        warn_if_torn(rel, &path, streamed);
+        self.record_file_baseline(folder_id, rel, Some(streamed), &uid)
+            .await
     }
 
     /// Upload a changed local file as a new revision of an existing remote node.
@@ -1291,6 +1312,7 @@ impl Core {
         let file = std::fs::File::open(&path).map_err(|e| format!("open {rel}: {e}"))?;
         let meta = file.metadata().map_err(|e| format!("stat {rel}: {e}"))?;
         let mtime = system_mtime(&meta);
+        let streamed = LocalSig::from(&meta);
         let reader = OwnedCountingReader::new(
             file,
             self.transfers.begin(
@@ -1304,11 +1326,20 @@ impl Core {
             .upload_new_revision_from(uid, reader, meta.len() as i64, Vec::new(), Some(mtime))
             .await
             .map_err(|e| format!("upload revision {rel}: {e}"))?;
-        self.record_file_baseline(folder_id, rel, &path, uid).await
+        warn_if_torn(rel, &path, streamed);
+        self.record_file_baseline(folder_id, rel, Some(streamed), uid)
+            .await
     }
 
     /// Download a remote file to its local path (atomically via a temp file),
     /// stamp the local mtime to match the remote, then record baseline.
+    ///
+    /// `expected_local` is the identity planning saw at the destination. The
+    /// rename below is the destructive step, and the download in between can run
+    /// for minutes, so the destination is re-examined right before it: a local
+    /// file that no longer matches the plan is set aside as a conflict copy
+    /// instead of being replaced (bugs.md B39).
+    #[allow(clippy::too_many_arguments)]
     async fn download_file(
         &self,
         folder_id: i64,
@@ -1317,6 +1348,7 @@ impl Core {
         uid: &NodeUid,
         mtime: i64,
         size: i64,
+        expected_local: Option<LocalSig>,
     ) -> Result<(), String> {
         let path = local_root.join(rel_to_path(rel));
         if let Some(parent) = path.parent() {
@@ -1351,6 +1383,13 @@ impl Core {
             out.flush().map_err(|e| format!("flush tmp {rel}: {e}"))?;
             out.sync_all().map_err(|e| format!("sync tmp {rel}: {e}"))?;
         }
+        // The last moment at which the destination can still be saved. Anything
+        // other than the state planning classified means a writer got there
+        // first, and its bytes are the ones nothing else has a copy of.
+        if let Err(e) = keep_racing_local_edit(&path, expected_local) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(format!("set aside racing local edit for {rel}: {e}"));
+        }
         std::fs::rename(&tmp, &path).map_err(|e| format!("place {rel}: {e}"))?;
         // Match local mtime to the remote's so neither side looks "changed" next pass.
         let f = std::fs::File::options()
@@ -1366,23 +1405,36 @@ impl Core {
                 .and_then(|dir| dir.sync_all())
                 .map_err(|e| format!("sync directory for {rel}: {e}"))?;
         }
-        self.record_file_baseline(folder_id, rel, &path, uid).await
+        // Here the file on disk *is* the transferred content: it was published
+        // by a rename and stamped just above, so its stat is the identity.
+        self.record_file_baseline(folder_id, rel, local_sig(&path), uid)
+            .await
     }
 
-    /// Refresh a file's baseline from ground truth: the local stat and the
-    /// remote node's reported signature. Called after every upload/download so
-    /// the very next reconcile sees the path as unchanged.
+    /// Refresh a file's baseline from ground truth: the local identity these
+    /// bytes came from and the remote node's reported signature. Called after
+    /// every upload/download so the very next reconcile sees the path as
+    /// unchanged.
+    ///
+    /// `local` is the identity the *transferred content* corresponds to, which
+    /// is not always the file's current stat. An upload streams the live file,
+    /// so it passes the identity it read the first byte at: if a writer changed
+    /// the file mid-stream, the remote now holds a torn revision, and recording
+    /// the pre-upload identity is what makes the next pass see the path as
+    /// locally changed and upload a whole, clean revision over it. Recording the
+    /// post-upload stat instead declared the torn revision synchronized and left
+    /// it as the file's content on Drive (bugs.md B40).
     async fn record_file_baseline(
         &self,
         folder_id: i64,
         rel: &str,
-        local_path: &Path,
+        local: Option<LocalSig>,
         uid: &NodeUid,
     ) -> Result<(), String> {
-        let (lmtime, lsize) = match std::fs::metadata(local_path) {
-            Ok(m) => (system_mtime(&m), m.len() as i64),
-            Err(e) => return Err(format!("stat {rel}: {e}")),
+        let Some(local) = local else {
+            return Err(format!("stat {rel}: no local identity to baseline"));
         };
+        let (lmtime, lsize) = (local.mtime, local.size);
         // Re-fetch the node so the stored remote signature is exactly what a walk
         // will report next time.
         let (rmtime, rsize) = match self.client.enumerate_nodes(std::slice::from_ref(uid)).await {
@@ -1402,12 +1454,95 @@ impl Core {
                     rel_path: rel.to_string(),
                     remote_uid: Some(uid.to_string()),
                     local_mtime: lmtime,
+                    local_mtime_ns: local.mtime_ns,
                     local_size: lsize,
                     remote_rev: Some(rmtime.to_string()),
                     remote_hash: Some(rsize.to_string()),
                 },
             )
             .map_err(|e| format!("baseline {rel}: {e:?}"))
+    }
+}
+
+/// Say so when a file changed under an upload that was streaming it.
+///
+/// Purely diagnostic — the correction is already in place, because the baseline
+/// records the identity the upload *read* rather than the one on disk now, so
+/// the next pass classifies the path as locally changed and replaces the torn
+/// revision. Without the log there is nothing in the journal to explain the
+/// extra revision (bugs.md B40).
+fn warn_if_torn(rel: &str, path: &Path, streamed: LocalSig) {
+    let now = local_sig(path);
+    if !now.is_some_and(|now| now.same_content(&streamed)) {
+        warn!(
+            rel,
+            ?streamed,
+            ?now,
+            "sync: file changed while uploading; the remote revision may be torn \
+             and will be replaced on the next pass"
+        );
+    }
+}
+
+/// The identity a reconcile pass uses to recognise a local file it has already
+/// looked at: `None` when nothing is at the path.
+fn local_sig(path: &Path) -> Option<LocalSig> {
+    std::fs::metadata(path).ok().map(|m| LocalSig {
+        mtime: system_mtime(&m),
+        mtime_ns: system_mtime_ns(&m),
+        size: m.len() as i64,
+    })
+}
+
+/// Guard the destination of a download: if what is at `path` is no longer what
+/// planning classified, move it aside as a conflict copy before the caller
+/// renames over it.
+///
+/// A reconcile pass decides what to do from a walk that finished before the
+/// transfer started, and a download of a large file can run for minutes. Without
+/// this, a local edit completed inside that window was replaced by the remote
+/// version with no copy of it kept anywhere — the one shape of loss a sync
+/// engine must not have (bugs.md B39). Keeping the copy makes it re-upload as a
+/// new file on the next pass, which is the same resolution a both-sides-changed
+/// conflict already gets.
+///
+/// A path that is empty when it was expected to be is not a conflict: the
+/// download is about to recreate it, and there is nothing to preserve.
+fn keep_racing_local_edit(path: &Path, expected: Option<LocalSig>) -> std::io::Result<()> {
+    let actual = local_sig(path);
+    let unchanged = match (actual, expected) {
+        (Some(a), Some(e)) => a.same_content(&e),
+        // Nothing there: the download is about to create it, and there is
+        // nothing to preserve either way.
+        (None, _) => true,
+        (Some(_), None) => false,
+    };
+    if unchanged {
+        return Ok(());
+    }
+    warn!(
+        path = %path.display(),
+        ?expected,
+        ?actual,
+        "sync: local file changed while downloading; keeping it as a conflict copy"
+    );
+    preserve_conflict_copy(path, now_secs()).map(|_| ())
+}
+
+/// Read a local removal as the sync engine has to read it: the *state* it was
+/// asking for is "this path is gone", so a path that was already gone is a
+/// success, not a failure.
+///
+/// It matters because the baseline is only dropped on success. Treating
+/// `NotFound` as an error left the baseline in place for a file that no longer
+/// exists, so the same removal was re-attempted and re-reported as an error on
+/// every pass, forever. Every other error is still an error, and keeping the
+/// baseline is exactly right there: the surviving file must not be mistaken for
+/// a new local creation on the next pass and uploaded back (bugs.md B42).
+fn removed_locally(result: std::io::Result<()>) -> std::io::Result<()> {
+    match result {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        other => other,
     }
 }
 
@@ -1476,9 +1611,76 @@ fn system_mtime(meta: &std::fs::Metadata) -> i64 {
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
 }
+
+/// The same modification time in nanoseconds, when the filesystem reports one.
+///
+/// Whole seconds cannot distinguish an edit made in the same second as the last
+/// sync from no edit at all, and if the size did not change either, that file
+/// was never uploaded (bugs.md B25). `None` for a clock or filesystem that
+/// cannot answer, which falls the comparison back to seconds rather than
+/// asserting an mtime of zero.
+fn system_mtime_ns(meta: &std::fs::Metadata) -> Option<i64> {
+    meta.modified()
+        .ok()
+        .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
+        .and_then(|d| i64::try_from(d.as_nanos()).ok())
+}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A removal of something already gone has produced the state the sync
+    /// engine wanted, so its baseline is dropped rather than retried forever.
+    /// Anything else stays an error and keeps the baseline (bugs.md B42).
+    #[test]
+    fn an_already_absent_path_counts_as_removed() {
+        let root = std::env::temp_dir().join(format!("pdfs-b42-{}", std::process::id()));
+        let missing = root.join("never-existed");
+        assert!(removed_locally(std::fs::remove_file(&missing)).is_ok());
+        assert!(removed_locally(std::fs::remove_dir_all(&missing)).is_ok());
+
+        // A directory in the way of `remove_file` is a real failure, and must
+        // stay one: the file survives, and its baseline has to survive with it.
+        let occupied = root.join("a-directory");
+        std::fs::create_dir_all(&occupied).unwrap();
+        assert!(removed_locally(std::fs::remove_file(&occupied)).is_err());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The download guard: a destination that still matches the plan is
+    /// replaced silently, one that has moved on since is kept (bugs.md B39).
+    #[test]
+    fn a_download_keeps_a_local_edit_it_did_not_plan_for() {
+        let root = std::env::temp_dir().join(format!("pdfs-b39-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("report.txt");
+
+        // Nothing there, nothing expected: the download simply creates it.
+        assert!(keep_racing_local_edit(&path, None).is_ok());
+        assert!(!path.exists());
+
+        // Unchanged since planning: no copy, the caller overwrites it.
+        std::fs::write(&path, b"planned").unwrap();
+        let planned = local_sig(&path).unwrap();
+        keep_racing_local_edit(&path, Some(planned)).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"planned");
+
+        // Changed since planning: the racing bytes are the only copy of
+        // themselves, so they must survive the overwrite as a conflict copy.
+        std::fs::write(&path, b"a much longer local edit").unwrap();
+        keep_racing_local_edit(&path, Some(planned)).unwrap();
+        let kept: Vec<_> = std::fs::read_dir(&root)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| std::fs::read(e.path()).unwrap_or_default())
+            .collect();
+        assert!(
+            kept.iter()
+                .any(|bytes| bytes == b"a much longer local edit"),
+            "the racing edit must still exist somewhere: {kept:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     /// Feed `n` `Reconcile` events `gap` apart on another thread, starting
     /// immediately. Returns the sender's join handle so the test can keep it
@@ -1565,6 +1767,7 @@ mod tests {
 
     fn local_item(is_dir: bool) -> LocalItem {
         LocalItem {
+            mtime_ns: None,
             is_dir,
             mtime: 1,
             size: 1,
@@ -1764,6 +1967,7 @@ mod tests {
                 remote_uid: Some("v~l".into()),
                 local_mtime: 0,
                 local_size: 0,
+                local_mtime_ns: None,
                 remote_rev: Some(mtime.to_string()),
                 remote_hash: Some(size.to_string()),
             },
@@ -1801,6 +2005,7 @@ mod tests {
                 remote_uid: Some("v~l".into()),
                 local_mtime: 0,
                 local_size: 0,
+                local_mtime_ns: None,
                 remote_rev: None,
                 remote_hash: None,
             },
@@ -1815,6 +2020,7 @@ mod tests {
             remote_uid: Some("v~l".into()),
             local_mtime: 10,
             local_size: 20,
+            local_mtime_ns: None,
             remote_rev: Some("1700".into()),
             remote_hash: Some("4096".into()),
         };
@@ -1828,6 +2034,7 @@ mod tests {
             remote_uid: Some("v~l".into()),
             local_mtime: 0,
             local_size: 0,
+            local_mtime_ns: None,
             remote_rev: None,
             remote_hash: None,
         };
@@ -1863,6 +2070,7 @@ mod tests {
             uid: uid(),
             mtime: 0,
             size: 10,
+            local: None,
         };
         assert_eq!(op.kind(), ActivityKind::Download);
     }

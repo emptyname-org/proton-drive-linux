@@ -1,6 +1,7 @@
 //! Kernel-facing FUSE callback adapter.
 
 use super::*;
+use crate::state::DirListing;
 
 impl Filesystem for ProtonFs {
     /// Negotiate kernel-side behaviour once, before any other callback.
@@ -162,15 +163,46 @@ impl Filesystem for ProtonFs {
         }
     }
 
+    /// Freeze this directory's listing for the life of the handle.
+    ///
+    /// `readdir` is paged, and its continuation offset only means anything
+    /// against a listing that does not move underneath it. Taking the snapshot
+    /// here — once per `opendir`, which the kernel pairs exactly with one
+    /// `releasedir` — is what makes the offsets stable, so a create or a trash
+    /// during an enumeration can no longer make the caller skip or repeat an
+    /// entry (bugs.md B43).
+    ///
+    /// Enumerating a cold folder is a remote call, so it goes to a worker for
+    /// the same reason `lookup` and `readdir` do.
+    fn opendir(&self, _req: &Request, ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
+        let ino = ino.0;
+        if self.core.children_cached(ino) {
+            self.serve_opendir(ino, reply);
+            return;
+        }
+        let fs = self.clone();
+        self.core
+            .workers
+            .run(Lane::Meta, move || fs.serve_opendir(ino, reply));
+    }
+
     fn readdir(
         &self,
         _req: &Request,
         ino: INodeNo,
-        _fh: FileHandle,
+        fh: FileHandle,
         offset: u64,
         reply: ReplyDirectory,
     ) {
         let ino = ino.0;
+        // The snapshot is the whole point: served from it, this is a pure
+        // in-memory walk with no chance of a remote call, so it never needs a
+        // worker. Only a handle whose `opendir` failed to snapshot (or a kernel
+        // that issued `readdir` without one) falls back to the live path.
+        if let Some(listing) = self.core.state().dir_snapshots.get(&fh.0).cloned() {
+            reply_listing(&listing, offset, reply);
+            return;
+        }
         // Same split as `lookup`: only the cold, remote-enumerating path pays
         // for a worker.
         if self.core.children_cached(ino) {
@@ -181,6 +213,18 @@ impl Filesystem for ProtonFs {
         self.core
             .workers
             .run(Lane::Meta, move || fs.serve_readdir(ino, offset, reply));
+    }
+
+    fn releasedir(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        fh: FileHandle,
+        _flags: OpenFlags,
+        reply: ReplyEmpty,
+    ) {
+        self.core.state().dir_snapshots.remove(&fh.0);
+        reply.ok();
     }
 
     /// A read-only open is a map lookup and answers inline; a write open has to
@@ -912,6 +956,58 @@ pub struct ProtonFs {
     gid: u32,
 }
 
+/// How many times a write `open` will re-read its base after a `release`
+/// published a newer queued revision underneath it (bugs.md B32).
+///
+/// One retry covers the race, which needs a close and an open of the same file
+/// to overlap on different threads. More than that is not contention, it is a
+/// file being republished continuously, and looping on it would keep a FUSE
+/// worker busy indefinitely.
+const OPEN_BASE_ATTEMPTS: u32 = 3;
+
+/// One directory's entries as `readdir` reports them: `.` and `..` first, then
+/// the interned children in `children` order.
+///
+/// Split out because it is built from two places that must agree — `opendir`
+/// freezes it, and the fallback `readdir` builds it live — and a divergence
+/// between them would show up as entries appearing or vanishing depending on
+/// whether the kernel happened to send an `opendir`.
+fn build_listing(st: &State, ino: u64) -> DirListing {
+    let parent = st.entries.get(&ino).map_or(ROOT_INO, |e| e.parent);
+    // "." and ".." occupy offsets 0 and 1; real children follow.
+    let mut listing = vec![
+        (ino, true, ".".to_string()),
+        (parent, true, "..".to_string()),
+    ];
+    if let Some(kids) = st.children.get(&ino) {
+        for &kid in kids {
+            if let Some(e) = st.entries.get(&kid) {
+                listing.push((kid, e.node.is_folder(), e.node.name.clone()));
+            }
+        }
+    }
+    listing
+}
+
+/// Fill a `readdir` reply from `listing`, resuming at `offset`.
+///
+/// The cookie handed back is the index of the *next* entry, so a resumed call
+/// continues exactly where the last one stopped — which is only true because
+/// the listing behind those indexes is a snapshot (bugs.md B43).
+fn reply_listing(listing: &DirListing, offset: u64, mut reply: ReplyDirectory) {
+    for (i, (ino, is_dir, name)) in listing.iter().enumerate().skip(offset as usize) {
+        let ft = if *is_dir {
+            FileType::Directory
+        } else {
+            FileType::RegularFile
+        };
+        if reply.add(INodeNo(*ino), (i + 1) as u64, ft, name) {
+            break;
+        }
+    }
+    reply.ok();
+}
+
 pub(crate) fn access_allowed(is_dir: bool, access: Access, mask: AccessFlags) -> bool {
     (!mask.contains(AccessFlags::W_OK) || access.writable())
         && (!mask.contains(AccessFlags::X_OK) || is_dir)
@@ -1027,40 +1123,39 @@ impl ProtonFs {
     }
 
     /// The body of [`Filesystem::readdir`], on whichever thread ends up serving it.
-    fn serve_readdir(&self, ino: u64, offset: u64, mut reply: ReplyDirectory) {
+    /// The body of [`Filesystem::opendir`]: enumerate the folder if it is cold,
+    /// then publish one frozen listing under a fresh handle.
+    ///
+    /// A failure to enumerate is reported as a failed `opendir` rather than
+    /// deferred to the first `readdir` — the caller gets the errno at the syscall
+    /// that can still act on it.
+    fn serve_opendir(&self, ino: u64, reply: ReplyOpen) {
+        if let Err(e) = self.core.ensure_children(ino) {
+            reply.error(e);
+            return;
+        }
+        let mut st = self.core.state();
+        let listing = Arc::new(build_listing(&st, ino));
+        // Shares the counter with write handles, so a directory handle can never
+        // collide with a file handle (both are `fh` values in one kernel space).
+        let fh = st.next_fh;
+        st.next_fh += 1;
+        st.dir_snapshots.insert(fh, listing);
+        drop(st);
+        reply.opened(FileHandle(fh), FopenFlags::empty());
+    }
+
+    /// The live, un-snapshotted `readdir`. Reached only by a handle that has no
+    /// snapshot — see [`Filesystem::readdir`].
+    fn serve_readdir(&self, ino: u64, offset: u64, reply: ReplyDirectory) {
         if let Err(e) = self.core.ensure_children(ino) {
             reply.error(e);
             return;
         }
         let st = self.core.state();
-        let parent = st.entries.get(&ino).map_or(ROOT_INO, |e| e.parent);
-
-        // "." and ".." occupy offsets 0 and 1; real children follow.
-        let mut listing: Vec<(u64, FileType, String)> = vec![
-            (ino, FileType::Directory, ".".to_string()),
-            (parent, FileType::Directory, "..".to_string()),
-        ];
-        if let Some(kids) = st.children.get(&ino) {
-            for &kid in kids {
-                if let Some(e) = st.entries.get(&kid) {
-                    let ft = if e.node.is_folder() {
-                        FileType::Directory
-                    } else {
-                        FileType::RegularFile
-                    };
-                    listing.push((kid, ft, e.node.name.clone()));
-                }
-            }
-        }
+        let listing = build_listing(&st, ino);
         drop(st);
-
-        for (i, (ino, ft, name)) in listing.into_iter().enumerate().skip(offset as usize) {
-            // The stored offset is that of the *next* entry to resume at.
-            if reply.add(INodeNo(ino), (i + 1) as u64, ft, &name) {
-                break;
-            }
-        }
-        reply.ok();
+        reply_listing(&listing, offset, reply);
     }
 
     fn attr(&self, ino: u64, node: &Node, access: Access) -> FileAttr {
@@ -1142,66 +1237,101 @@ impl ProtonFs {
         // any network access. An incomplete blob still has gaps referring to
         // the remote base; stacking another write on it cannot be represented
         // safely by WriteHandle, so fail the open rather than risk corruption.
-        let pending_base = self.core.pending.lock().get(&uid).cloned();
-        if pending_base.as_ref().is_some_and(|p| !p.meta.complete) {
-            if let Some(entry) = self.core.state().entries.get_mut(&ino.0) {
-                entry.open_count = entry.open_count.saturating_sub(1);
-            }
-            error!(%uid, "refusing write over incomplete queued revision");
-            reply.error(Errno::EIO);
-            return;
-        }
-        let (file, path) = match self.core.cache.create_scratch() {
-            Ok(x) => x,
-            Err(e) => {
-                if let Some(entry) = self.core.state().entries.get_mut(&ino.0) {
-                    entry.open_count = entry.open_count.saturating_sub(1);
+        //
+        // Reading that blob and installing the handle cannot be done under one
+        // lock — the copy is the size of the file — so the base is re-checked at
+        // the moment the handle goes in, and a `release` that published a newer
+        // revision in between sends this around again. Without the re-check the
+        // new handle carried the *older* base, and its own release published
+        // content that silently discarded the revision closed a moment earlier
+        // (bugs.md B32). A second attempt is already unlikely and a third would
+        // mean something is republishing continuously, so give up rather than
+        // spin: the caller's `open` fails instead of its data being lost.
+        //
+        // `reply` is consumed by whichever arm answers, so the loop yields an
+        // outcome and the answer is sent once, after it.
+        let outcome = 'install: {
+            for attempt in 0..OPEN_BASE_ATTEMPTS {
+                let pending_base = self.core.pending.lock().get(&uid).cloned();
+                if pending_base.as_ref().is_some_and(|p| !p.meta.complete) {
+                    error!(%uid, "refusing write over incomplete queued revision");
+                    break 'install Err(Errno::EIO);
                 }
-                error!(%uid, error = %e, "create scratch file failed");
-                reply.error(Errno::EIO);
-                return;
+                let (file, path) = match self.core.cache.create_scratch() {
+                    Ok(x) => x,
+                    Err(e) => {
+                        error!(%uid, error = %e, "create scratch file failed");
+                        break 'install Err(Errno::EIO);
+                    }
+                };
+                let mut initial_written = Intervals::default();
+                if let Some(pending) = &pending_base {
+                    // Reflink where the filesystem can: this blob is the whole
+                    // file, and a byte-for-byte copy of a multi-GB pending
+                    // revision is the kind of work `open` must not do
+                    // (`ContentCache::clone_or_copy`).
+                    if let Err(e) = ContentCache::clone_or_copy(&pending.path, &path) {
+                        let _ = std::fs::remove_file(&path);
+                        error!(%uid, source = %pending.path.display(), error = %e,
+                            "copy queued revision into write scratch failed");
+                        break 'install Err(Errno::EIO);
+                    }
+                    initial_written.add(0, pending.meta.len);
+                }
+                // Sampled *before* the state lock, never under it: no site in
+                // the daemon holds `pending` and `state` at once (see
+                // `stamp_pending_sizes`) and this must not become the first.
+                // What that costs is a window of a few instructions instead of
+                // a lock-tight comparison — against the multi-gigabyte copy
+                // above, which is the window that actually loses data.
+                let current = self.core.pending_blob(&uid);
+                let mut st = self.core.state();
+                // Only a handle this open is about to *create* can carry a stale
+                // base; if one already exists, that handle is authoritative and
+                // the scratch prepared above is discarded either way.
+                let creating = !st.active_writes.contains_key(&ino.0);
+                if creating && current != pending_base.map(|p| p.path) {
+                    drop(st);
+                    let _ = std::fs::remove_file(&path);
+                    warn!(%uid, attempt, "queued revision changed while opening for write; retrying");
+                    continue;
+                }
+                let fh = st.next_fh;
+                st.next_fh += 1;
+                let aw = st.active_writes.entry(ino.0).or_insert_with(|| {
+                    WriteHandle {
+                        ino: ino.0,
+                        uid: uid.clone(),
+                        file: Arc::new(file),
+                        path,
+                        written: initial_written,
+                        // Starts at the current size; reads in [0, base_size)
+                        // come from the base until overwritten.
+                        len: base_size,
+                        base_size,
+                        base_mtime,
+                        base_revision_id,
+                        dirty: false,
+                        open_count: 0,
+                    }
+                });
+                aw.open_count += 1;
+                st.handles.insert(fh, ino.0);
+                break 'install Ok(fh);
             }
+            error!(%uid, "queued revision kept changing while opening for write");
+            Err(Errno::EIO)
         };
-        let mut initial_written = Intervals::default();
-        if let Some(pending) = &pending_base {
-            // Reflink where the filesystem can: this blob is the whole file, and
-            // a byte-for-byte copy of a multi-GB pending revision is the kind of
-            // work `open` must not do (`ContentCache::clone_or_copy`).
-            if let Err(e) = ContentCache::clone_or_copy(&pending.path, &path) {
+        match outcome {
+            Ok(fh) => reply.opened(FileHandle(fh), FopenFlags::empty()),
+            Err(error) => {
+                // The lookup count was raised before any of this could fail.
                 if let Some(entry) = self.core.state().entries.get_mut(&ino.0) {
                     entry.open_count = entry.open_count.saturating_sub(1);
                 }
-                let _ = std::fs::remove_file(&path);
-                error!(%uid, source = %pending.path.display(), error = %e,
-                    "copy queued revision into write scratch failed");
-                reply.error(Errno::EIO);
-                return;
+                reply.error(error);
             }
-            initial_written.add(0, pending.meta.len);
         }
-        let mut st = self.core.state();
-        let fh = st.next_fh;
-        st.next_fh += 1;
-        let aw = st.active_writes.entry(ino.0).or_insert_with(|| {
-            WriteHandle {
-                ino: ino.0,
-                uid,
-                file: Arc::new(file),
-                path,
-                written: initial_written,
-                // Starts at the current size; reads in [0, base_size) come from
-                // the base until overwritten.
-                len: base_size,
-                base_size,
-                base_mtime,
-                base_revision_id,
-                dirty: false,
-                open_count: 0,
-            }
-        });
-        aw.open_count += 1;
-        st.handles.insert(fh, ino.0);
-        reply.opened(FileHandle(fh), FopenFlags::empty());
     }
 
     /// The body of [`Filesystem::fsync`], run off the dispatch loop.

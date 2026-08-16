@@ -32,17 +32,24 @@ pub(crate) enum SyncMsg {
     ReconcileAll,
     /// Re-read the folder set and adjust the filesystem watches (after add/remove).
     Rewatch,
+    /// The daemon is tearing down: finish the current pass and end the engine
+    /// thread, so the mount can join it (bugs.md B44).
+    Stop,
 }
 
 /// Start the sync engine: a control thread that owns the filesystem watcher and
 /// serialises reconcile passes, plus a periodic poll thread. The engine receives
 /// on `rx`; senders live in [`Core::sync_tx`].
-pub(crate) fn spawn(core: Core, rx: Receiver<SyncMsg>) {
-    if let Err(e) = std::thread::Builder::new()
+pub(crate) fn spawn(core: Core, rx: Receiver<SyncMsg>) -> Option<std::thread::JoinHandle<()>> {
+    match std::thread::Builder::new()
         .name("pdfs-sync".into())
         .spawn(move || engine_loop(core, rx))
     {
-        warn!(error = %e, "failed to start sync engine");
+        Ok(handle) => Some(handle),
+        Err(e) => {
+            warn!(error = %e, "failed to start sync engine");
+            None
+        }
     }
 }
 
@@ -74,11 +81,11 @@ fn engine_loop(core: Core, rx: Receiver<SyncMsg>) {
     // Periodic remote poll.
     {
         let tx = core.sync_tx.clone();
+        let shutdown = core.shutdown.clone();
         std::thread::Builder::new()
             .name("pdfs-sync-poll".into())
             .spawn(move || {
-                loop {
-                    std::thread::sleep(POLL_INTERVAL);
+                while shutdown.sleep(POLL_INTERVAL) {
                     if tx.send(SyncMsg::ReconcileAll).is_err() {
                         break;
                     }
@@ -94,8 +101,12 @@ fn engine_loop(core: Core, rx: Receiver<SyncMsg>) {
         let mut ids: HashSet<i64> = HashSet::new();
         let mut all = false;
         let mut do_rewatch = false;
-        classify(msg, &mut ids, &mut all, &mut do_rewatch);
-        settle(&rx, &mut ids, &mut all, &mut do_rewatch);
+        if !classify(msg, &mut ids, &mut all, &mut do_rewatch)
+            || !settle(&rx, &mut ids, &mut all, &mut do_rewatch)
+        {
+            info!("sync engine stopping");
+            return;
+        }
 
         if do_rewatch {
             rewatch(&core, &mut watcher, &watched);
@@ -116,9 +127,9 @@ fn engine_loop(core: Core, rx: Receiver<SyncMsg>) {
 fn poll_only_loop(core: &Core, rx: Receiver<SyncMsg>) {
     {
         let tx = core.sync_tx.clone();
+        let shutdown = core.shutdown.clone();
         std::thread::spawn(move || {
-            loop {
-                std::thread::sleep(POLL_INTERVAL);
+            while shutdown.sleep(POLL_INTERVAL) {
                 if tx.send(SyncMsg::ReconcileAll).is_err() {
                     break;
                 }
@@ -130,8 +141,12 @@ fn poll_only_loop(core: &Core, rx: Receiver<SyncMsg>) {
         let mut ids: HashSet<i64> = HashSet::new();
         let mut all = false;
         let mut do_rewatch = false;
-        classify(msg, &mut ids, &mut all, &mut do_rewatch);
-        settle(&rx, &mut ids, &mut all, &mut do_rewatch);
+        if !classify(msg, &mut ids, &mut all, &mut do_rewatch)
+            || !settle(&rx, &mut ids, &mut all, &mut do_rewatch)
+        {
+            info!("sync engine stopping");
+            return;
+        }
         if all {
             reconcile_all(core);
         } else {
@@ -158,7 +173,7 @@ pub(super) fn settle_with(
     do_rewatch: &mut bool,
     quiet: Duration,
     cap: Duration,
-) {
+) -> bool {
     let deadline = Instant::now() + cap;
     loop {
         let now = Instant::now();
@@ -170,28 +185,49 @@ pub(super) fn settle_with(
         match rx.recv_timeout(wait) {
             // Another event: the burst is still going, so the quiet window
             // starts again from here.
-            Ok(m) => classify(m, ids, all, do_rewatch),
+            // A stop lands mid-burst: give up the rest of the burst rather
+            // than settling for it, and let the caller end the loop.
+            Ok(m) => {
+                if !classify(m, ids, all, do_rewatch) {
+                    return false;
+                }
+            }
             // Quiet for a full window: whatever was being written has stopped.
             Err(RecvTimeoutError::Timeout) => break,
             // Every sender is gone; the caller's loop is about to end anyway.
             Err(RecvTimeoutError::Disconnected) => break,
         }
     }
+    true
 }
 
 /// [`settle_with`] at the real timings.
-fn settle(rx: &Receiver<SyncMsg>, ids: &mut HashSet<i64>, all: &mut bool, do_rewatch: &mut bool) {
-    settle_with(rx, ids, all, do_rewatch, DEBOUNCE, MAX_SETTLE);
+fn settle(
+    rx: &Receiver<SyncMsg>,
+    ids: &mut HashSet<i64>,
+    all: &mut bool,
+    do_rewatch: &mut bool,
+) -> bool {
+    settle_with(rx, ids, all, do_rewatch, DEBOUNCE, MAX_SETTLE)
 }
 
-pub(super) fn classify(msg: SyncMsg, ids: &mut HashSet<i64>, all: &mut bool, rewatch: &mut bool) {
+/// Fold one message into the pending work of the current burst. Returns `false`
+/// for [`SyncMsg::Stop`], which is not work but an instruction to end the loop.
+pub(super) fn classify(
+    msg: SyncMsg,
+    ids: &mut HashSet<i64>,
+    all: &mut bool,
+    rewatch: &mut bool,
+) -> bool {
     match msg {
         SyncMsg::Reconcile(id) => {
             ids.insert(id);
         }
         SyncMsg::ReconcileAll => *all = true,
         SyncMsg::Rewatch => *rewatch = true,
+        SyncMsg::Stop => return false,
     }
+    true
 }
 
 /// Reconcile every mirror folder in turn.

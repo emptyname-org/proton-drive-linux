@@ -67,10 +67,16 @@ impl Core {
     /// Sweep for stale conflict copies forever, on its own thread. See the module
     /// docs for the identical/divergent policy.
     pub(crate) fn run_conflict_sweep_loop(&self) {
-        std::thread::sleep(CONFLICT_SWEEP_WARMUP);
+        // Both waits are interruptible, so teardown does not have to sit out a
+        // five-minute interval to join this thread (bugs.md B44).
+        if !self.shutdown.sleep(CONFLICT_SWEEP_WARMUP) {
+            return;
+        }
         loop {
             self.sweep_conflicts_once();
-            std::thread::sleep(CONFLICT_SWEEP_INTERVAL);
+            if !self.shutdown.sleep(CONFLICT_SWEEP_INTERVAL) {
+                return;
+            }
         }
     }
 

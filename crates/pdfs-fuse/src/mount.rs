@@ -365,6 +365,7 @@ pub fn mount(
         readers: Arc::new(Mutex::new(HashMap::new())),
         block_ring: Arc::new(Mutex::new(BlockRing::default())),
         block_flight: Arc::new(BlockFlight::default()),
+        content_repairs: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         prefetch: Arc::new(Prefetch::default()),
         prefetch_budget: Arc::new(tokio::sync::Semaphore::new(PREFETCH_BUDGET)),
         workers: Arc::new(Workers::new(FUSE_WORKERS)?),
@@ -376,6 +377,7 @@ pub fn mount(
         pending: Arc::new(Mutex::new(HashMap::new())),
         hidden: Arc::new(Mutex::new(HashSet::new())),
         drain_wake: Arc::new((Mutex::new(false), Condvar::new())),
+        shutdown: Arc::new(crate::shutdown::Shutdown::default()),
         upload_times: Arc::new(Mutex::new(HashMap::new())),
         upload_cancel: Arc::new(Mutex::new(HashMap::new())),
         timeline_refreshing: Arc::new(AtomicBool::new(false)),
@@ -420,16 +422,24 @@ pub fn mount(
     // long as it ran; the claim column (`Db::claim_next_due_op`) keeps the
     // workers off each other's nodes, which is the only ordering the queue
     // actually needs. Worker 0 additionally runs the queue's idle chores.
+    //
+    // Every long-lived thread started from here on is kept in `workers` and
+    // joined at the end of this function. Leaving them running turned an
+    // in-process remount into a second generation of drain workers, sync engines
+    // and sweeps all operating on a mount that no longer exists (bugs.md B44).
+    let mut workers: Vec<std::thread::JoinHandle<()>> = Vec::new();
     for worker in 0..DRAIN_WORKERS {
         let core = core.clone();
-        std::thread::Builder::new()
-            .name(format!("pdfs-drain-{worker}"))
-            .spawn(move || core.run_pending_drain(worker == 0))?;
+        workers.push(
+            std::thread::Builder::new()
+                .name(format!("pdfs-drain-{worker}"))
+                .spawn(move || core.run_pending_drain(worker == 0))?,
+        );
     }
 
     // Start the folder-sync engine. It watches every mirror folder, polls the
     // remotes, and reconciles on its own thread — never in front of a FUSE call.
-    sync::spawn(core.clone(), sync_rx);
+    workers.extend(sync::spawn(core.clone(), sync_rx));
 
     // Reconcile leftover `(sync-conflict …)` copies: drop the ones that turned
     // out identical to the live file, surface the ones that genuinely diverge.
@@ -441,18 +451,22 @@ pub fn mount(
     } else {
         info!(mode = ?sweep_mode, "conflict sweep enabled");
         let core = core.clone();
-        std::thread::Builder::new()
-            .name("pdfs-conflict-sweep".into())
-            .spawn(move || core.run_conflict_sweep_loop())?;
+        workers.push(
+            std::thread::Builder::new()
+                .name("pdfs-conflict-sweep".into())
+                .spawn(move || core.run_conflict_sweep_loop())?,
+        );
     }
 
     // Mounted from the cache: watch for the network coming back so the mount can
     // stop being read-only-ish without the user restarting the daemon.
     if !online {
         let core = core.clone();
-        std::thread::Builder::new()
-            .name("pdfs-online-probe".into())
-            .spawn(move || core.run_online_probe())?;
+        workers.push(
+            std::thread::Builder::new()
+                .name("pdfs-online-probe".into())
+                .spawn(move || core.run_online_probe())?,
+        );
     }
 
     // Keep the launcher prompt's "This computer" index fresh. Its own thread:
@@ -462,9 +476,12 @@ pub fn mount(
         let indexing = core.indexing.clone();
         let transfers = core.transfers.clone();
         let mountpoint = mountpoint.to_path_buf();
-        std::thread::Builder::new()
-            .name("pdfs-localindex".into())
-            .spawn(move || run_local_index(db, indexing, transfers, mountpoint))?;
+        let shutdown = core.shutdown.clone();
+        workers.push(
+            std::thread::Builder::new()
+                .name("pdfs-localindex".into())
+                .spawn(move || run_local_index(db, indexing, transfers, mountpoint, shutdown))?,
+        );
     }
 
     // Bind the control socket before the FUSE session takes over the thread. A
@@ -501,23 +518,29 @@ pub fn mount(
         let control_core = core.clone();
         let username = username.clone();
         let mountpoint = mountpoint.to_path_buf();
-        if let Err(error) = std::thread::Builder::new()
+        match std::thread::Builder::new()
             .name("pdfs-control".into())
             .spawn(move || run_control_socket(control_core, username, mountpoint, listener))
         {
-            let secondaries = core.mounts.lock().close_and_drain();
-            for (id, mount) in secondaries {
-                if let Err(unmount_error) = mount.teardown() {
-                    warn!(id, error = %unmount_error, "secondary teardown after control startup failure failed");
+            Ok(handle) => workers.push(handle),
+            Err(error) => {
+                // A failure here abandons the mount, so the background threads
+                // started above have to be told to stop with it.
+                stop_workers(&core, control_socket, workers);
+                let secondaries = core.mounts.lock().close_and_drain();
+                for (id, mount) in secondaries {
+                    if let Err(unmount_error) = mount.teardown() {
+                        warn!(id, error = %unmount_error, "secondary teardown after control startup failure failed");
+                    }
                 }
+                if let Err(unmount_error) = teardown_session(&core.session_live, || {
+                    umount_session_unblocked(bg, main_conn)
+                }) {
+                    warn!(error = %unmount_error, "unmount after control startup failure failed");
+                }
+                let _ = std::fs::remove_file(control_socket);
+                return Err(error);
             }
-            if let Err(unmount_error) = teardown_session(&core.session_live, || {
-                umount_session_unblocked(bg, main_conn)
-            }) {
-                warn!(error = %unmount_error, "unmount after control startup failure failed");
-            }
-            let _ = std::fs::remove_file(control_socket);
-            return Err(error);
         }
     }
     // Re-establish on-demand mounts only after the primary session is live.
@@ -626,8 +649,41 @@ pub fn mount(
         }
     }
 
-    let _ = std::fs::remove_file(control_socket);
+    // Last, because the workers may legitimately be finishing an upload, and
+    // nothing they can still do is harmful once the mounts are down.
+    stop_workers(&core, control_socket, workers);
     Ok(outcome)
+}
+
+/// Signal every background loop, wake the ones that are blocked, and join them.
+///
+/// The mount used to return with its drain workers, sync engine, sweep, online
+/// probe, indexer and control listener all still running on `Core` clones. The
+/// process usually exited straight afterwards and hid it; an in-process remount
+/// did not, and started a second full set on top of the first (bugs.md B44).
+///
+/// Two of the waits need waking rather than merely flagging: the drain workers
+/// block on their own condvar (`wake_drain`), and the control listener blocks
+/// inside `accept`, which only returns when a connection arrives — so it gets
+/// one, from us, after the flag is already set. A join that takes a while is
+/// expected and correct: a worker part-way through an upload finishes it rather
+/// than abandoning the user's bytes mid-flight.
+fn stop_workers(core: &Core, control_socket: &Path, workers: Vec<std::thread::JoinHandle<()>>) {
+    core.shutdown.stop();
+    core.wake_drain();
+    let _ = core.sync_tx.send(sync::SyncMsg::Stop);
+    // Connect while the socket still exists — that is the whole point of the
+    // poke — then unlink it so nothing else can arrive behind us. The listener
+    // re-checks the flag after every accept, so even a connection that races the
+    // unlink cannot put it back to sleep.
+    let _ = std::os::unix::net::UnixStream::connect(control_socket);
+    let _ = std::fs::remove_file(control_socket);
+    for worker in workers {
+        if worker.join().is_err() {
+            warn!("a background worker panicked before shutdown");
+        }
+    }
+    debug!("background workers stopped");
 }
 
 #[cfg(test)]

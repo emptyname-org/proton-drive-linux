@@ -218,7 +218,10 @@ pub(super) fn plan_file(
     }
 
     let local_changed = local.is_some_and(|item| {
-        baseline.is_none_or(|base| base.local_mtime != item.mtime || base.local_size != item.size)
+        // Nanoseconds where both sides have them (bugs.md B25): whole seconds
+        // could not see an edit made in the same second as the last sync that
+        // left the file the same length, so it was never uploaded.
+        baseline.is_none_or(|base| !LocalSig::from(item).same_content(&LocalSig::from(base)))
     });
     let remote_changed = remote.is_some_and(|item| {
         baseline.is_none_or(|base| remote_sig(base) != Some((item.mtime, item.size)))
@@ -252,6 +255,7 @@ mod file_plan_tests {
 
     fn local(mtime: i64, size: i64) -> LocalItem {
         LocalItem {
+            mtime_ns: None,
             is_dir: false,
             mtime,
             size,
@@ -278,10 +282,47 @@ mod file_plan_tests {
             rel_path: "file".into(),
             remote_uid: Some("v~l".into()),
             local_mtime,
+            local_mtime_ns: None,
             local_size,
             remote_rev: Some(remote_mtime.to_string()),
             remote_hash: Some(remote_size.to_string()),
         }
+    }
+
+    /// Whole seconds cannot see an edit made inside the same second that leaves the
+    /// file the same length, so a mirror silently stopped uploading it. With a
+    /// nanosecond time on both sides it is an ordinary local change (bugs.md B25).
+    #[test]
+    fn a_same_second_same_size_edit_is_still_a_local_change() {
+        let mut base = baseline(10, 20, 30, 40);
+        base.local_mtime_ns = Some(10_000_000_000);
+        let edited = LocalItem {
+            mtime_ns: Some(10_400_000_000),
+            ..local(10, 20)
+        };
+        let remote = remote(30, 40);
+        assert_eq!(
+            plan_file(Some(&edited), Some(&remote), Some(&base)),
+            FilePlan::UploadRevision
+        );
+
+        // The same file untouched still reads as unchanged.
+        let same = LocalItem {
+            mtime_ns: Some(10_000_000_000),
+            ..local(10, 20)
+        };
+        assert_eq!(
+            plan_file(Some(&same), Some(&remote), Some(&base)),
+            FilePlan::Unchanged
+        );
+
+        // And a row from before the column exists compares on seconds, exactly
+        // as it did when it was written — no mass re-upload on upgrade.
+        let old = baseline(10, 20, 30, 40);
+        assert_eq!(
+            plan_file(Some(&edited), Some(&remote), Some(&old)),
+            FilePlan::Unchanged
+        );
     }
 
     #[test]

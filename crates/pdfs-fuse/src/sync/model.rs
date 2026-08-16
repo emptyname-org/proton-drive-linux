@@ -2,9 +2,73 @@
 
 use super::*;
 
+/// What a reconcile pass remembers about the local side of one path: enough to
+/// recognise the same content again, and no more.
+///
+/// `mtime_ns` is the whole reason this is a struct rather than a pair — see
+/// [`StoredSyncEntry::local_mtime_ns`](pdfs_core::db::StoredSyncEntry).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct LocalSig {
+    pub(super) mtime: i64,
+    pub(super) mtime_ns: Option<i64>,
+    pub(super) size: i64,
+}
+
+impl LocalSig {
+    /// Whether these two observations describe the same local content.
+    ///
+    /// Nanoseconds decide it when both sides have them; otherwise the comparison
+    /// falls back to whole seconds, which is what a baseline row written before
+    /// schema 28 — or a filesystem that reports no sub-second time — can support
+    /// (bugs.md B25).
+    pub(super) fn same_content(&self, other: &Self) -> bool {
+        if self.size != other.size {
+            return false;
+        }
+        match (self.mtime_ns, other.mtime_ns) {
+            (Some(a), Some(b)) => a == b,
+            _ => self.mtime == other.mtime,
+        }
+    }
+}
+
+impl From<&LocalItem> for LocalSig {
+    fn from(item: &LocalItem) -> Self {
+        Self {
+            mtime: item.mtime,
+            mtime_ns: item.mtime_ns,
+            size: item.size,
+        }
+    }
+}
+
+impl From<&std::fs::Metadata> for LocalSig {
+    fn from(meta: &std::fs::Metadata) -> Self {
+        Self {
+            mtime: system_mtime(meta),
+            mtime_ns: system_mtime_ns(meta),
+            size: meta.len() as i64,
+        }
+    }
+}
+
+/// The baseline's record of the local side, as [`LocalSig`] compares it.
+impl From<&StoredSyncEntry> for LocalSig {
+    fn from(entry: &StoredSyncEntry) -> Self {
+        Self {
+            mtime: entry.local_mtime,
+            mtime_ns: entry.local_mtime_ns,
+            size: entry.local_size,
+        }
+    }
+}
+
 pub(super) struct LocalItem {
     pub(super) is_dir: bool,
     pub(super) mtime: i64,
+    /// [`LocalItem::mtime`] to nanosecond precision, when the filesystem
+    /// reports one.
+    pub(super) mtime_ns: Option<i64>,
     pub(super) size: i64,
     /// True when another process holds this file open for writing (detected via
     /// `/proc/*/fd`). An open-for-write file is kept in the map — so it is not
@@ -91,11 +155,18 @@ pub(super) enum Pending {
     UploadRevision { rel: String, uid: NodeUid },
     /// Download remote `uid` to the local path, stamping `mtime`. `size` is the
     /// remote's reported size, used as the transfer's expected total.
+    ///
+    /// `local` is what the planning walk saw at this path, or `None` if nothing
+    /// was there. A download can run for minutes, so the apply step revalidates
+    /// against it immediately before it renames over the destination: a writer
+    /// that finished an edit in the meantime must not be overwritten without a
+    /// conflict copy (bugs.md B39).
     Download {
         rel: String,
         uid: NodeUid,
         mtime: i64,
         size: i64,
+        local: Option<LocalSig>,
     },
     /// Both sides changed: set the local copy aside, then download remote `uid`.
     Conflict {

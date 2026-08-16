@@ -1084,6 +1084,12 @@ pub(crate) fn run_control_socket(
 ) {
     info!("control socket listening");
     for conn in listener.incoming() {
+        // Checked on every accept, including the deliberate poke teardown sends
+        // to wake this thread out of a blocking accept (bugs.md B44).
+        if core.shutdown.is_stopping() {
+            info!("control socket closing");
+            return;
+        }
         match conn {
             Ok(stream) => {
                 let Some(permit) = ControlHandlerPermit::acquire() else {

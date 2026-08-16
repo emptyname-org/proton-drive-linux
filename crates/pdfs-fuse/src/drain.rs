@@ -260,6 +260,13 @@ impl Core {
     /// [`Db::claim_next_due_op`]: pdfs_core::db::Db::claim_next_due_op
     pub(crate) fn run_pending_drain(&self, primary: bool) {
         loop {
+            // Between ops, never inside one: an op that has started is either
+            // retired or released, so stopping here cannot leave the queue with
+            // a row claimed by a worker that no longer exists (bugs.md B44).
+            if self.shutdown.is_stopping() {
+                debug!(primary, "drain worker stopping");
+                return;
+            }
             let now = now_millis();
             // One row, chosen and *claimed* by the database. Reading the whole
             // queue to pick one op made a long queue quadratic to drain, and

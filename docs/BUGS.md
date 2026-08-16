@@ -12,6 +12,167 @@ Conventions:
 
 ---
 
+## B84 — A block read that comes back short truncates the file, silently
+
+**Status:** Fixed and **live-verified 2026-08-16**. **Data correctness** — an application reading a large
+file through the mount could get a truncated copy that reported success. The truncation is now
+impossible: a disagreement is repaired from the whole-file download, or the read fails `EIO`.
+Unverified because the repair path has not yet been driven against the three known files on a
+live mount, and the metadata question below is still open.
+**Found:** 2026-08-16, chasing what looked like log noise. GNOME's file indexer
+(`localsearch-3`) was filling the journal with `libpng error: Read Error`,
+`libpng error: IDAT: CRC error` and `File too small to be a PNG` on files under
+`~/ProtonDrive/Pictures`, interleaved with 49 `ERROR fuser::reply: Failed to send FUSE reply:
+Invalid argument (os error 22)` from the daemon in one afternoon. The indexer was right and we
+were wrong.
+
+**Where:** `Core::read_block` (`crates/pdfs-fuse/src/reads.rs:566`), the assembly loop in
+`Core::read_range_remote` (`reads.rs:759-769`); upstream, `RevisionReader::read_at` /
+`splice_block` and `rank_block_sizes` (`proton-drive-rs` 0.6.0, `revision.rs`,
+`transport.rs:256`).
+
+**Repro.** Deterministic per file, no account state needed beyond the files themselves:
+
+```bash
+stat -c %s FILE            # what the mount reports
+cat FILE | wc -c           # what the mount can actually deliver
+```
+
+| file | `nodes.size` / `stat` | bytes readable |
+|---|---|---|
+| `Pictures/old/92433593_p0.png` | 4317497 | 4194304 (tail block yields **0**) |
+| `Pictures/old/79779657_p0.png` | 11574982 | 10567052 |
+| `Pictures/old/2022-07-09_04-53.png` | 6388959 | 4389310 |
+
+`pdfs pin` on the third file, then re-read: **6388959 bytes, a fully valid PNG** — every chunk
+CRC passes, IEND is reached, the IDAT stream inflates to 44.8 MB. So the remote data is intact,
+`nodes.size` is right, and the whole-file (manifest-verified) download path is right. Only the
+block/range path truncates. Pinning is the workaround.
+
+**Root cause.** `read_block` asks the SDK for `blen = BLOCK_SIZE.min(fsize - bstart)` bytes and
+never checks how many it got:
+
+```rust
+let bytes = reader.read_at(bstart, blen).await.map_err(...)?;   // reads.rs:577
+```
+
+`RevisionReader::read_at` clamps the range to its own `file_size` — summed from the *believed*
+per-block sizes `rank_block_sizes` resolved — and `splice_block` clamps again to
+`plaintext.len()`. Both are silent. A short block then vanishes in the assembly loop: with
+`block.len()` short, `e = (end.min(bstart + block.len()) - bstart)` collapses, and for an empty
+block `s < e` is false, so nothing is appended at all. The FUSE read returns fewer bytes than
+asked for, the kernel hands userspace a short read, and every tool reads a short read as EOF.
+The `EINVAL` reply errors are the same mismatch seen from the other side.
+
+Nothing on this path validates a block against the length the file's own size implies
+(`block_len(fsize, bidx)` — which the *cache* does check, in `ContentCache::cached_block`, and
+which is why a short blob on disk is rejected and refetched while a short blob from the network
+is served).
+
+**Not yet known:** which rung of `rank_block_sizes` these revisions land on. The three
+reader-vs-node deltas fit no constant ratio, so this is per-revision metadata rather than block
+padding — the terminal `block_count <= 1` fallback (`vec![4 MiB; block_count]`) would explain
+the file that stops at exactly 4 MiB but not the other two. Needs a live probe printing
+`RevisionReader::block_sizes()` against `nodes.size` for these three uids. That answer decides
+whether the real fix belongs in this repo or in `proton-sdk-rs`.
+
+**Fix (2026-08-16).** `Core::read_block` no longer trusts the range path blindly.
+
+1. **The disagreement is caught before any bytes are read.** If `reader.size() != fsize`, the
+   revision's block table does not describe this file and *no* block of it can be trusted — not
+   just the short ones. Sizes that overstate a block shift every block after it and return
+   full-length reads of the wrong bytes, which no length check would ever catch (the SDK's
+   `rank_block_sizes` documents exactly this failure). So the whole file leaves the range path.
+2. **A short block is caught as a second net,** compared against `block_len(fsize, bidx)` — now
+   `pub` in `pdfs-core::cache`, because it is the contract the read path shares with the cache
+   rather than a detail of the cache. The assembly loop in `read_range_remote` re-checks the same
+   thing and fails `EIO` rather than contributing fewer bytes than the range it covers, which is
+   the line that actually turned a bad block into a truncated file.
+3. **A file that fails either check is repaired, not just refused.** `Core::repair_block` pulls
+   the whole revision through `download_file_to` — the manifest-verified path, which does no
+   boundary arithmetic and is why pinning worked — into a scratch file, checks it against
+   `nodes.size`, and adopts it as the cached blob via `store_file`. Every later read of the file
+   is then answered by `ContentCache::read_range` before the block path is consulted at all. One
+   download per file, not per block: `content_repairs` holds a lock per file so the concurrent
+   block reads that all discover the same bad table share it. Bounded by `REPAIR_MAX` (512 MiB) —
+   past that one unlucky read would pull down gigabytes, so it fails `EIO` and says to pin.
+
+Nothing short is cached or promoted: `read_block` only reaches `store_block` and the `block_ring`
+insert with bytes that passed. `store_block` itself deliberately does *not* check — its fixtures
+store 4 KiB "blocks" of notional 1 GiB files to keep the budget tests cheap, and the read side
+(`cached_block`, `has_block`) already rejects a wrong-length block as a miss. Validation is the
+reader's job, at the point of fetch.
+
+`getattr` needs no change after all: `pdfs pin` proved `nodes.size` is the correct one and the
+reader's belief is the wrong one, so the fix is to stop serving the reader's belief — not to
+publish it through `stat`.
+
+**Verified live (2026-08-16).** Four multi-block PNGs under `Pictures/wallpaper/` were read whole
+through the mount on the running 1.8.1 daemon; every one delivered exactly its `stat` size
+(5558846, 1098729, 2015463, 2291122 bytes), and no `fuser::reply … Invalid argument` appeared. The
+journal shows the second net firing and the repair path serving each of them:
+
+```
+WARN block came back shorter than the file's size implies bidx=0 blen=4194304 got=4939506 …
+INFO served a short block from a repaired whole-file download bidx=0 …
+```
+
+**Answered, and not as expected.** The open question was which rung of `rank_block_sizes` these
+revisions take. The evidence says the reader is not the confused party: `reader.size()` equals
+`fsize` in every case — the gate in step 1 never fires — and the blocks it returns are *larger*
+than 4 MiB, not smaller (4939506 for a whole 4.9 MB file; 5239804 and 5670228 as first blocks).
+This client's fixed 4 MiB block geometry is the thing that is wrong. Filed as **B85**; the repair
+path above is what keeps those files readable in the meantime, at the cost of a whole-file
+download on first read.
+
+## B85 — The read path assumes 4 MiB blocks; some revisions do not have them
+
+**Status:** Open — **data correctness**, currently masked by B84's repair path
+**Found:** 2026-08-16, while live-verifying B84 (see its journal evidence)
+**Where:** `crates/pdfs-fuse/src/reads.rs`, `crates/pdfs-core/src/cache.rs` (`BLOCK_SIZE`,
+`block_len`)
+
+**Cause:** The whole range path is built on one assumption — that a revision is a series of
+`BLOCK_SIZE` (4 MiB) blocks with a remainder at the end. `block_len(size, idx)` encodes it, the
+on-disk block cache is keyed by that index, and `read_block` asks the SDK's `RevisionReader` for
+`[idx * BLOCK_SIZE, block_len)`.
+
+Some revisions on this account are not laid out that way, and B84's diagnostic caught it in the
+act. The warning it logs reads "shorter", but the numbers say the opposite:
+
+```
+bidx=0 blen=4194304 got=4939506 fsize=4939506     # one block holding the whole file
+bidx=1 blen=745202  got=0       fsize=4939506     # …so there is no block 1
+bidx=0 blen=4194304 got=5239804 fsize=11537412    # first block is ~5.0 MiB, not 4
+bidx=1 blen=4194304 got=5670228 fsize=11106988    # …and they are not even uniform
+bidx=2 blen=4194304 got=5233034 fsize=19932790
+```
+
+`reader.size()` agrees with `fsize` in every one of these, so B84's primary gate — the one that
+catches a block table that does not add up — correctly does *not* fire. The file is intact and
+the reader knows its real boundaries; it is this client that is asking for the wrong ones.
+
+**Why it is not currently losing data:** B84's length check catches every one of these and routes
+the file through the whole-file manifest-verified download, so reads are correct. The cost is
+real, though: any file with non-4-MiB blocks is downloaded whole on first read, however few bytes
+were asked for, and one above `REPAIR_MAX` (512 MiB) fails `EIO` and can only be read by pinning
+it.
+
+**Fix direction:** take the geometry from the revision instead of assuming it.
+`RevisionReader::block_sizes()` already exposes it and B84 already logs it. That means block
+offsets become a prefix sum over the real sizes rather than `idx * BLOCK_SIZE`, and — the part
+that makes this its own change rather than a patch — the on-disk block cache is keyed and
+length-validated on the 4 MiB assumption too (`block_len`), so its key scheme has to follow the
+file's own geometry or the cache has to hold ranges rather than blocks.
+
+**Open question:** what produced these revisions. Uniform-but-not-4-MiB would suggest another
+client's chunk size; these are *not* uniform (5239804, 5670228, 5233034), which looks more like a
+size recorded per block after some transformation. Worth answering before choosing the fix, since
+"blocks are whatever the revision says" and "blocks are a different constant" lead to different
+designs.
+
+---
+
 ## B83 — An access-deferred op retries forever and is reported as an ordinary queued upload
 
 **Status:** Fixed (partly verified) 2026-08-16 — both halves are in and
@@ -1580,11 +1741,25 @@ silently undoing the hole at commit.
 
 ## B22 — Synchronous `block_on` inside Mutex Guard (HIGH-02)
 
-**Status:** Open / In Progress  
+**Status:** Fixed (unverified under load) 2026-08-16 — the systematic audit this was waiting on
+has been done and found nothing left.
 **Found:** 2026-07-21, multi-agent concurrency audit (`audit_bugs.md` HIGH-02)  
 **Where:** `crates/pdfs-fuse/src/lib.rs`, `sync.rs`, `devices.rs`
 
 **Cause:** Invoking `rt.block_on(...)` while holding `state.lock()` deadlocks worker threads and the main FUSE loop under high concurrency. Most major handlers have been refactored to drop `state.lock()` before invoking async runtime methods, but a full systematic audit across all background tasks and FUSE callbacks is required to eliminate all instances.
+
+**Audit (2026-08-16).** All 131 `block_on` sites in `pdfs-fuse` were scanned mechanically: for
+each, every guard binding (`self.state()` or any `.lock()`) still lexically live at that point,
+accounting for explicit `drop(..)` and scope exits. Two hits, both false positives —
+`devices.rs:570` binds `taken`, the `Option<Mount>` *taken out of* the map (the guard is a
+temporary, and `_guard` is explicitly dropped above), and `lib.rs:1917/1927` binds `resident`,
+a `bool` read out of a temporary guard. `pdfs-core` contains no `block_on` at all. The reverse
+direction — a guard held across an `.await` — is covered by `clippy::await_holding_lock`, which
+is on in the CI gate.
+
+The scan is lexical, so it cannot see a guard passed into a callee; it is evidence, not proof,
+which is why this is *unverified*. What would settle it is the concurrency half of the acceptance
+suite run against a heavily loaded drain.
 
 ---
 
@@ -1620,11 +1795,43 @@ silently undoing the hole at commit.
 
 ## B25 — Weak Conflict Baseline Detection `(mtime, size)` (HIGH-05)
 
-**Status:** Open  
+**Status:** Fixed (unverified) 2026-08-16 — the FUSE-write half was closed by **B69**; the
+mirror half is closed here.  
 **Found:** 2026-07-21, multi-agent sync engine audit (`audit_bugs.md` HIGH-05)  
 **Where:** `crates/pdfs-core/src/cache.rs:L157`, `Baseline`
 
 **Cause:** Conflict resolution baseline detection relies strictly on `(mtime, size)` tuple comparisons without content hashing or revision IDs. Concurrent edits landing within the same second that produce identical file sizes match baselines, causing offline edits to overwrite remote changes silently without creating `(sync-conflict <ts>)` copies.
+
+**Fix (2026-08-16), part one — the FUSE write path.** Closed by **B69**: `Baseline` gained
+`revision_id`, and `revision_changed` keys on the server revision id — the true identity, which
+advances if and only if a new revision was sealed — falling back to `(mtime, size)` only for a
+sidecar written before the field existed.
+
+**Fix (2026-08-16), part two — the mirror sync path.** B69 did not reach it: a mirror folder's
+baseline is `sync_entry`, and its local side was still whole seconds. An edit made in the same
+second as the last sync that left the file the same length — a fixed-size record rewritten in
+place, an image re-exported, a database page updated — read as *unchanged* and was never
+uploaded, leaving the remote silently behind until something else about the file moved.
+
+`sync_entry` gains `local_mtime_ns` (schema **28**), and the comparison moved into
+`LocalSig::same_content`, which uses nanoseconds when both sides have them and whole seconds
+otherwise. The column is nullable rather than a converted `local_mtime * 1e9` on purpose: the
+sub-second part of an existing baseline is genuinely unknown, and inventing zero for it would make
+every already-synced file compare as changed and re-upload an entire mirror on first start. `NULL`
+means "compare seconds", which is exactly the behaviour that row was written under; each row gains
+a real value the next time its path syncs.
+
+Covered by `db::tests::migration_v28_adds_sub_second_local_times_without_disturbing_a_v27_baseline`
+and `sync::planner::file_plan_tests::a_same_second_same_size_edit_is_still_a_local_change`.
+
+**Still open (deliberately):** the *remote* side of a mirror baseline is still `(mtime, size)`
+(`remote_rev`/`remote_hash`). Re-keying it onto `active_revision_id` the way B69 did for the FUSE
+path is the same idea and the same size of change, but the stored column already holds
+mtime-shaped strings, and telling an old row from a new one would need a heuristic on the value's
+shape. That deserves its own column and its own pass rather than a guess.
+
+**To verify:** on a mirror folder, `printf %s aaaa > f && sync && printf %s bbbb > f` inside one
+second, then a reconcile pass — expect an upload, and the remote content to be `bbbb`.
 
 ---
 
@@ -1696,31 +1903,91 @@ queueing when it retires the last handle of an unlinked inode.
 
 ## B30 — SQLite Write Lock & Mutex Contention under Heavy Drain (MED-03)
 
-**Status:** Open / In Progress  
+**Status:** Fixed (unverified under load) 2026-08-16 — closed by the work filed under the
+performance audit rather than by a change made for this entry.  
 **Found:** 2026-07-21, multi-agent database audit (`audit_bugs.md` MED-03)  
 **Where:** `crates/pdfs-core/src/db/ops.rs`, `crates/pdfs-core/src/db/mod.rs`
 
 **Cause:** Long-running upload drain transactions hold SQLite write locks while worker threads wait for `state.lock()`, causing periodic FUSE response latency spikes during heavy sync operations.
 
+**Audit (2026-08-16).** Each of the three mechanisms behind that sentence is gone:
+
+1. **No transaction spans a network call.** Every `Db` method opens its transaction, commits and
+   returns; nothing holds one open across calls (the invariant is stated on `Db::read`). A drain
+   op's upload happens between database calls, not inside one.
+2. **Reads no longer queue behind the writer.** The read-only connection pool (`Db::read`) gives
+   `SELECT`-only methods their own connections, so a FUSE metadata call does not wait on whatever
+   is committing. Asserted by `db::tests::a_read_does_not_wait_for_the_write_connection`, which
+   holds the write connection for the whole measurement.
+3. **The queue is no longer read whole to pick one op.** `Db::claim_next_due_op` selects and
+   claims a single row in the database, which is what made a long queue quadratic to drain while
+   holding the shared connection.
+
+The `state.lock()` half is covered from the other side: **B75** moved network work off fuser's
+dispatch thread, and **B22**'s audit found no `block_on` under a `State` guard.
+
+Unverified because "periodic latency spikes" is a load property, not a code property: it is
+closed by construction and wants the concurrency acceptance case under a loaded drain to confirm
+it in the field.
+
 ---
 
 ## B31 — Unimplemented Special Files & Attribute Modifications (MED-04)
 
-**Status:** Open  
+**Status:** Not a bug — by design, verified 2026-08-16  
 **Found:** 2026-07-21, multi-agent POSIX audit (`audit_bugs.md` MED-04)  
 **Where:** `crates/pdfs-fuse/src/lib.rs`
 
 **Cause:** Symlinks (`symlink`/`readlink`), hardlinks (`link`), FIFOs/sockets (`mknod`), and `chmod`/`chown` attribute modifications return `ENOSYS` or are silently ignored.
 
+**Verdict (2026-08-16).** Each of these is the correct answer, not a gap, and each errno is now a
+deliberate choice with a comment saying why:
+
+- `symlink` → **EPERM**. The operation is meaningful; Drive simply cannot represent it. Callers
+  treat `EPERM` as a definite "no" instead of retrying against an older interface.
+- `link` → **EPERM**. A node has exactly one parent on Drive, so there are no hard links. git
+  falls back to `rename()` on `EPERM`, which this filesystem supports.
+- `mknod` → **ENOSYS**. Devices, FIFOs and sockets have no representation at all. Regular files
+  arrive through `create`, never here.
+- `chmod`/`chown`/`utimes` → accepted and ignored, so tools that chmod or restamp after writing
+  succeed rather than failing on a filesystem with no per-file mode to set.
+
+Implementing any of them would mean inventing a local-only representation that no other Proton
+client can read — a worse outcome than a clean refusal. The errno contract is asserted by the
+acceptance suite's clean-refusal case so it cannot drift, and **B73** removed the per-probe WARN
+that made these look like incidents in the journal.
+
 ---
 
 ## B32 — Race Condition in Concurrent Handle Release and Open (MED-05)
 
-**Status:** Open  
+**Status:** Fixed (unverified) 2026-08-16  
 **Found:** 2026-07-21, multi-agent concurrency audit (`audit_bugs.md` MED-05)  
 **Where:** `crates/pdfs-fuse/src/lib.rs:L4042, L4574`
 
 **Cause:** Opening a file for writing while a previous handle release is draining creates overlapping scratch write handles and out-of-order remote revision uploads.
+
+**Fix (2026-08-16).** The concrete hole was in `serve_open`: it sampled the queued revision
+(`Core::pending`), then copied that blob into a fresh scratch file, then took the `State` lock to
+install the handle. A `release` publishing a newer revision anywhere inside that gap — which spans
+a copy the size of the whole file — left the new handle carrying the *older* base, and its own
+release then published content that silently discarded the revision closed a moment earlier.
+
+The install is now guarded: the pending blob path (which changes on every publication, so it
+identifies the revision) is re-read immediately before the `State` lock, and if it moved, the
+scratch file is discarded and the open goes around again — up to `OPEN_BASE_ATTEMPTS` (3), after
+which it fails with `EIO` rather than spinning a FUSE worker. Only a handle the open is about to
+*create* is checked; if one already exists, that handle is authoritative and the scratch is
+discarded regardless.
+
+The re-read is deliberately **not** taken under the `State` lock: no site in the daemon holds
+`pending` and `state` at once (the invariant is stated on `stamp_pending_sizes`) and this is not
+the place to become the first. What that costs is a residual window of a few instructions instead
+of a lock-tight comparison; what it removes is the multi-gigabyte window, which is the one that
+actually loses data.
+
+**To verify:** the acceptance suite's concurrency case, with a large file, closing and reopening
+it for write from two processes while the drain is loaded.
 
 ---
 
@@ -1780,11 +2047,24 @@ second-account and live FUSE acceptance have not been run and remain required in
 
 ## B36 — Unicode Normalization Discrepancy (NFC vs NFD) (LOW-01)
 
-**Status:** Open  
+**Status:** Open (verified 2026-08-16, deliberately not fixed)  
 **Found:** 2026-07-21, multi-agent sync audit (`audit_bugs.md` LOW-01)  
 **Where:** `crates/pdfs-fuse/src/lib.rs`, `crates/pdfs-fuse/src/sync.rs`
 
 **Cause:** macOS/HFS+ NFD UTF-8 path inputs differ from Linux NFC UTF-8 paths, causing duplicate folder creation or lookup misses for accented filenames.
+
+**Verified (2026-08-16), not fixed.** The claim is accurate: names are compared as bytes
+throughout — the mirror engine's rel paths, `by_uid`/`children` interning, and the planner's
+classification union — so `café` written by a Proton client on macOS or iOS (NFD) and `café`
+written here (NFC) are two different paths, and a mirror folder holding both would sync both.
+
+Not fixed here on purpose. A normalizing comparison changes what "the same file" *means* across
+the whole daemon, and it changes it in the unsafe direction: two names that are genuinely distinct
+on the remote would start colliding locally, and a collision in the sync engine is a deletion or
+an overwrite, not a warning. Doing it properly means a normalization dependency, a decision about
+which form is canonical on the wire, and a migration for baselines keyed on the other form — its
+own change with its own acceptance case, not a line in a sweep. Left LOW because it needs
+cross-platform authorship of the *same* accented name to bite at all.
 
 ---
 
@@ -1821,7 +2101,7 @@ pass from being treated as successfully settled.
 
 ## B39 — Sync Download Can Overwrite a Concurrent Local Edit (HIGH-09)
 
-**Status:** Open
+**Status:** Fixed (unverified) 2026-08-16
 **Found:** 2026-07-22, sync concurrency audit
 **Where:** `crates/pdfs-fuse/src/sync.rs`, download classification and apply path
 
@@ -1835,11 +2115,28 @@ revalidate immediately before rename. Preserve a conflict copy on mismatch. A
 deterministic test should pause the download, edit the target, resume it, and
 verify that neither version is lost.
 
+**Fix (2026-08-16).** `Pending::Download` now carries `local: Option<LocalSig>` — what the
+planning walk actually saw at that path, or `None` for nothing there — and `download_file` calls
+`keep_racing_local_edit` in the last moment before the rename that publishes the download. A
+destination that no longer matches the plan is moved aside by `preserve_conflict_copy` first, so
+the racing bytes survive and re-upload as a new file on the next pass: the same resolution a
+both-sides-changed conflict already gets. A path that is *empty* when something was expected is
+not a conflict — the download is about to recreate it and there is nothing to preserve.
+
+`Pending::Conflict` passes `None` deliberately: it has just moved the local copy aside itself, so
+the state its download expects to find is "nothing", and anything that appears while it runs is a
+new racing write that gets its own copy.
+
+Covered by `sync::tests::a_download_keeps_a_local_edit_it_did_not_plan_for` (unchanged destination
+overwritten silently; changed destination preserved). Unverified against a real timing race —
+the deterministic pause-mid-download test the entry asks for is not in place; the unit test drives
+the guard directly instead.
+
 ---
 
 ## B40 — Sync Upload Can Stream Torn Live Content (HIGH-10)
 
-**Status:** Open
+**Status:** Fixed (unverified) 2026-08-16
 **Found:** 2026-07-22, sync concurrency audit
 **Where:** `crates/pdfs-fuse/src/sync.rs`, upload apply and baseline update
 
@@ -1851,11 +2148,32 @@ and falsely declare them synchronized.
 **Required fix/test:** Upload an immutable staged snapshot, or validate an open
 descriptor before and after streaming and refuse baseline settlement on change.
 
+**Fix (2026-08-16).** The second option, and the correction is structural rather than a check.
+`record_file_baseline` no longer stats the path when it is done; it is *given* the identity the
+transferred content corresponds to, and both upload paths pass the `LocalSig` taken from the
+descriptor they streamed. So a file that changed mid-stream records a baseline describing the
+bytes that went up, not the bytes on disk now — which makes the very next pass classify the path
+as locally changed and upload a whole, clean revision over the torn one. The old behaviour stated
+the opposite: it declared the torn revision synchronized and left it as the file's content on
+Drive.
+
+`warn_if_torn` compares before and after purely so the journal explains the extra revision; the
+correction does not depend on it. Downloads are unaffected — there the file on disk *is* the
+transferred content, published by a rename and stamped, so its stat is the identity.
+
+Note the pre-existing mitigation this backs up: the `/proc/*/fd` scan already defers any file held
+open for writing (`FilePlan::Deferred`), so this covers the residual — a writer that opens, writes
+and closes entirely inside one upload.
+
+**To verify:** upload a large file from a mirror folder while appending to it, then check that the
+following pass uploads a new revision and the final remote content matches the local file.
+
 ---
 
 ## B41 — Sync Folder Removal Races Active Reconciliation (HIGH-11)
 
-**Status:** Open
+**Status:** Fixed (verified by inspection) 2026-08-16 — already correct in the code by the time
+this was revisited
 **Found:** 2026-07-22, sync lifecycle audit
 **Where:** `crates/pdfs-fuse/src/devices.rs`, `remove_sync_folder`
 
@@ -1867,11 +2185,26 @@ baseline state.
 **Required fix/test:** Serialize removal with reconciliation, cancel/disable the
 folder, await active work, then unmount and remove durable state.
 
+**Audit (2026-08-16).** `Core::remove_sync_folder` opens by taking `self.sync_lock(id)` and holds
+it across the whole removal, and `reconcile_pass` takes the same lock for the whole pass — so a
+removal requested mid-pass blocks until that pass finishes, which is the serialization this asked
+for. The ordering inside the lock is also the one specified: unmount the on-demand session first
+(before trashing the remote tree it serves, which would otherwise leave it answering for deleted
+nodes), then drop the row.
+
+The one step outside the lock is the remote trash, and that is safe by construction rather than by
+accident: the row is already gone, and `reconcile_pass` re-reads `sync_folder_get` **under the
+lock** and returns when it finds nothing, so no pass can start against a folder being removed. The
+mode re-check on that same re-read is what makes this hold for a switch racing a removal too.
+
+No code change. Recorded as verified-by-inspection: a live removal during an active pass has not
+been driven.
+
 ---
 
 ## B42 — Local Delete Failure Is Recorded as Sync Success (HIGH-12)
 
-**Status:** Open
+**Status:** Fixed (unverified) 2026-08-16.
 **Found:** 2026-07-22, sync error-path audit
 **Where:** `crates/pdfs-fuse/src/sync.rs`, local file/directory deletion branches
 
@@ -1882,11 +2215,23 @@ next pass and can resurrect content that was deleted remotely.
 **Required fix/test:** Treat `ENOENT` as success; for every other removal error,
 retain the baseline and increment `Outcome.errors`.
 
+**Fix (2026-08-16).** The error half was already in place by the time this was revisited: both
+`FilePlan::DeleteLocal` and the deferred folder removals log the failure, increment
+`outcome.errors` and `continue` without touching `sync_entry_remove`, so the baseline survives
+and the survivor is not mistaken for a new local file next pass.
+
+The `ENOENT` half was not, and it failed the opposite way: a path that was *already* gone was
+counted as an error and kept its baseline, so the same removal was retried and re-reported on
+every pass forever. Both call sites now go through `removed_locally`, which reads `NotFound` as
+the state the engine was asking for. Covered by
+`sync::tests::an_already_absent_path_counts_as_removed`. Unverified because no live sync pass has
+been driven over an externally-deleted file yet.
+
 ---
 
 ## B43 — FUSE Directory Cookies Are Not Stable (MED-09)
 
-**Status:** Open
+**Status:** Fixed (unverified) 2026-08-16
 **Found:** 2026-07-22, FUSE/POSIX audit
 **Where:** `crates/pdfs-fuse/src/filesystem.rs`, `ProtonFs::serve_readdir`
 
@@ -1898,11 +2243,31 @@ indexes and cause entries to be skipped or repeated.
 directory handle, or assign stable per-entry cookies. Test with deliberately
 small reply pages and mutation between calls.
 
+**Fix (2026-08-16).** The first option. `opendir` is now implemented: it enumerates the folder if
+it is cold, freezes the listing, and publishes it under a fresh `fh` in `State::dir_snapshots`;
+`readdir` serves from that snapshot; `releasedir` drops it. The kernel pairs each `opendir` with
+exactly one `releasedir`, so the snapshot lives exactly as long as the enumeration it belongs to,
+and a create or a trash landing between two pages can no longer shift the indexes the continuation
+cookie is expressed in.
+
+The `fh` comes from the same `State::next_fh` counter write handles use, so a directory handle can
+never collide with a file handle. Serving from the snapshot is a pure in-memory walk with no
+chance of a remote call, so `readdir` no longer needs a worker at all; the live path
+(`serve_readdir`) stays as a fallback for a handle that has no snapshot, and both build their
+listing through the same `build_listing` so they cannot disagree.
+
+Enumeration cost is unchanged — it moved from the first `readdir` to `opendir`, one call earlier —
+and a folder that cannot be enumerated now fails at `opendir`, where the caller can still act on
+the errno.
+
+**To verify:** the acceptance suite with deliberately small reply pages, creating and trashing
+entries between `getdents` calls, asserting no entry is skipped or repeated.
+
 ---
 
 ## B44 — FUSE Background Workers Have No Coordinated Shutdown (MED-10)
 
-**Status:** Open
+**Status:** Fixed (unverified) 2026-08-16
 **Found:** 2026-07-22, daemon lifecycle audit
 **Where:** `crates/pdfs-fuse/src/mount.rs`, mount lifecycle; drain/index/sync loops
 
@@ -1914,6 +2279,31 @@ continue DB/client activity after teardown.
 **Required fix/test:** Add shared cancellation, interruptible waits, owned join
 handles, and ordered shutdown. Repeated mount/unmount tests should return thread
 counts to baseline and observe no post-unmount DB work.
+
+**Fix (2026-08-16).** All four, in `crates/pdfs-fuse/src/shutdown.rs` plus the loops:
+
+1. **Shared cancellation.** `Shutdown` — a flag and a condvar, set once and never cleared — lives
+   on `Core`, so every clone a worker was given carries it.
+2. **Interruptible waits.** Every loop that called `thread::sleep` in a `loop {}` with no exit now
+   calls `Shutdown::sleep`, which returns `false` the moment teardown starts: the conflict sweep
+   (warmup *and* interval), the online probe, the local indexer, and both sync poll threads. The
+   drain workers check between ops — never inside one, so an op is always either retired or
+   released — and the sync engine gained a `SyncMsg::Stop` that ends its loop and abandons any
+   burst it was settling.
+3. **Owned join handles.** `run_mount` collects every long-lived thread it starts into one
+   `workers` vec.
+4. **Ordered shutdown.** `stop_workers` sets the flag, wakes the two waits that need waking — the
+   drain's own condvar via `wake_drain`, and the control listener, which blocks inside `accept`
+   and is woken by a connection from us before the socket is unlinked — then joins them all. It
+   runs after the mounts are down, because nothing a worker can still do is harmful at that point,
+   and it also runs on the startup-failure path, which abandons the mount just as completely.
+
+A join that takes a while is expected and correct: a drain worker part-way through an upload
+finishes it rather than abandoning the user's bytes mid-flight.
+
+Covered by `shutdown::tests` (a stop cuts an hour-long wait short; an already-stopped signal does
+not wait at all). Unverified for the property that motivated the entry — repeated in-process
+mount/unmount returning thread counts to baseline — which wants the acceptance suite.
 
 ---
 

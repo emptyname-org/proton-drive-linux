@@ -84,7 +84,11 @@ const TOUCH_FLUSH_AT: usize = 256;
 
 /// How long block `idx` of a file of `size` bytes must be: a full
 /// [`BLOCK_SIZE`] except for the last one, which holds the remainder.
-fn block_len(size: u64, idx: u64) -> u64 {
+///
+/// Public because it is the *contract* a block has to satisfy, not a detail of
+/// this cache: the network read path validates against it too, so a block that
+/// comes back short is refused before it can truncate a file (bugs.md B84).
+pub fn block_len(size: u64, idx: u64) -> u64 {
     let start = idx.saturating_mul(BLOCK_SIZE);
     size.saturating_sub(start).min(BLOCK_SIZE)
 }
@@ -651,6 +655,12 @@ impl ContentCache {
     /// Store `bytes` as cached block `idx` of `uid`, tagged `(mtime, size)`.
     /// Temp-file-then-rename like [`store`](Self::store); meta written last so a
     /// crash mid-store fails validation. Enforces the block-cache LRU budget.
+    ///
+    /// The caller owes it a block of exactly [`block_len`] bytes; anything else
+    /// reads back as a miss ([`cached_block`](Self::cached_block) checks), so a
+    /// bad block cannot escape this cache even though this does not check.
+    /// Validating a block is the *reader's* job, at the point it is fetched —
+    /// see `Core::read_block` (bugs.md B84).
     pub fn store_block(
         &self,
         uid: &NodeUid,
@@ -2246,6 +2256,34 @@ mod tests {
         // A new revision (mtime/size bump) invalidates the block.
         assert!(c.cached_block(&u, 101, 10, 0).is_none());
         assert!(c.cached_block(&u, 100, 5000, 0).is_none());
+    }
+
+    /// The geometry the whole read path validates against, here and over the
+    /// network (bugs.md B84): full blocks, then whatever is left.
+    #[test]
+    fn block_len_is_full_blocks_then_the_remainder() {
+        let size = BLOCK_SIZE * 2 + 17;
+        assert_eq!(block_len(size, 0), BLOCK_SIZE);
+        assert_eq!(block_len(size, 1), BLOCK_SIZE);
+        assert_eq!(block_len(size, 2), 17);
+        // Past the end there is no block, not a short one.
+        assert_eq!(block_len(size, 3), 0);
+        // An exact multiple has no short tail at all.
+        assert_eq!(block_len(BLOCK_SIZE, 0), BLOCK_SIZE);
+        assert_eq!(block_len(BLOCK_SIZE, 1), 0);
+    }
+
+    /// A block of the wrong length cannot escape the cache even though the
+    /// store does not check: the read validates it and reports a miss, so the
+    /// next read refetches rather than serving a hole (bugs.md B84).
+    #[test]
+    fn a_block_of_the_wrong_length_reads_as_a_miss() {
+        let (c, _d) = cache();
+        let u = uid("a");
+        // A 10-byte file's only block is 10 bytes; 5 is not a short tail.
+        c.store_block(&u, 100, 10, 0, b"block").unwrap();
+        assert!(c.cached_block(&u, 100, 10, 0).is_none());
+        assert!(!c.has_block(&u, 100, 10, 0));
     }
 
     /// The block cache is written without an fsync, so a crash can leave a blob

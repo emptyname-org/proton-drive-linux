@@ -9,7 +9,7 @@ use super::Db;
 use crate::Result;
 
 /// Current schema version. Bump on every forward migration added below.
-pub(super) const SCHEMA_VERSION: i64 = 27;
+pub(super) const SCHEMA_VERSION: i64 = 28;
 
 impl Db {
     pub(super) fn migrate(&self) -> Result<()> {
@@ -199,6 +199,23 @@ impl Db {
             )? > 0;
             if has_ops && !has_column {
                 tx.execute_batch(MIGRATION_V27)?;
+            }
+        }
+        if current < 28 {
+            // Same guards as V26/V27, for the same two reasons.
+            let has_column: bool = tx.query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('sync_entry') \
+                 WHERE name = 'local_mtime_ns'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )? > 0;
+            let has_entries: bool = tx.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'sync_entry'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )? > 0;
+            if has_entries && !has_column {
+                tx.execute_batch(MIGRATION_V28)?;
             }
         }
         tx.execute(
@@ -807,4 +824,25 @@ CREATE INDEX IF NOT EXISTS idx_pending_op_claimed
 /// deferral against.
 const MIGRATION_V27: &str = "
 ALTER TABLE pending_op ADD COLUMN access_deferred_since INTEGER NOT NULL DEFAULT 0;
+";
+
+/// Schema v28: sub-second precision for a mirror folder's local baseline.
+///
+/// A reconcile pass decides whether the local side of a path changed by
+/// comparing `(local_mtime, local_size)` against the baseline. Both sides of
+/// that comparison were whole seconds, so an edit that landed in the same second
+/// as the last sync and left the file the same length — a fixed-size record
+/// rewritten, an image re-exported, a database page updated in place — read as
+/// *unchanged* and was never uploaded. The remote copy silently stayed at the
+/// older content until something else about the file moved (bugs.md B25).
+///
+/// Nullable rather than a converted `local_mtime * 1_000_000_000`: the
+/// nanosecond part of an existing baseline is genuinely unknown, and inventing
+/// zero for it would make every already-synced file compare as changed and
+/// re-upload an entire mirror on first start. `NULL` means "this row predates
+/// the column", which the comparison reads as "fall back to whole seconds" —
+/// exactly the behaviour that row was written under. Each row gains a real value
+/// the next time its path is synced.
+const MIGRATION_V28: &str = "
+ALTER TABLE sync_entry ADD COLUMN local_mtime_ns INTEGER;
 ";

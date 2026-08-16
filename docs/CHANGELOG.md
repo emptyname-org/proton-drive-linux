@@ -9,6 +9,75 @@ release ships. Migrations are forward-only — a database written by a newer cli
 refuse-to-open, not a downgrade, so rolling back a release means restoring the cache from
 scratch (user data in `staging/` and `recovery/` is never touched by this).
 
+## [1.8.1] — 2026-08-16
+
+Some files read short through the mount and reported success — an application got a truncated
+copy with nothing anywhere saying so (`docs/BUGS.md` B84). Found because GNOME's file indexer
+kept complaining that PNGs under `~/ProtonDrive/Pictures` were corrupt; it was right. The rest
+of this release is the long-standing architectural backlog from the July concurrency audits
+(B25, B32, B39, B40, B43, B44), each verified against the current code before being fixed.
+Schema: **28** — migration V28 adds `sync_entry.local_mtime_ns`.
+
+### Fixed
+- A read no longer trusts a revision whose recorded block sizes disagree with the file's size.
+  Such a file leaves the block/range path entirely: it is fetched through the whole-file,
+  manifest-verified download — the same path `pdfs pin` uses, and the reason pinning was the
+  workaround — and served from the resulting cached blob. One download per file however many
+  reads discover the problem at once, and files above 512 MiB fail `EIO` with a note to pin
+  them rather than pulling down gigabytes for one read.
+- A block that comes back shorter than the file's size implies is never served, cached or kept
+  in memory. Assembling a read out of short blocks is what quietly produced the truncation:
+  the missing bytes were simply not appended, the kernel handed userspace a short read, and
+  every tool reads a short read as end-of-file.
+- A synced folder no longer reports the same deletion as an error on every pass. Deleting a
+  local file that something else had already deleted counted as a failure, which kept its
+  baseline and made the next pass try again — forever. A path that is already gone is the
+  state the sync pass wanted (`docs/BUGS.md` B42).
+- A mirror folder no longer misses an edit made in the same second as its last sync. Change
+  detection compared whole seconds, so rewriting a file in place without changing its length
+  read as "unchanged" and never uploaded — the remote silently stayed behind until something
+  else about the file moved. Baselines now record the modification time to nanoseconds
+  (`docs/BUGS.md` B25).
+- A sync download no longer overwrites an edit that finished while it was running. The
+  destination is re-checked in the last moment before the download is published, and a local
+  file that has moved on since the pass planned for it is kept as a conflict copy — the same
+  resolution a both-sides-changed conflict gets (`docs/BUGS.md` B39).
+- An upload interrupted by a writer no longer reports itself as synchronized. The baseline now
+  records the content that actually went up rather than whatever is on disk when the transfer
+  ends, so a revision torn by a concurrent write is replaced by a clean one on the next pass
+  instead of standing as the file's content on Drive (`docs/BUGS.md` B40).
+- Listing a directory that changes while it is being read no longer skips or repeats entries.
+  `readdir` resumed by index into a listing rebuilt on every call, so a create or a trash
+  between two pages shifted everything after it. The listing is now frozen for the life of the
+  directory handle (`docs/BUGS.md` B43).
+- Opening a file for writing while a previous close is still publishing no longer discards that
+  close's revision. The base is re-checked at the moment the write handle is installed, rather
+  than trusted across a copy that can be the size of the whole file (`docs/BUGS.md` B32).
+- Unmounting now stops and joins the daemon's background workers instead of leaving them
+  running. The drain, sync engine, conflict sweep, online probe, local indexer and control
+  listener share a stop signal and interruptible waits, so an in-process remount no longer
+  starts a second set on top of the first (`docs/BUGS.md` B44).
+
+### Notes
+- The size `stat` reports was always the correct one; it is the reader's belief about where
+  blocks end that was wrong, so nothing about reported sizes changes.
+- Verified live on the affected account: four multi-block PNGs that had been reading short now
+  deliver their full size, and the journal shows each one repaired. The diagnostics also
+  answered the open question, and not as expected — the revision metadata is fine; those files
+  simply do not have 4 MiB blocks, and this client assumes they do. Filed as `docs/BUGS.md`
+  B85. Until that is fixed, a file with non-4-MiB blocks is downloaded whole on its first read.
+- Migration V28's new column is nullable rather than converted from the existing seconds. A
+  baseline row written before this release has no sub-second time to recover, and inventing
+  zero for it would make every already-synced file compare as changed and re-upload an entire
+  mirror on first start; `NULL` keeps those rows comparing exactly as they did, and each gains
+  a real value the next time its path syncs.
+- Three audit entries closed without a code change, having been fixed already or being correct
+  as they stand: sync-folder removal is serialized against reconciliation (B41), the drain's
+  database contention was removed by the read-only connection pool and the claim column (B30),
+  and the refusals for symlinks, hard links, device nodes and `chmod` are deliberate — Drive
+  cannot represent them, and a local-only representation no other Proton client can read would
+  be worse than a clean refusal (B31).
+
 ## [1.8.0] — 2026-08-16
 
 A queued write whose node had left the local tree was retried every five seconds forever and

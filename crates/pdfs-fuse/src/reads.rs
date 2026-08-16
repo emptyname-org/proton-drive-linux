@@ -26,6 +26,11 @@ const PREFETCH_MAX: u64 = 8;
 /// Window a sequential read starts at, and returns to after a seek.
 const PREFETCH_MIN: u64 = 2;
 
+/// Largest file [`Core::repair_block`] will pull down whole to work around a
+/// revision whose block table understates it. Past this a single read would cost
+/// gigabytes of download, so the read fails instead and says to pin the file.
+pub(super) const REPAIR_MAX: u64 = 512 * 1024 * 1024;
+
 /// Blocks that may be prefetching at once, across every file. Prefetch takes a
 /// permit and gives up rather than queueing, so it can never sit in front of a
 /// demand read in the SDK's flat block semaphore.
@@ -563,6 +568,10 @@ impl Core {
     /// The disk store is handed to a blocking thread — it is a 4 MiB write plus
     /// a cache-index update, and neither the reactor nor the kernel read waiting
     /// on these bytes should be held up by it.
+    ///
+    /// A block that comes back shorter than the file's size says it must be is
+    /// never served, cached or promoted: it is repaired from the whole-file
+    /// download, or the read fails. See [`Core::repair_block`] (bugs.md B84).
     async fn read_block(
         &self,
         reader: &Arc<RevisionReader>,
@@ -573,11 +582,36 @@ impl Core {
         cache_blocks: bool,
     ) -> BlockResult {
         let bstart = bidx * BLOCK_SIZE;
-        let blen = BLOCK_SIZE.min(fsize - bstart);
-        let bytes = reader.read_at(bstart, blen).await.map_err(|e| {
-            warn!(%uid, bstart, blen, error = %e, "block read failed");
-            Errno::EIO
-        })?;
+        let blen = block_len(fsize, bidx);
+        // The reader derives every block boundary from the revision's recorded
+        // block sizes. If they do not add up to the size the node reports, this
+        // file's boundaries are wrong, and the failure is not confined to short
+        // reads: sizes that *overstate* a block shift every block after it and
+        // return full-length reads of the wrong bytes. So a disagreement of any
+        // kind takes the file off the range path entirely (bugs.md B84).
+        let bytes = if reader.size() != fsize {
+            warn!(
+                %uid, bidx, fsize,
+                reader_size = reader.size(),
+                reader_blocks = reader.block_sizes().len(),
+                "the revision's block table disagrees with the node size"
+            );
+            self.repair_block(uid, mtime, fsize, bidx).await?
+        } else {
+            let bytes = reader.read_at(bstart, blen).await.map_err(|e| {
+                warn!(%uid, bstart, blen, error = %e, "block read failed");
+                Errno::EIO
+            })?;
+            if bytes.len() as u64 == blen {
+                bytes
+            } else {
+                warn!(
+                    %uid, bidx, blen, got = bytes.len(), fsize,
+                    "block came back shorter than the file's size implies"
+                );
+                self.repair_block(uid, mtime, fsize, bidx).await?
+            }
+        };
         let bytes = Arc::new(bytes);
         if cache_blocks {
             let cache = self.cache.clone();
@@ -591,6 +625,129 @@ impl Core {
             .lock()
             .insert(uid, mtime, fsize, bidx, bytes.clone());
         Ok(bytes)
+    }
+
+    /// Recover block `bidx` of a file whose per-block reads cannot be trusted,
+    /// by fetching the whole revision through the manifest-verified download and
+    /// serving the block out of that.
+    ///
+    /// The range path derives every block boundary from the revision's recorded
+    /// block sizes. When those understate the file, reads come back short with
+    /// no error anywhere, and the caller hands userspace a truncated file that
+    /// looks like a clean EOF (bugs.md B84). `download_file_to` does not do that
+    /// arithmetic — it streams the block list — so it returns the whole file
+    /// where the range path cannot, which is why pinning was the workaround.
+    /// This does the same thing on the user's behalf, once, and the resulting
+    /// blob answers every later read of the file before the block path is
+    /// consulted at all.
+    ///
+    /// Bounded by [`REPAIR_MAX`]: past that, one unlucky read would pull down
+    /// gigabytes, and a clear `EIO` plus a `pdfs pin` is the better trade.
+    async fn repair_block(
+        &self,
+        uid: &NodeUid,
+        mtime: i64,
+        fsize: u64,
+        bidx: u64,
+    ) -> Result<Vec<u8>, Errno> {
+        let blen = block_len(fsize, bidx);
+        let bstart = bidx * BLOCK_SIZE;
+        if fsize > REPAIR_MAX {
+            warn!(
+                %uid, fsize,
+                "file is too large to repair from a whole-file download; pin it to read it"
+            );
+            return Err(Errno::EIO);
+        }
+        // One download per file, not per block: every block of a file with a bad
+        // block table discovers the same problem at once.
+        let lock = {
+            let mut locks = self.content_repairs.lock().await;
+            locks.entry(uid.clone()).or_default().clone()
+        };
+        let guard = lock.clone().lock_owned().await;
+        let downloaded = match self.cache.read_range(uid, mtime, fsize, bstart, blen) {
+            // The first arrival did the work; the rest just read its blob.
+            Some(bytes) if bytes.len() as u64 == blen => Ok(Some(bytes)),
+            _ => self
+                .download_whole_revision(uid, mtime, fsize)
+                .await
+                .map(|()| None),
+        };
+        // Before releasing, so the map entry is only dropped once no waiter is
+        // still holding it.
+        drop(guard);
+        self.release_repair_lock(uid, lock).await;
+        if let Some(bytes) = downloaded? {
+            return Ok(bytes);
+        }
+        match self.cache.read_range(uid, mtime, fsize, bstart, blen) {
+            Some(bytes) if bytes.len() as u64 == blen => {
+                info!(%uid, bidx, "served a short block from a repaired whole-file download");
+                Ok(bytes)
+            }
+            _ => {
+                error!(%uid, bidx, fsize, "repairing a short block did not produce the block");
+                Err(Errno::EIO)
+            }
+        }
+    }
+
+    /// Download the whole of `uid`'s active revision to disk and adopt it as the
+    /// cached blob, so the range path is bypassed entirely for this file.
+    ///
+    /// Streamed into a scratch file rather than memory: this runs for files up
+    /// to [`REPAIR_MAX`], and buffering that per concurrent reader is not a cost
+    /// a read should carry. A download that does not produce exactly `fsize`
+    /// bytes is discarded — a short blob would fail the cache's own validity
+    /// check anyway, and storing it would only hide the disagreement one layer
+    /// further down.
+    async fn download_whole_revision(
+        &self,
+        uid: &NodeUid,
+        mtime: i64,
+        fsize: u64,
+    ) -> Result<(), Errno> {
+        let (mut file, path) = self.cache.create_scratch().map_err(|error| {
+            error!(%uid, %error, "creating a scratch file for a repair download failed");
+            Errno::EIO
+        })?;
+        let outcome = self.client.download_file_to(uid, &mut file).await;
+        let stored = (|| {
+            outcome.map_err(|error| {
+                warn!(%uid, %error, "repair download failed");
+                Errno::EIO
+            })?;
+            file.sync_all().map_err(|error| {
+                warn!(%uid, %error, "syncing a repair download failed");
+                Errno::EIO
+            })?;
+            let got = file.metadata().map(|m| m.len()).unwrap_or(0);
+            if got != fsize {
+                warn!(%uid, fsize, got, "repair download did not match the node size");
+                return Err(Errno::EIO);
+            }
+            self.cache
+                .store_file(uid, mtime, fsize, &path)
+                .map_err(|error| {
+                    error!(%uid, %error, "adopting a repair download as cached content failed");
+                    Errno::EIO
+                })
+        })();
+        // The blob is a hardlink to the same inode, so unlinking the scratch
+        // name leaves it intact.
+        let _ = std::fs::remove_file(&path);
+        stored
+    }
+
+    /// Drop a repair lock's map entry once nobody else holds it, so a file
+    /// repaired long ago does not keep a mutex alive forever.
+    async fn release_repair_lock(&self, uid: &NodeUid, lock: Arc<tokio::sync::Mutex<()>>) {
+        let mut locks = self.content_repairs.lock().await;
+        // Two: the map's and ours. Anything more means a waiter still needs it.
+        if Arc::strong_count(&lock) <= 2 {
+            locks.remove(uid);
+        }
     }
 
     /// Warm the blocks after a sequential read into the caches, in the
@@ -761,6 +918,15 @@ impl Core {
             let bstart = bidx * BLOCK_SIZE;
             // Every slot is populated: cache hits up front, misses by the fetch above.
             let block = block.expect("block fetched or cached");
+            // Both sources guarantee the length the file's size implies — the
+            // cache validates it on read, the network path in `read_block` — so
+            // this refuses rather than quietly contributing fewer bytes than the
+            // range covers, which is what turned a bad block into a truncated
+            // file (bugs.md B84).
+            if block.len() as u64 != block_len(fsize, bidx) {
+                error!(%uid, bidx, len = block.len(), fsize, "assembling a read hit a short block");
+                return Err(Errno::EIO);
+            }
             let s = (offset.max(bstart) - bstart) as usize;
             let e = (end.min(bstart + block.len() as u64) - bstart) as usize;
             if s < e {

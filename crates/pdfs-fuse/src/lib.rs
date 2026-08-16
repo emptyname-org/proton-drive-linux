@@ -55,7 +55,7 @@ use fuser::{
 };
 use futures::StreamExt as _;
 use pdfs_core::batch;
-use pdfs_core::cache::{BLOCK_SIZE, Baseline, ContentCache, StagedWrite};
+use pdfs_core::cache::{BLOCK_SIZE, Baseline, ContentCache, StagedWrite, block_len};
 use pdfs_core::config::{AppDirs, SweepMode};
 use pdfs_core::control::{
     ActivityEntry, ActivityKind, DirEntry, ErrorKind, LocalHit, PhotoKind, PublicLinkInfo,
@@ -92,6 +92,7 @@ mod profile;
 mod reads;
 mod revisions;
 mod sharing;
+mod shutdown;
 mod state;
 mod sweep;
 mod sync;
@@ -410,6 +411,10 @@ struct Core {
     /// kernel read-ahead, our own prefetch) share a single download and decrypt.
     /// See [`BlockFlight`].
     block_flight: Arc<BlockFlight>,
+    /// One lock per file being repaired by [`Core::repair_block`], so the
+    /// concurrent block reads that all discover the same untrustworthy block
+    /// table share a single whole-file download instead of one each.
+    content_repairs: Arc<tokio::sync::Mutex<HashMap<NodeUid, Arc<tokio::sync::Mutex<()>>>>>,
     /// Per-file sequential-read detection driving [`Core::prefetch`].
     prefetch: Arc<Prefetch>,
     /// Permits bounding speculative block fetches, so prefetch cannot queue in
@@ -450,6 +455,9 @@ struct Core {
     /// Nudges the drain workers: set true and notify to have them re-examine
     /// the queue instead of waiting out their backoff.
     drain_wake: Arc<(Mutex<bool>, Condvar)>,
+    /// The daemon's stop signal, shared with every background loop this `Core`
+    /// was cloned into so teardown can end and join them (bugs.md B44).
+    shutdown: Arc<shutdown::Shutdown>,
     /// How long this node's last upload actually took, in milliseconds, with
     /// the time it was measured for eviction. Feeds
     /// [`Core::revision_debounce`]: a file that takes 30 seconds to send needs
@@ -1708,7 +1716,9 @@ impl Core {
     fn run_online_probe(&self) {
         let mut delay = ONLINE_PROBE_MIN;
         loop {
-            std::thread::sleep(delay);
+            if !self.shutdown.sleep(delay) {
+                return;
+            }
             match self.rt.block_on(self.client.get_my_files_folder()) {
                 Ok(root) => {
                     {
@@ -3223,6 +3233,15 @@ impl Core {
         }
         self.pending.lock().remove(uid);
         Ok(())
+    }
+
+    /// Which staged blob is currently queued for `uid`, if any.
+    ///
+    /// The path identifies the revision: publication stages a fresh file and
+    /// swaps the map entry to point at it, so an unchanged path means the base a
+    /// caller sampled earlier is still the base now (bugs.md B32).
+    fn pending_blob(&self, uid: &NodeUid) -> Option<PathBuf> {
+        self.pending.lock().get(uid).map(|p| p.path.clone())
     }
 
     /// Nudge the drain worker to re-examine the queue now.

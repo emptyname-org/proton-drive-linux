@@ -2408,6 +2408,7 @@ fn mirror_uid_lookup_covers_the_root_and_synced_descendants_only() {
             local_size: 2,
             remote_rev: Some("3".into()),
             remote_hash: Some("2".into()),
+            local_mtime_ns: None,
         },
     )
     .unwrap();
@@ -2424,6 +2425,7 @@ fn mirror_uid_lookup_covers_the_root_and_synced_descendants_only() {
             local_size: 2,
             remote_rev: Some("3".into()),
             remote_hash: Some("2".into()),
+            local_mtime_ns: None,
         },
     )
     .unwrap();
@@ -3539,6 +3541,78 @@ fn migration_v27_adds_the_access_deferral_column_to_a_v26_queue() {
         db.defer_op_for_access(ops[0].id, now, now + 5_000).unwrap(),
         now,
         "a carried-over op is not already deferred"
+    );
+
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(format!("{}.lock", path.display()));
+}
+
+/// A mirror baseline carried over from V27 keeps its rows, and each one reads
+/// back with no nanosecond time. That `None` is the whole point: it makes the
+/// comparison fall back to whole seconds for rows written before the column
+/// existed, instead of asserting a sub-second time of zero and re-uploading
+/// every already-synced file in the folder (bugs.md B25).
+#[test]
+fn migration_v28_adds_sub_second_local_times_without_disturbing_a_v27_baseline() {
+    let path = std::env::temp_dir().join(format!(
+        "pdfs-db-v27-fixture-{}-{}.db",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    {
+        let db = Db::open(&path).unwrap();
+        let folder = db
+            .sync_folder_add("/home/me/Mirror", "vol~root", "share")
+            .unwrap();
+        db.sync_entry_upsert(
+            folder,
+            &StoredSyncEntry {
+                rel_path: "notes.txt".into(),
+                remote_uid: Some("vol~notes".into()),
+                local_mtime: 1_700_000_000,
+                local_mtime_ns: Some(1_700_000_000_123_456_789),
+                local_size: 42,
+                remote_rev: Some("1700000000".into()),
+                remote_hash: Some("42".into()),
+            },
+        )
+        .unwrap();
+    }
+    {
+        // Put the file back in the state a released V27 database was in.
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "ALTER TABLE sync_entry DROP COLUMN local_mtime_ns;
+             UPDATE sync_state SET value = '27' WHERE key = 'schema_version';",
+        )
+        .unwrap();
+    }
+
+    let db = Db::open(&path).unwrap();
+    let entries = db.sync_entries(1).unwrap();
+    let entry = entries.get("notes.txt").expect("the baseline row survives");
+    assert_eq!(entry.local_mtime, 1_700_000_000);
+    assert_eq!(entry.local_size, 42);
+    assert_eq!(
+        entry.local_mtime_ns, None,
+        "a carried-over row must not claim a sub-second time it never recorded"
+    );
+
+    // And the column is live: a refreshed row keeps the precision it is given.
+    db.sync_entry_upsert(
+        1,
+        &StoredSyncEntry {
+            local_mtime_ns: Some(1_700_000_001_000_000_500),
+            ..entry.clone()
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        db.sync_entries(1).unwrap()["notes.txt"].local_mtime_ns,
+        Some(1_700_000_001_000_000_500)
     );
 
     let _ = std::fs::remove_file(&path);

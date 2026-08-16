@@ -1,6 +1,7 @@
 //! Remote-event invalidation and local-index background workers.
 
 use super::*;
+use crate::shutdown::Shutdown;
 
 /// Drop `uid` from one mount's tree and tell that mount's kernel session the
 /// entry is gone. Shared by the trash and delete paths, which differ only in
@@ -437,6 +438,7 @@ pub(super) fn run_local_index(
     indexing: Arc<AtomicBool>,
     transfers: Arc<TransferRegistry>,
     mountpoint: PathBuf,
+    shutdown: Arc<Shutdown>,
 ) {
     loop {
         let age = db.local_indexed_at().ok().flatten();
@@ -445,7 +447,11 @@ pub(super) fn run_local_index(
         if stale {
             scan_local_once(&db, &indexing, &transfers, &mountpoint);
         }
-        std::thread::sleep(LOCAL_INDEX_CHECK);
+        // Interruptible, so teardown joins this thread instead of leaving it to
+        // keep rewriting the index for a mount that is gone (bugs.md B44).
+        if !shutdown.sleep(LOCAL_INDEX_CHECK) {
+            return;
+        }
     }
 }
 
