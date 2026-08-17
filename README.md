@@ -13,6 +13,10 @@
 
 A fast, unofficial Proton Drive client for Linux. This client features an advanced files-on-demand FUSE virtual mount with block-level caching, a command-line interface (CLI), and a fully non-blocking GTK4 desktop application with system tray integration.
 
+**Thumbnail browsing in Files:** The regular Files section displays and locally
+caches previews for supported images—including camera RAW files—in any Drive
+folder, rather than limiting thumbnails to the Photos gallery.
+
 This fork focuses on a more native Linux desktop experience, responsive file
 and offline-copy actions, locally cached thumbnails (including camera RAW
 previews), and reproducible Debian packaging. GitHub Releases contain an
@@ -41,7 +45,7 @@ this repository does not imply a promise of support or long-term maintenance.
 - **Unified Search Launcher (HUD)**: A resident Google Drive-style launcher (`pdfs-prompt`) that searches Proton Drive and local files together, ranks the best matches, tolerates abbreviations and typos, and is ideal for a system-wide hotkey.
 - **Secure Credential Storage**: Integrates with the system Secret Service (GNOME Keyring, KWallet, etc.) with smart in-memory credential caching to avoid UI thread blockages.
 - **Proton Photos Support**: Access your Proton Photos timeline, view thumbnails, and download backed-up media natively (available in the GUI as a navigation tab and via the CLI).
-- **Drive Thumbnails**: Build and cache thumbnails for ordinary images and camera RAW files while browsing Drive. RAW previews are extracted locally with ExifTool; the original files are never modified.
+- **Drive Thumbnails**: See, build, and cache thumbnails for ordinary images and camera RAW files directly in the Files section, in any Drive folder. RAW previews are extracted locally with ExifTool; the original files are never modified.
 - **File Version History**: Every revision Proton Drive still holds for a file, from **Versions…** in the file's context menu or `pdfs versions list|restore|save|rm`. Restoring is server-side — no re-upload — and an old version can be written out to a local file without touching the live one.
 - **Photo Favourites**: Star a photo in the lightbox, filter the gallery to favourites, or use `pdfs favorite <uid>` / `pdfs photos --favorites`.
 - **Photo Albums**: Browse your albums — including the ones shared with you — from the Albums view of the Photos page, or with `pdfs albums` / `pdfs album <uid>`. Album contents open in the same gallery as the timeline.
