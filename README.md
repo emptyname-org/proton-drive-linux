@@ -11,11 +11,7 @@
 > shared as-is without a promise of support, compatibility, or continued
 > maintenance.
 
-A fast, unofficial Proton Drive client for Linux. This client features an advanced files-on-demand FUSE virtual mount with block-level caching, a command-line interface (CLI), and a fully non-blocking GTK4 desktop application with system tray integration.
-
-**Thumbnail browsing in Files:** The regular Files section displays and locally
-caches previews for supported images—including camera RAW files—in any Drive
-folder, rather than limiting thumbnails to the Photos gallery.
+A fast, unofficial Proton Drive client for Linux. This client features an advanced files-on-demand FUSE virtual mount with block-level caching, thumbnail browsing for standard images and camera RAW files in any Drive folder, a command-line interface (CLI), and a fully non-blocking GTK4 desktop application with system tray integration.
 
 This fork focuses on a more native Linux desktop experience, responsive file
 and offline-copy actions, locally cached thumbnails (including camera RAW
