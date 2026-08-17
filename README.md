@@ -11,8 +11,8 @@
 > shared as-is without a promise of support, compatibility, or continued
 > maintenance.
 
-This experimental community fork extends the upstream client first and foremost
-with thumbnail browsing directly in the regular Files section. It builds and
+This experimental community fork extends the upstream client with thumbnail
+browsing directly in the regular Files section. It builds and
 caches previews for standard images and camera RAW files in any Drive folder,
 not only in the Photos gallery. Compared with the parent project, this fork also
 focuses on more native Linux desktop controls, responsive file and offline-copy
