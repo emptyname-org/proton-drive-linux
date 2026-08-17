@@ -153,9 +153,6 @@ pub(crate) fn open_share_dialog(ui: &Rc<Ui>, entry: &DirEntry) {
         ShareTarget::Path(entry_rel(ui, entry))
     };
 
-    let header = adw::HeaderBar::new();
-    header.set_title_widget(Some(&adw::WindowTitle::new("Share", &entry.name)));
-
     // Invite section: emails + role + optional message.
     let invite_group = adw::PreferencesGroup::builder()
         .title("Invite people")
@@ -207,16 +204,13 @@ pub(crate) fn open_share_dialog(ui: &Rc<Ui>, entry: &DirEntry) {
         .hscrollbar_policy(gtk4::PolicyType::Never)
         .child(&clamp)
         .build();
-    let toolbar = toolbar_view(&header, &scroll);
-
-    let dialog = adw::Window::builder()
-        .title("Share")
-        .default_width(480)
-        .default_height(560)
-        .modal(true)
-        .content(&toolbar)
-        .build();
-    dialog.set_transient_for(ui_window(ui).as_ref());
+    let dialog = native_dialog_window(
+        ui_window(ui).as_ref(),
+        &format!("Share — {}", entry.name),
+        480,
+        560,
+    );
+    dialog.set_child(Some(&scroll));
 
     let state = Rc::new(ShareDialog {
         ui: ui.clone(),

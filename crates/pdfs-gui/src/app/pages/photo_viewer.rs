@@ -410,18 +410,13 @@ pub(crate) fn show_photo_position(viewer: &Rc<Viewer>, index: u32, total: u32, c
 /// The in-app lightbox: the photo, edge-to-edge on a dark backdrop, with a
 /// floating top bar, prev/next affordances and a details drawer.
 ///
-/// Closing it is deliberately hard to get wrong — Escape, `q`, Ctrl+W, the close
-/// button, or a click on the backdrop beside the photo all dismiss it.
+/// Closing it is deliberately hard to get wrong — the native title-bar button,
+/// Escape, `q`, Ctrl+W, or a click on the backdrop beside the photo all dismiss
+/// it.
 pub(crate) fn open_photo_viewer(ui: &Rc<Ui>, initial_uid: String) {
     let parent = ui.stack.root().and_downcast::<gtk4::Window>().unwrap();
 
-    let window = gtk4::Window::builder()
-        .title("Photo")
-        .modal(true)
-        .transient_for(&parent)
-        .default_width(1100)
-        .default_height(760)
-        .build();
+    let window = native_dialog_window(Some(&parent), "Photo", 1100, 760);
     window.add_css_class("photo-viewer-window");
 
     let overlay = gtk4::Overlay::new();
@@ -501,9 +496,6 @@ pub(crate) fn open_photo_viewer(ui: &Rc<Ui>, initial_uid: String) {
 
     let download_btn = action("document-save-symbolic", "Save a copy…");
     let open_ext_btn = action("document-open-symbolic", "Open with another app");
-    let close_btn = action("window-close-symbolic", "Close (Esc)");
-    close_btn.add_css_class("viewer-close-btn");
-
     let top_bar = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
     top_bar.add_css_class("viewer-top-bar");
     top_bar.set_valign(gtk4::Align::Start);
@@ -513,7 +505,6 @@ pub(crate) fn open_photo_viewer(ui: &Rc<Ui>, initial_uid: String) {
     top_bar.append(&info_toggle);
     top_bar.append(&download_btn);
     top_bar.append(&open_ext_btn);
-    top_bar.append(&close_btn);
     overlay.add_overlay(&top_bar);
 
     // Details drawer: slides in from the right as a real surface (not a wash of
@@ -628,11 +619,6 @@ pub(crate) fn open_photo_viewer(ui: &Rc<Ui>, initial_uid: String) {
 
     load_photo(ui, &viewer, initial_uid);
     prefetch_photo(ui, &viewer, 1);
-
-    let w_close = window.clone();
-    close_btn.connect_clicked(move |_| {
-        w_close.close();
-    });
 
     let viewer_info = viewer.clone();
     info_toggle.connect_toggled(move |toggle| {

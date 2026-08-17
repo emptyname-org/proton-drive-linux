@@ -14,6 +14,10 @@ use crate::syncignore::DEFAULT_IGNORE_PATTERNS;
 /// stable/beta/alpha); a malformed value trips the 422 anti-abuse path.
 pub const APP_VERSION: &str = "external-drive-linux@0.1.0-alpha";
 pub const USER_AGENT: &str = "proton-drive-linux/0.1.0";
+/// Human-facing build version from the workspace manifest. Keep this separate
+/// from [`APP_VERSION`], which is a Proton API protocol identifier rather than
+/// the installed application's release number.
+pub const BUILD_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Keyring service name; one entry per credential kind keyed by username.
 pub const KEYRING_SERVICE: &str = "proton-drive-linux";

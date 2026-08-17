@@ -262,7 +262,7 @@ pub(crate) fn build_main_page() -> (gtk4::Widget, MainWidgets) {
     );
     diagnostics_group.add(&settings_row(
         "Version",
-        Some(pdfs_core::config::APP_VERSION),
+        Some(pdfs_core::config::BUILD_VERSION),
     ));
     diagnostics_group.add(&settings_row(
         "User agent",

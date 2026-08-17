@@ -98,9 +98,6 @@ pub(crate) fn open_versions_dialog(ui: &Rc<Ui>, entry: &DirEntry) {
         VersionTarget::Path(entry_rel(ui, entry))
     };
 
-    let header = adw::HeaderBar::new();
-    header.set_title_widget(Some(&adw::WindowTitle::new("Versions", &entry.name)));
-
     let group = adw::PreferencesGroup::builder()
         .title("Version history")
         .description("Proton Drive keeps earlier versions of a file until you delete them.")
@@ -118,16 +115,13 @@ pub(crate) fn open_versions_dialog(ui: &Rc<Ui>, entry: &DirEntry) {
         .hscrollbar_policy(gtk4::PolicyType::Never)
         .child(&clamp)
         .build();
-    let toolbar = toolbar_view(&header, &scroll);
-
-    let dialog = adw::Window::builder()
-        .title("Versions")
-        .default_width(520)
-        .default_height(520)
-        .modal(true)
-        .content(&toolbar)
-        .build();
-    dialog.set_transient_for(ui_window(ui).as_ref());
+    let dialog = native_dialog_window(
+        ui_window(ui).as_ref(),
+        &format!("Versions — {}", entry.name),
+        520,
+        520,
+    );
+    dialog.set_child(Some(&scroll));
 
     let state = Rc::new(VersionsDialog {
         ui: ui.clone(),

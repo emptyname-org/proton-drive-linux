@@ -299,7 +299,7 @@ fn load_proton_theme() {
 
         // Register custom icons directory from our GResource with the icon theme
         let icon_theme = gtk4::IconTheme::for_display(&display);
-        icon_theme.add_resource_path("/de/nils/protondrivelinux/icons");
+        icon_theme.add_resource_path("/io/emptyname/protondrivelinux/icons");
     }
 }
 
@@ -722,18 +722,28 @@ fn refresh_button() -> gtk4::Button {
     button
 }
 
-/// A Debian-12-compatible replacement for `AdwToolbarView`: keep the header and
-/// content in one vertical widget while retaining the same visual hierarchy.
-pub(crate) fn toolbar_view(
-    header: &impl IsA<gtk4::Widget>,
-    content: &impl IsA<gtk4::Widget>,
-) -> gtk4::Box {
-    let toolbar = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
-    toolbar.set_hexpand(true);
-    toolbar.set_vexpand(true);
-    toolbar.append(header);
-    toolbar.append(content);
-    toolbar
+/// The one shell for every content-rich dialog owned by the application.
+///
+/// It deliberately supplies only a decorated GTK window: the window manager
+/// owns the title bar, while each caller supplies ordinary content below it.
+/// Confirmation prompts and file choosers use GTK's specialised native dialog
+/// classes and likewise never construct an in-content title bar.
+pub(crate) fn native_dialog_window(
+    parent: Option<&gtk4::Window>,
+    title: &str,
+    default_width: i32,
+    default_height: i32,
+) -> gtk4::Window {
+    let window = gtk4::Window::builder()
+        .title(title)
+        .default_width(default_width)
+        .default_height(default_height)
+        .modal(true)
+        .decorated(true)
+        .build();
+    window.add_css_class("app-dialog");
+    window.set_transient_for(parent);
+    window
 }
 
 /// Point every page's Refresh button at the current page. One handler for all of
@@ -897,15 +907,63 @@ fn install_window_actions(window: &gtk4::ApplicationWindow) {
     let about = gio::SimpleAction::new("about", None);
     let win = window.clone();
     about.connect_activate(move |_, _| {
-        let dialog = adw::AboutWindow::builder()
-            .application_name("Proton Drive")
-            .application_icon("folder-remote-symbolic")
-            .version(pdfs_core::config::APP_VERSION)
-            .developer_name("proton-drive-linux")
-            .comments("On-demand Proton Drive sync for Linux.")
-            .transient_for(&win)
-            .modal(true)
+        let content = gtk4::Box::new(gtk4::Orientation::Vertical, 12);
+        content.set_margin_top(24);
+        content.set_margin_bottom(24);
+        content.set_margin_start(24);
+        content.set_margin_end(24);
+        content.set_halign(gtk4::Align::Center);
+
+        let icon = gtk4::Image::builder()
+            .icon_name(APP_ID)
+            .pixel_size(112)
             .build();
+        let name = gtk4::Label::new(Some("Proton Drive Linux — Community Fork"));
+        name.add_css_class("title-1");
+        let version = gtk4::Label::new(Some(&format!(
+            "Version {}",
+            pdfs_core::config::BUILD_VERSION
+        )));
+        version.add_css_class("dim-label");
+        let description = gtk4::Label::builder()
+            .label(
+                "Experimental community fork with image and camera RAW thumbnails in Files.\nUnofficial and not affiliated with Proton AG.",
+            )
+            .wrap(true)
+            .justify(gtk4::Justification::Center)
+            .max_width_chars(48)
+            .build();
+        let repository = gtk4::LinkButton::builder()
+            .label("Fork repository")
+            .uri("https://github.com/emptyname-org/proton-drive-linux")
+            .build();
+        let credits = gtk4::Label::new(Some(
+            "Proton Drive Linux contributors · MIT-licensed code",
+        ));
+        credits.add_css_class("dim-label");
+
+        for child in [
+            icon.upcast_ref::<gtk4::Widget>(),
+            name.upcast_ref(),
+            version.upcast_ref(),
+            description.upcast_ref(),
+            repository.upcast_ref(),
+            credits.upcast_ref(),
+        ] {
+            content.append(child);
+        }
+        let clamp = adw::Clamp::builder()
+            .maximum_size(520)
+            .child(&content)
+            .build();
+        let dialog = native_dialog_window(
+            Some(win.upcast_ref()),
+            "About Proton Drive Linux",
+            520,
+            430,
+        );
+        dialog.set_resizable(false);
+        dialog.set_child(Some(&clamp));
         dialog.present();
     });
     window.add_action(&about);
