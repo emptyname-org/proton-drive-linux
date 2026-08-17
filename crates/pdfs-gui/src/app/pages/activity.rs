@@ -20,6 +20,8 @@ pub(crate) struct ActivityWidgets {
     pub(crate) content: gtk4::Stack,
     pub(crate) status: adw::StatusPage,
     pub(crate) group: adw::PreferencesGroup,
+    /// Live work belongs on Activity, above the completed-event feed.
+    pub(crate) transfers_group: adw::PreferencesGroup,
     pub(crate) retry: gtk4::Button,
     pub(crate) refresh: gtk4::Button,
 }
@@ -72,6 +74,13 @@ pub(crate) fn build_activity_page() -> (gtk4::Widget, ActivityWidgets) {
     inner.set_margin_start(12);
     inner.set_margin_end(12);
     inner.append(&header);
+    let transfers_group = adw::PreferencesGroup::builder()
+        .title("Current transfers")
+        .description("Uploads, downloads and background jobs.")
+        .build();
+    transfers_group.set_visible(false);
+    let transfers_clamp = adw::Clamp::builder().child(&transfers_group).build();
+    inner.append(&transfers_clamp);
     inner.append(&content);
 
     (
@@ -80,6 +89,7 @@ pub(crate) fn build_activity_page() -> (gtk4::Widget, ActivityWidgets) {
             content,
             status,
             group,
+            transfers_group,
             retry,
             refresh,
         },

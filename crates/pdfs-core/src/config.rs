@@ -119,6 +119,11 @@ pub struct AppConfig {
     /// field.
     #[serde(default)]
     pub prompt: Option<PromptConfig>,
+    /// Whether the mount service stays enabled after the desktop app closes.
+    /// `None` preserves the historical behaviour for configs predating this
+    /// setting: keep the daemon running in the user's desktop session.
+    #[serde(default)]
+    pub keep_service_running: Option<bool>,
 }
 
 impl Default for AppConfig {
@@ -133,6 +138,7 @@ impl Default for AppConfig {
             conflict_sweep: None,
             open_with: None,
             prompt: None,
+            keep_service_running: None,
         }
     }
 }
@@ -154,6 +160,12 @@ impl AppConfig {
     /// The effective prompt settings, defaulted when the section is absent.
     pub fn resolved_prompt(&self) -> PromptConfig {
         self.prompt.clone().unwrap_or_default()
+    }
+
+    /// Whether the daemon should outlive the desktop app. Older configs have no
+    /// field and retain the client's established always-on service behaviour.
+    pub fn resolved_keep_service_running(&self) -> bool {
+        self.keep_service_running.unwrap_or(true)
     }
 
     /// The effective conflict-sweep mode: the [`CONFLICT_SWEEP_ENV`] override if
@@ -477,11 +489,13 @@ mod tests {
             conflict_sweep: Some(SweepMode::Enforce),
             open_with: None,
             prompt: None,
+            keep_service_running: Some(false),
         };
         let json = serde_json::to_string(&config).unwrap();
         let decoded: AppConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(decoded.app_version, "external-drive-test-client@1.0.0");
         assert_eq!(decoded.user_agent, "test-agent/1.0");
+        assert!(!decoded.resolved_keep_service_running());
     }
 
     #[test]
@@ -489,6 +503,15 @@ mod tests {
         let default_config = AppConfig::default();
         assert_eq!(default_config.app_version, APP_VERSION);
         assert_eq!(default_config.user_agent, USER_AGENT);
+        assert!(default_config.resolved_keep_service_running());
+    }
+
+    #[test]
+    fn a_config_predating_service_lifecycle_keeps_the_service_running() {
+        let json = r#"{"app_version":"v","user_agent":"u"}"#;
+        let decoded: AppConfig = serde_json::from_str(json).unwrap();
+        assert!(decoded.keep_service_running.is_none());
+        assert!(decoded.resolved_keep_service_running());
     }
 
     #[test]

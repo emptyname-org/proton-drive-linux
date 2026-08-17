@@ -1,10 +1,11 @@
 //! Thin wrappers over `systemctl --user` for the auto-mount daemon.
 //!
 //! The mount is owned by a systemd *user* service (`proton-drive.service`, see
-//! `packaging/`). Front-ends never spawn `pdfs mount` directly anymore: logging
-//! in enables+starts the unit, logging out disables+stops it, and the tray's
-//! "Disconnect" just stops it. systemd then handles restart-on-failure and a
-//! clean SIGTERM stop (which the daemon turns into a lazy unmount).
+//! `packaging/`). Front-ends never spawn `pdfs mount` directly. Depending on the
+//! desktop preference, the unit is either enabled for the whole login session
+//! or started only while the app is open. Logging out always disables+stops it,
+//! and the tray's "Disconnect" just stops it. systemd handles restart-on-failure
+//! and a clean SIGTERM stop (which the daemon turns into a lazy unmount).
 //!
 //! Every call is best-effort: a failure is logged but not fatal, since the user
 //! can always drive `systemctl --user` by hand.
@@ -47,10 +48,28 @@ fn systemctl_query(args: &[&str]) -> bool {
         .unwrap_or(false)
 }
 
-/// Enable the service so it survives reboots/logins and start it now. Called on
-/// successful login.
+/// Enable the service so it survives reboots/logins and start it now.
 pub fn enable_start() -> bool {
     systemctl(&["enable", "--now"])
+}
+
+/// Start the service now without changing whether it starts on future logins.
+pub fn start() -> bool {
+    systemctl(&["start"])
+}
+
+/// Apply the desktop app's lifecycle policy and make sure the service is
+/// running now. In app-scoped mode the separate calls are deliberate: disabling
+/// must not stop the current mount, and starting must still run even if the unit
+/// was already disabled.
+pub fn start_for_app(keep_running: bool) -> bool {
+    if keep_running {
+        enable_start()
+    } else {
+        let disabled = disable();
+        let started = start();
+        disabled && started
+    }
 }
 
 /// Stop the running mount without disabling it. Called by the tray's
@@ -80,21 +99,18 @@ pub fn is_failed() -> bool {
 }
 
 /// Whether the unit is enabled to start on login/boot. `systemctl is-enabled`
-/// exits 0 only for an enabled unit, so the Settings page can render the
-/// "Start on login" switch in its true state.
+/// exits 0 only for an enabled unit.
 pub fn is_enabled() -> bool {
     systemctl_query(&["is-enabled"])
 }
 
 /// Enable the service so it auto-starts on future logins, without necessarily
-/// starting it now beyond what `enable` does. Used by the Settings "Start on
-/// login" switch; pairs with [`disable`].
+/// starting it now beyond what `enable` does. Pairs with [`disable`].
 pub fn enable() -> bool {
     systemctl(&["enable"])
 }
 
-/// Disable auto-start without stopping the running mount. Used by the Settings
-/// "Start on login" switch turning off; the current session stays mounted.
+/// Disable auto-start without stopping the running mount.
 pub fn disable() -> bool {
     systemctl(&["disable"])
 }

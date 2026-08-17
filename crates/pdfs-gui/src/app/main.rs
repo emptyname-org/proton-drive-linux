@@ -179,6 +179,17 @@ fn main() -> glib::ExitCode {
         pdfs_core::shell::install_file_manager_scripts();
         spawn_tray();
     });
+    app.connect_shutdown(|_| {
+        let Ok(dirs) = AppDirs::new() else {
+            return;
+        };
+        if !dirs.load_config().resolved_keep_service_running() {
+            // App-scoped mode owns the unit's complete lifecycle. Disable again
+            // as well as stopping, so an external change cannot leave it
+            // unexpectedly starting on the next desktop login.
+            service::disable_stop();
+        }
+    });
     app.connect_activate(|app| {
         // Desktop-file launches, tray clicks and D-Bus activation all reach this
         // signal. Raise the existing main window instead of constructing another
@@ -201,6 +212,12 @@ fn spawn_tray() {
         Ok(_) => tracing::info!("spawned `pdfs-tray`"),
         Err(e) => tracing::error!("failed to spawn `pdfs-tray`: {e}"),
     }
+}
+
+/// Keep the single-instance GTK application alive while a service transition
+/// finishes, even if its last window closes in the meantime.
+pub(crate) fn hold_application() -> Option<gio::ApplicationHoldGuard> {
+    gio::Application::default().map(|app| app.hold())
 }
 
 /// Install a CSS provider that overrides libadwaita's accent colour with Proton
@@ -374,26 +391,23 @@ fn build_window(app: &adw::Application) {
             status_inflight: Cell::new(false),
             account_row: main_widgets.account_row.clone(),
             mount_row: main_widgets.mount_row.clone(),
-            transfers_group: main_widgets.transfers_group.clone(),
+            transfers_group: activity_widgets.transfers_group.clone(),
             transfer_rows: RefCell::new(Vec::new()),
             transfers_inflight: Cell::new(false),
             cache_bar: main_widgets.cache_bar.clone(),
             cache_label: main_widgets.cache_label.clone(),
-            quota_group: main_widgets.quota_group.clone(),
+            quota_row: main_widgets.quota_row.clone(),
             quota_bar: main_widgets.quota_bar.clone(),
             quota_label: main_widgets.quota_label.clone(),
             quota_inflight: Cell::new(false),
             quota_checked_at: Cell::new(None),
-            autostart_row: main_widgets.autostart_row.clone(),
+            background_service_row: main_widgets.background_service_row.clone(),
             budget_row: main_widgets.budget_row.clone(),
             budget_source: RefCell::new(None),
             budget_inflight: Cell::new(false),
             budget_pending: Cell::new(None),
             mountpoint_row: main_widgets.mountpoint_row.clone(),
             settings_suppress: Cell::new(false),
-            pins_group: main_widgets.pins_group.clone(),
-            pin_rows: RefCell::new(Vec::new()),
-            pins_state: RefCell::new(None),
             notified_mounted: Cell::new(None),
             active_transfers: Cell::new(0),
         },
@@ -635,6 +649,7 @@ fn build_window(app: &adw::Application) {
     });
 
     window.present();
+    start_service_for_app(&ui);
 }
 
 /// The sidebar destinations, in order: the row index is the index into this table,

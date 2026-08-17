@@ -1833,6 +1833,13 @@ impl ContentCache {
             .collect()
     }
 
+    /// Number of direct offline-copy policies without loading their paths.
+    /// Used by frequent status calls; full listings remain explicit via
+    /// [`Self::list_pins`].
+    pub fn pin_count(&self) -> usize {
+        self.db.pin_count().unwrap_or_default()
+    }
+
     /// Total bytes the cache holds on disk — blobs, blocks and thumbnails
     /// together — which is what the configured budget caps and therefore the
     /// only honest thing to show next to it.

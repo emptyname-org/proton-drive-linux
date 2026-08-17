@@ -13,21 +13,21 @@ pub(crate) struct StatusState {
     // Main page.
     pub(crate) account_row: adw::ActionRow,
     /// Read-only mount status line. The mount is driven by the systemd user
-    /// service (enabled on login), not by the user — so this only reports.
+    /// service under the selected lifecycle policy, so this only reports.
     pub(crate) mount_row: adw::ActionRow,
     pub(crate) cache_bar: gtk4::ProgressBar,
     pub(crate) cache_label: gtk4::Label,
-    /// Account-quota group + its bar/label. Hidden until the first reading.
-    pub(crate) quota_group: adw::PreferencesGroup,
+    /// Account-quota row + its bar/label. Hidden until the first reading.
+    pub(crate) quota_row: adw::PreferencesRow,
     pub(crate) quota_bar: gtk4::ProgressBar,
     pub(crate) quota_label: gtk4::Label,
     /// One `AccountQuota` in flight at a time, and when it last succeeded — quota
     /// barely moves, so [`refresh_quota`] refetches on a long TTL, not every tick.
     pub(crate) quota_inflight: Cell<bool>,
     pub(crate) quota_checked_at: Cell<Option<Instant>>,
-    /// "Start on login" toggle. [`Self::settings_suppress`] guards programmatic
-    /// sets so reflecting the systemd state doesn't fire the toggle handler.
-    pub(crate) autostart_row: gtk4::Switch,
+    /// Whether the daemon should remain available after the app closes.
+    /// [`Self::settings_suppress`] guards programmatic changes.
+    pub(crate) background_service_row: gtk4::Switch,
     /// Cache-budget editor (GiB). Populated once from config; user edits drive a
     /// `SetCacheBudget` round-trip. Guarded by [`Self::settings_suppress`].
     pub(crate) budget_row: gtk4::SpinButton,
@@ -43,13 +43,6 @@ pub(crate) struct StatusState {
     /// Set while a settings widget is being populated programmatically, so its
     /// change handler skips the IPC/systemd side effect.
     pub(crate) settings_suppress: Cell<bool>,
-    pub(crate) pins_group: adw::PreferencesGroup,
-    /// Rows currently shown under [`Self::pins_group`], retained so a refresh can
-    /// diff against them and only rebuild when the pin set actually changes.
-    pub(crate) pin_rows: RefCell<Vec<PinRow>>,
-    /// The pin paths last rendered, the diff baseline for [`repaint_pins`].
-    /// `None` = nothing built yet; `Some(empty)` = the placeholder is shown.
-    pub(crate) pins_state: RefCell<Option<Vec<String>>>,
     /// The mount state the *last* desktop notification reported, so a flap only
     /// notifies on the edge. `None` until the first status reply, so a cold start
     /// doesn't announce "disconnected" before the service has had a chance to come
@@ -58,14 +51,6 @@ pub(crate) struct StatusState {
     /// How many transfers were in flight on the previous poll. A drop to zero is
     /// what "sync complete" means; there's no completion event on the wire.
     pub(crate) active_transfers: Cell<usize>,
-}
-
-/// One rendered pin row, retained so [`repaint_pins`] can flip the unpin button's
-/// `sensitive` in place (when the pin set is unchanged) instead of rebuilding.
-pub(crate) struct PinRow {
-    pub(crate) row: adw::ActionRow,
-    /// The unpin button, absent on the placeholder row.
-    pub(crate) unpin: Option<gtk4::Button>,
 }
 
 /// One rendered row in the Activity group: a description over a progress bar.
@@ -90,18 +75,15 @@ pub(crate) struct ActivityLine {
 pub(crate) struct MainWidgets {
     pub(crate) account_row: adw::ActionRow,
     pub(crate) mount_row: adw::ActionRow,
-    /// Live upload/download progress, populated by the refresh loop.
-    pub(crate) transfers_group: adw::PreferencesGroup,
-    /// Account-quota group; hidden until `refresh_quota` gets a reading.
-    pub(crate) quota_group: adw::PreferencesGroup,
+    /// Account-quota row; hidden until `refresh_quota` gets a reading.
+    pub(crate) quota_row: adw::PreferencesRow,
     pub(crate) quota_bar: gtk4::ProgressBar,
     pub(crate) quota_label: gtk4::Label,
     pub(crate) cache_bar: gtk4::ProgressBar,
     pub(crate) cache_label: gtk4::Label,
-    pub(crate) pins_group: adw::PreferencesGroup,
     pub(crate) logout_button: gtk4::Button,
-    /// "Start on login" toggle, reflecting the systemd unit's enabled state.
-    pub(crate) autostart_row: gtk4::Switch,
+    /// Whether the daemon should remain available after the app closes.
+    pub(crate) background_service_row: gtk4::Switch,
     /// Cache soft-cap editor, in GiB; `0` = unlimited.
     pub(crate) budget_row: gtk4::SpinButton,
     /// Purges all unpinned cached content.
@@ -183,7 +165,10 @@ fn settings_metric_row() -> (adw::PreferencesRow, gtk4::ProgressBar, gtk4::Label
 /// authority. It supplies the clamp, scrolling, group spacing, insets and native
 /// title/subtitle typography instead of duplicating those values per section.
 pub(crate) fn build_main_page() -> (gtk4::Widget, MainWidgets) {
-    let account_group = adw::PreferencesGroup::new();
+    let account_group = settings_group(
+        "Account",
+        Some("Your Proton account and storage shared across Proton products."),
+    );
     let account_row = settings_row("Not signed in", None);
     account_row.add_prefix(&adw::Avatar::new(40, None, true));
     let logout_button = gtk4::Button::builder()
@@ -194,21 +179,34 @@ pub(crate) fn build_main_page() -> (gtk4::Widget, MainWidgets) {
     account_row.add_suffix(&logout_button);
     account_group.add(&account_row);
 
-    let quota_group = settings_group(
-        "Account storage",
-        Some("Storage shared across all Proton products."),
-    );
-    quota_group.set_visible(false);
     let (quota_row, quota_bar, quota_label) = settings_metric_row();
-    quota_group.add(&quota_row);
+    quota_row.set_visible(false);
+    account_group.add(&quota_row);
 
-    let mount_group = settings_group("Drive", None);
-    let mount_row = settings_row("Proton Drive", Some("Not connected"));
-    mount_group.add(&mount_row);
+    let drive_group = settings_group(
+        "Drive",
+        Some("Connection, background service and local locations."),
+    );
+    let mount_row = settings_row("Connection", Some("Not connected"));
+    drive_group.add(&mount_row);
 
-    let transfers_group =
-        settings_group("Activity", Some("Files moving to and from Proton Drive."));
-    transfers_group.set_visible(false);
+    let background_service_setting_row = settings_row(
+        "Keep Drive running in background",
+        Some("Keep mounts, sync, tray actions and Drive search available after closing the app."),
+    );
+    let background_service_row = gtk4::Switch::builder().valign(gtk4::Align::Center).build();
+    background_service_setting_row.add_suffix(&background_service_row);
+    background_service_setting_row.set_activatable_widget(Some(&background_service_row));
+    drive_group.add(&background_service_setting_row);
+
+    let (mountpoint_row, locations_button) = settings_disclosure_row(
+        "Locations",
+        "Manage the mountpoint and synced folders.",
+        "drive-harddisk-symbolic",
+        "Open Locations",
+        None,
+    );
+    drive_group.add(&mountpoint_row);
 
     let storage_group = settings_group(
         "Local storage",
@@ -240,27 +238,7 @@ pub(crate) fn build_main_page() -> (gtk4::Widget, MainWidgets) {
     purge_row.add_suffix(&purge_button);
     storage_group.add(&purge_row);
 
-    let system_group = settings_group("System integration", None);
-    let autostart_setting_row = settings_row(
-        "Start on login",
-        Some("Connect Proton Drive automatically after you sign in."),
-    );
-    let autostart_row = gtk4::Switch::builder().valign(gtk4::Align::Center).build();
-    autostart_setting_row.add_suffix(&autostart_row);
-    autostart_setting_row.set_activatable_widget(Some(&autostart_row));
-    system_group.add(&autostart_setting_row);
-    let mountpoint_row = settings_row("Mountpoint", Some("—"));
-    system_group.add(&mountpoint_row);
-
     let application_group = settings_group("Application", None);
-    let (locations_row, locations_button) = settings_disclosure_row(
-        "Locations",
-        "Manage local folders and sync modes.",
-        "drive-harddisk-symbolic",
-        "Open Locations",
-        None,
-    );
-    application_group.add(&locations_row);
     let (shortcuts_row, _) = settings_disclosure_row(
         "Keyboard shortcuts",
         "View available keyboard commands.",
@@ -278,11 +256,6 @@ pub(crate) fn build_main_page() -> (gtk4::Widget, MainWidgets) {
     );
     application_group.add(&about_row);
 
-    let pins_group = settings_group(
-        "Offline copies",
-        Some("Files kept available offline on this device."),
-    );
-
     let diagnostics_group = settings_group(
         "Diagnostics",
         Some("Information useful for troubleshooting."),
@@ -299,13 +272,9 @@ pub(crate) fn build_main_page() -> (gtk4::Widget, MainWidgets) {
     let page = adw::PreferencesPage::new();
     for group in [
         &account_group,
-        &quota_group,
-        &mount_group,
-        &transfers_group,
+        &drive_group,
         &storage_group,
-        &system_group,
         &application_group,
-        &pins_group,
         &diagnostics_group,
     ] {
         page.add(group);
@@ -316,15 +285,13 @@ pub(crate) fn build_main_page() -> (gtk4::Widget, MainWidgets) {
         MainWidgets {
             account_row,
             mount_row,
-            transfers_group,
-            quota_group,
+            quota_row,
             quota_bar,
             quota_label,
             cache_bar,
             cache_label,
-            pins_group,
             logout_button,
-            autostart_row,
+            background_service_row,
             budget_row,
             purge_button,
             mountpoint_row,
@@ -337,8 +304,8 @@ pub(crate) fn build_main_page() -> (gtk4::Widget, MainWidgets) {
 pub(crate) const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
 
 /// Wire the Settings-page controls: the cache-budget editor, the purge button,
-/// the start-on-login switch and the mountpoint chooser. Initial widget state is
-/// read once from config / systemd here (the refresh loop owns only the live
+/// the background-service switch and the mountpoint chooser. Initial widget
+/// state is read once from config here (the refresh loop owns only the live
 /// mount + cache-usage read-out), with `settings_suppress` set around the
 /// programmatic populate so the change handlers don't fire on it.
 pub(crate) fn wire_settings(
@@ -348,7 +315,7 @@ pub(crate) fn wire_settings(
 ) {
     let config = ui.dirs.load_config();
 
-    // Populate from persisted config + the systemd unit state, suppressed.
+    // Populate from persisted config, suppressed.
     ui.status.settings_suppress.set(true);
     ui.status
         .budget_row
@@ -356,7 +323,9 @@ pub(crate) fn wire_settings(
     ui.status
         .mountpoint_row
         .set_subtitle(&ui.dirs.resolved_mountpoint(&config).display().to_string());
-    ui.status.autostart_row.set_active(service::is_enabled());
+    ui.status
+        .background_service_row
+        .set_active(config.resolved_keep_service_running());
     ui.status.settings_suppress.set(false);
 
     // Cache budget: a user edit applies the new soft cap on the daemon (which
@@ -409,24 +378,97 @@ pub(crate) fn wire_settings(
         dialog.present();
     });
 
-    // Start on login: enable/disable the systemd unit without stopping a live
-    // mount (the user can disconnect separately).
-    let ui_auto = ui.clone();
-    ui.status.autostart_row.connect_active_notify(move |row| {
-        if ui_auto.status.settings_suppress.get() {
-            return;
-        }
-        if row.is_active() {
-            service::enable();
-        } else {
-            service::disable();
-        }
-    });
+    // Persist the lifecycle choice first, then apply the systemd policy on a
+    // worker. The switch is insensitive until systemctl finishes, preventing
+    // rapid toggles from racing enable/disable/start operations.
+    let ui_background = ui.clone();
+    ui.status
+        .background_service_row
+        .connect_active_notify(move |row| {
+            if ui_background.status.settings_suppress.get() {
+                return;
+            }
+
+            let keep_running = row.is_active();
+            let mut config = ui_background.dirs.load_config();
+            config.keep_service_running = Some(keep_running);
+            if let Err(error) = ui_background.dirs.save_config(&config) {
+                ui_background.status.settings_suppress.set(true);
+                row.set_active(!keep_running);
+                ui_background.status.settings_suppress.set(false);
+                toast_error(
+                    &ui_background,
+                    "Couldn't save background setting",
+                    &error.to_string(),
+                );
+                return;
+            }
+
+            row.set_sensitive(false);
+            ui_background.busy_begin();
+            let app_hold = hold_application();
+            let (tx, rx) = async_channel::bounded(1);
+            std::thread::spawn(move || {
+                let _ = tx.send_blocking(service::start_for_app(keep_running));
+            });
+
+            let ui = ui_background.clone();
+            let row = row.clone();
+            glib::spawn_future_local(async move {
+                let applied = rx.recv().await.unwrap_or(false);
+                ui.busy_end();
+                row.set_sensitive(true);
+                if applied {
+                    toast(
+                        &ui,
+                        if keep_running {
+                            "Drive will keep running in background"
+                        } else {
+                            "Drive will stop when the app closes"
+                        },
+                    );
+                } else {
+                    toast_error(
+                        &ui,
+                        "Couldn't update the background service",
+                        "The preference was saved and will be retried when the app next starts.",
+                    );
+                }
+                drop(app_hold);
+            });
+        });
 
     // Mountpoint: the chooser lives on the Locations page, next to every other
     // local path; this button is the way there.
     let ui_mp = ui.clone();
     locations_button.connect_clicked(move |_| ui_mp.stack.set_visible_child_name("locations"));
+}
+
+/// Start the daemon for a signed-in app without blocking GTK. The application
+/// hold closes the open/close race: if the window is immediately dismissed, the
+/// start policy finishes before the shutdown hook applies the matching stop
+/// policy.
+pub(crate) fn start_service_for_app(ui: &Rc<Ui>) {
+    if ui.session.borrow().is_none() {
+        return;
+    }
+    let keep_running = ui.dirs.load_config().resolved_keep_service_running();
+    let app_hold = hold_application();
+    let (tx, rx) = async_channel::bounded(1);
+    std::thread::spawn(move || {
+        let _ = tx.send_blocking(service::start_for_app(keep_running));
+    });
+    let ui = ui.clone();
+    glib::spawn_future_local(async move {
+        if !rx.recv().await.unwrap_or(false) {
+            toast_error(
+                &ui,
+                "Couldn't start the Drive service",
+                "Check the user service and try again from Files.",
+            );
+        }
+        drop(app_hold);
+    });
 }
 
 fn apply_cache_budget(ui: &Rc<Ui>, bytes: u64) {
@@ -620,7 +662,7 @@ pub(crate) fn refresh_quota(ui: &Rc<Ui>) {
         {
             ui.status.quota_checked_at.set(Some(Instant::now()));
             paint_account_quota(&ui, max_space, used_space);
-            ui.status.quota_group.set_visible(true);
+            ui.status.quota_row.set_visible(true);
         } else if ui.status.quota_checked_at.get().is_none() {
             // Match Dolphin: capacity information does not occupy the bar until
             // the backing observer (the Proton API here) has real figures.
@@ -632,7 +674,9 @@ pub(crate) fn refresh_quota(ui: &Rc<Ui>) {
 fn paint_account_quota(ui: &Rc<Ui>, max_space: i64, used_space: i64) {
     let (fraction, text) = quota_display(max_space, used_space);
     ui.status.quota_bar.set_fraction(fraction);
-    ui.status.quota_label.set_text(&text);
+    ui.status
+        .quota_label
+        .set_text(&format!("Account storage · {text}"));
     if let Some((fraction, free_text, tooltip)) = quota_status_display(max_space, used_space) {
         ui.browser.quota.set_fraction(fraction);
         ui.browser.quota.set_tooltip_text(Some(&tooltip));
@@ -864,11 +908,10 @@ pub(crate) fn transfer_line(t: &TransferItem) -> ActivityLine {
     }
 }
 
-/// Fetch mount status + cache stats from the daemon on a worker thread and repaint
-/// the mount line, cache bar and pin list on the reply. The daemon owns the cache
-/// stats now (`used`/`budget`/`pins` ride along on [`Response::Status`]), so the
-/// GUI never opens the on-disk cache itself. Skipped while a fetch is in flight so
-/// the tick can't stack threads on a stalled daemon.
+/// Fetch mount status + bounded cache stats from the daemon on a worker thread
+/// and repaint the connection and cache rows. Full offline-copy paths are never
+/// part of this two-second poll; they are available through the explicit
+/// `ListPins` request used by Quick Search and the CLI.
 pub(crate) fn refresh_status(ui: &Rc<Ui>) {
     if ui.status.status_inflight.get() {
         return;
@@ -882,9 +925,9 @@ pub(crate) fn refresh_status(ui: &Rc<Ui>) {
         match result {
             Ok(Ok(Response::Status {
                 mountpoint,
+                pinned,
                 used,
                 budget,
-                pins,
                 online,
                 pending_uploads,
                 pending_changes,
@@ -909,116 +952,29 @@ pub(crate) fn refresh_status(ui: &Rc<Ui>) {
                     (used as f64 / budget as f64).min(1.0)
                 };
                 ui.status.cache_bar.set_fraction(fraction);
+                let offline = match pinned {
+                    1 => "1 offline item".to_string(),
+                    count => format!("{count} offline items"),
+                };
                 ui.status.cache_label.set_text(&if budget == 0 {
-                    format!("{} used — no cache limit", human_bytes(used))
+                    format!("{offline} · {} used · no cache limit", human_bytes(used))
                 } else {
-                    format!("{} of {} used", human_bytes(used), human_bytes(budget))
+                    format!(
+                        "{offline} · {} of {} used",
+                        human_bytes(used),
+                        human_bytes(budget)
+                    )
                 });
-                repaint_pins(&ui, &pins, true);
             }
-            // Daemon unreachable (still starting, or down): report not-mounted and
-            // grey out the unpin buttons in place, but leave the last-known pin
-            // rows and cache read-out so the page doesn't flicker on a blip.
+            // Daemon unreachable (still starting, or down): report not-mounted
+            // but leave the last-known cache read-out so the page does not
+            // flicker on a transient failure.
             _ => {
                 set_mounted(&ui, false);
                 ui.status.mount_row.set_subtitle("Not connected");
-                for r in ui.status.pin_rows.borrow().iter() {
-                    if let Some(b) = &r.unpin {
-                        b.set_sensitive(false);
-                    }
-                }
             }
         }
     });
-}
-
-/// Render the pins group from `pins`, with the unpin buttons enabled only while a
-/// mount daemon is running (`mounted`). Diffs against the last batch by path: when
-/// the set is unchanged (the common case on the 2s tick) it only flips the unpin
-/// buttons' `sensitive` flag, avoiding the rebuild that used to flicker the list
-/// and drop scroll/selection every tick.
-pub(crate) fn repaint_pins(ui: &Rc<Ui>, pins: &[pdfs_core::cache::Pin], mounted: bool) {
-    let desired: Vec<String> = pins.iter().map(|p| p.path.clone()).collect();
-    if ui.status.pins_state.borrow().as_ref() == Some(&desired) {
-        for r in ui.status.pin_rows.borrow().iter() {
-            if let Some(b) = &r.unpin {
-                b.set_sensitive(mounted);
-            }
-        }
-        return;
-    }
-
-    for pr in ui.status.pin_rows.borrow_mut().drain(..) {
-        ui.status.pins_group.remove(&pr.row);
-    }
-    *ui.status.pins_state.borrow_mut() = Some(desired);
-
-    if pins.is_empty() {
-        let row = settings_row(
-            "No offline copies",
-            Some("Choose “Offline copy” from a file’s context menu."),
-        );
-        ui.status.pins_group.add(&row);
-        ui.status
-            .pin_rows
-            .borrow_mut()
-            .push(PinRow { row, unpin: None });
-        return;
-    }
-
-    for pin in pins {
-        let name = Path::new(&pin.path)
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or(&pin.path)
-            .to_string();
-        let row = settings_row(&name, Some(&pin.path));
-        let icon = gtk4::Image::from_icon_name("emblem-documents-symbolic");
-        row.add_prefix(&icon);
-
-        let unpin = settings_icon_button("user-trash-symbolic", "Remove offline copy", None);
-        unpin.set_sensitive(mounted);
-        let ui_btn = ui.clone();
-        let path = pin.path.clone();
-        unpin.connect_clicked(move |button| {
-            button.set_sensitive(false);
-            ui_btn.busy_begin();
-            let rx = spawn_request(
-                ui_btn.dirs.control_socket(),
-                Request::Unpin { path: path.clone() },
-            );
-            let button = button.downgrade();
-            let ui = ui_btn.clone();
-            glib::spawn_future_local(async move {
-                let result = rx.recv().await;
-                ui.busy_end();
-                if let Some(button) = button.upgrade() {
-                    button.set_sensitive(*ui.mounted.borrow());
-                }
-                match result {
-                    Ok(Ok(Response::Error { message, kind })) => {
-                        toast_failure(&ui, "Couldn't remove offline copy", &message, kind)
-                    }
-                    Ok(Ok(_)) => {
-                        toast(&ui, "Offline copy removed");
-                        refresh(&ui);
-                    }
-                    _ => toast_error(
-                        &ui,
-                        "Couldn't remove offline copy",
-                        "The mount service didn't respond.",
-                    ),
-                }
-            });
-        });
-        row.add_suffix(&unpin);
-
-        ui.status.pins_group.add(&row);
-        ui.status.pin_rows.borrow_mut().push(PinRow {
-            row,
-            unpin: Some(unpin),
-        });
-    }
 }
 
 #[cfg(test)]

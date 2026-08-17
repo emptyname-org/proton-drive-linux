@@ -1293,9 +1293,9 @@ pub fn pending_summary(uploads: u64, changes: u64) -> Option<String> {
 /// The daemon's reply to a [`Request`].
 #[derive(Serialize, Deserialize, Debug)]
 pub enum Response {
-    /// Current mount status. Carries the cache stats the daemon already holds
-    /// (`used`/`budget` bytes and the pin list) so a front-end never has to open
-    /// the on-disk cache itself on its UI thread.
+    /// Current mount status. Carries bounded cache statistics the daemon already
+    /// holds so a front-end never has to open the on-disk cache itself on its UI
+    /// thread. Full pin paths are available separately through [`Request::ListPins`].
     Status {
         username: String,
         mountpoint: String,
@@ -1304,7 +1304,9 @@ pub enum Response {
         used: u64,
         /// Configured soft byte cap (`0` = unlimited).
         budget: u64,
-        /// The pin registry.
+        /// Legacy compatibility field. New daemons leave this empty so a status
+        /// poll cannot grow with the number of offline copies; use
+        /// [`Request::ListPins`] for an explicit listing.
         pins: Vec<Pin>,
         /// False when the daemon is serving the cached tree because the API is
         /// unreachable (offline.md Phase 1). Cached and pinned content still

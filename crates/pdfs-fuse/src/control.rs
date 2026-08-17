@@ -180,7 +180,6 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
     };
     let response = match serde_json::from_str::<CtlRequest>(line.trim()) {
         Ok(CtlRequest::Status) => {
-            let pins = core.cache.list_pins();
             let queued = core.db.pending_op_counts().unwrap_or_default();
             let staging = core.cache.staging_usage();
             CtlResponse::Status {
@@ -191,10 +190,13 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
                 staged_oldest_secs: staging.oldest_secs,
                 username: username.to_string(),
                 mountpoint: mountpoint.display().to_string(),
-                pinned: pins.len(),
+                pinned: core.cache.pin_count(),
                 used: core.cache.usage(),
                 budget: core.cache.budget(),
-                pins,
+                // Kept as an empty compatibility field for older wire readers.
+                // Full pin paths are intentionally returned only by ListPins;
+                // status is polled every two seconds and must remain bounded.
+                pins: Vec::new(),
                 online: core.online.load(Ordering::Relaxed),
                 pending_uploads: queued.uploads.max(0) as u64,
                 pending_changes: queued.changes.max(0) as u64,

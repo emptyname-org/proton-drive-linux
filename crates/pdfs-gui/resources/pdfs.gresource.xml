@@ -6,5 +6,6 @@
   <gresource prefix="/de/nils/protondrivelinux/icons">
     <file preprocess="xml-stripblanks">scalable/actions/pdfs-cloud-upload-symbolic.svg</file>
     <file preprocess="xml-stripblanks">scalable/actions/pdfs-folder-upload-symbolic.svg</file>
+    <file preprocess="xml-stripblanks">scalable/actions/pdfs-build-thumbnails-symbolic.svg</file>
   </gresource>
 </gresources>

@@ -162,7 +162,7 @@ pub(crate) fn build_browser_page() -> (gtk4::Widget, BrowserWidgets) {
         .build();
     upload_folder.add_css_class("flat");
     let build_thumbnails = gtk4::Button::builder()
-        .icon_name("image-x-generic-symbolic")
+        .icon_name("pdfs-build-thumbnails-symbolic")
         .tooltip_text("Build thumbnails in this folder and its subfolders")
         .valign(gtk4::Align::Center)
         .build();

@@ -20,6 +20,15 @@ pub struct PinRow {
 }
 
 impl Db {
+    /// Number of directly pinned files/folders. Unlike [`Self::pin_list`], this
+    /// is cheap enough for the periodic status poll and does not materialise an
+    /// unbounded path list.
+    pub fn pin_count(&self) -> Result<usize> {
+        let conn = self.read();
+        let count: i64 = conn.query_row("SELECT COUNT(*) FROM pins", [], |row| row.get(0))?;
+        Ok(count.max(0) as usize)
+    }
+
     pub fn pin_add(&self, uid: &str, path: &str, recursive: bool) -> Result<()> {
         let conn = self.conn.lock();
         conn.execute(

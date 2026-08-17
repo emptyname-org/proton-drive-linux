@@ -19,11 +19,21 @@ previews), and reproducible Debian packaging. GitHub Releases contain an
 `amd64` `.deb` package only; the Arch and Fedora files remain available for
 people who want to build locally.
 
+## Why this fork?
+
+The upstream project is the foundation of this client. This fork exists to
+explore and share a more desktop-focused Linux experience: native controls,
+responsive background work, image and RAW thumbnails, explicit control over
+the mount service's lifetime, and a tested Debian package. The changes are kept
+public so they can be reviewed, reused, or proposed upstream independently;
+this repository does not imply a promise of support or long-term maintenance.
+
 ## Features
 
 - **Files-on-Demand (FUSE)**: Mount your Proton Drive as a virtual filesystem where files are downloaded only when opened, utilizing smart block-level caching and disk-backed writes.
 - **Command-Line Interface (CLI)**: Manage your drive, authenticate, and monitor sync status directly from the terminal.
 - **Non-Blocking GTK4 Desktop App**: Browse files, manage pins, configure options, and monitor active transfers through a modern, native GUI with a fully non-blocking asynchronous main loop.
+- **Background Service Control**: Keep mounts, sync, tray actions, and Drive search running after the app closes, or scope the mount service to the app session from Settings.
 - **Shared Links & Invites**: Browse files shared with you by other users, and view/manage your own public shared links directly in the GUI.
 - **Local Backup (Computers)**: Sync and back up local directories (like Downloads, Documents, Pictures, etc.) directly to your Proton Drive account.
 - **Locations**: One page (and `pdfs locations`) listing every place Proton Drive occupies on this machine — the main mount plus each backed-up folder — with its mode, sync state, and whether it is read-only. Switching a folder between a full local copy and on-demand happens here.

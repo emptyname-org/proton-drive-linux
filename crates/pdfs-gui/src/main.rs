@@ -151,6 +151,15 @@ fn open_manager() {
     }
 }
 
+/// Connect from the tray without silently changing the lifecycle preference the
+/// user selected in the desktop app.
+fn connect_service() {
+    let keep_running = AppDirs::new()
+        .map(|dirs| dirs.load_config().resolved_keep_service_running())
+        .unwrap_or(true);
+    service::start_for_app(keep_running);
+}
+
 impl Tray for DriveTray {
     fn id(&self) -> String {
         "io.narl.proton-drive-linux".into()
@@ -223,12 +232,13 @@ impl Tray for DriveTray {
                 .into(),
             );
         } else {
-            // Enable+start the service so it mounts now and on future logins.
+            // Start under the saved lifecycle policy; a tray click must not
+            // silently turn app-scoped mode back into an always-on service.
             items.push(
                 StandardItem {
                     label: "Connect".into(),
                     activate: Box::new(|this: &mut Self| {
-                        service::enable_start();
+                        connect_service();
                         this.state.line = "Connecting…".into();
                     }),
                     ..Default::default()

@@ -2731,8 +2731,10 @@ fn cache_index_rebuild_replaces_every_row() {
 #[test]
 fn pin_add_list_remove_roundtrip() {
     let db = Db::open_in_memory().unwrap();
+    assert_eq!(db.pin_count().unwrap(), 0);
     db.pin_add("vol~a", "docs/a.txt", false).unwrap();
     db.pin_add("vol~d", "docs", true).unwrap();
+    assert_eq!(db.pin_count().unwrap(), 2);
     let list = db.pin_list().unwrap();
     assert_eq!(list.len(), 2);
     // No `nodes` row for either pin, so the kind is unknown rather than guessed

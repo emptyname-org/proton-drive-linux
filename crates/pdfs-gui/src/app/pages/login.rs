@@ -147,8 +147,9 @@ pub(crate) fn wire_login(ui: &Rc<Ui>) {
                     ui.login.password.set_text("");
                     // Cache the new identity so `refresh` never hits the keyring.
                     *ui.session.borrow_mut() = auth::load().ok();
-                    // Enable+start the mount service now that we have a session.
-                    service::enable_start();
+                    // Apply the user's background lifecycle preference now that
+                    // the daemon has a session it can mount with.
+                    start_service_for_app(&ui);
                     refresh(&ui);
                 }
                 Err(e) => ui
