@@ -88,7 +88,7 @@ pub fn is_enabled() -> bool {
 
 /// Enable the service so it auto-starts on future logins, without necessarily
 /// starting it now beyond what `enable` does. Used by the Settings "Start on
-/// login" switch; pairs with [`disable`](disable).
+/// login" switch; pairs with [`disable`].
 pub fn enable() -> bool {
     systemctl(&["enable"])
 }

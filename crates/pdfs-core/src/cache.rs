@@ -1332,7 +1332,7 @@ impl ContentCache {
     ///
     /// Asked for on every idle drain pass, so the usual answer — a directory
     /// that has been empty since the last clean shutdown — costs an atomic load
-    /// rather than a `read_dir` (see [`recovery_pending`](Self::recovery_pending)).
+    /// rather than a `read_dir` (see the `recovery_pending` flag).
     pub fn recovered_writes(&self) -> Vec<(PathBuf, StagedWrite)> {
         if !self.recovery_pending.load(Ordering::Relaxed) {
             return Vec::new();
@@ -1894,7 +1894,7 @@ impl ContentCache {
 
     /// Configured soft byte cap (`0` = unlimited), for display alongside
     /// [`usage`](Self::usage). This is the whole-cache figure; internally it is
-    /// divided between the pools (see [`SPLIT_BLOB`]), but the user set one
+    /// divided between the pools (see `SPLIT_BLOB`), but the user set one
     /// number and gets that number.
     pub fn budget(&self) -> u64 {
         self.cap()

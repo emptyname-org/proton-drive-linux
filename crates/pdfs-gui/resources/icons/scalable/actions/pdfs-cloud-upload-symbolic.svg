@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16">
+  <!-- Cloud-upload action. A single symbolic fill lets GTK recolour the icon
+       with the surrounding control in light, dark, disabled and selected states. -->
+  <path fill="#222222" fill-rule="evenodd" d="M 6.5,2 C 4.86,2 3.47,3.05 2.95,4.52 C 1.24,4.99 0,6.55 0,8.4 C 0,10.61 1.79,12.4 4,12.4 H 5 V 10.4 H 4 C 2.9,10.4 2,9.5 2,8.4 C 2,7.3 2.9,6.4 4,6.4 H 4.75 L 4.94,5.68 C 5.12,4.71 5.76,4 6.5,4 C 7.26,4 7.9,4.56 8.12,5.36 L 8.37,6.25 L 9.28,6.08 C 9.47,6.04 9.66,6.02 9.85,6.02 C 11.6,6.02 13,7.42 13,9.17 C 13,9.85 12.78,10.49 12.42,11 H 14.67 C 14.88,10.42 15,9.81 15,9.17 C 15,6.33 12.77,4.02 9.96,4.02 C 9.2,2.78 7.95,2 6.5,2 Z M 8,7 L 4.5,10.5 H 7 V 15 H 9 V 10.5 H 11.5 Z"/>
+</svg>

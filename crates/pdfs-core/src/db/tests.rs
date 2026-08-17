@@ -7,12 +7,20 @@ use proton_drive_rs::proton_sdk::ids::NodeUid;
 use proton_drive_rs::{Node, NodeKind};
 use serde_json::json;
 
+fn remove_test_database(path: &std::path::Path) {
+    for suffix in ["", "-wal", "-shm", ".lock"] {
+        let mut candidate = path.as_os_str().to_owned();
+        candidate.push(suffix);
+        let _ = std::fs::remove_file(std::path::PathBuf::from(candidate));
+    }
+}
+
 /// `Db::open` applies the pragmas that `open_in_memory` skips, so the WAL
 /// settings can only be checked against a real file.
 #[test]
 fn open_bounds_the_wal_size() {
     let path = std::env::temp_dir().join(format!("pdfs-db-wal-{}.db", std::process::id()));
-    let _ = std::fs::remove_file(&path);
+    remove_test_database(&path);
     let db = Db::open(&path).unwrap();
     let conn = db.conn.lock();
 
@@ -36,7 +44,7 @@ fn open_bounds_the_wal_size() {
 
     drop(conn);
     drop(db);
-    let _ = std::fs::remove_file(&path);
+    remove_test_database(&path);
 }
 
 /// A second connection to the same file — a hand-started `pdfs mount` alongside
@@ -53,7 +61,7 @@ fn a_write_waits_for_a_competing_writer() {
     use std::time::Duration;
 
     let path = std::env::temp_dir().join(format!("pdfs-db-busy-{}.db", std::process::id()));
-    let _ = std::fs::remove_file(&path);
+    remove_test_database(&path);
     let db = Db::open(&path).unwrap();
 
     // A second process's connection takes an exclusive write lock and holds it
@@ -79,7 +87,7 @@ fn a_write_waits_for_a_competing_writer() {
     assert_eq!(db.state_i64("busy_probe").unwrap(), Some(7));
 
     drop(db);
-    let _ = std::fs::remove_file(&path);
+    remove_test_database(&path);
 }
 use proton_drive_rs::proton_sdk::ids::{LinkId, VolumeId};
 
@@ -864,7 +872,7 @@ fn shared_root_pinned_name_survives_database_reopen() {
         Some("Shared with me (Proton 4)")
     );
     drop(reopened);
-    let _ = std::fs::remove_file(path);
+    remove_test_database(&path);
 }
 
 /// Two writers on one database is the failure mode the single-instance lock
@@ -887,8 +895,7 @@ fn a_second_writer_is_refused_while_the_first_holds_the_database() {
     // to be cleaned up for the next daemon to start.
     Db::open(&path).expect("reopen after the first handle is dropped");
 
-    let _ = std::fs::remove_file(&path);
-    let _ = std::fs::remove_file(path.with_extension("db.lock"));
+    remove_test_database(&path);
 }
 
 /// `cache.db` is derived state — every row can be re-fetched or re-scanned — so
@@ -901,6 +908,7 @@ fn a_corrupt_database_is_moved_aside_and_rebuilt() {
         std::process::id(),
         now_test_id()
     ));
+    remove_test_database(&path);
     std::fs::write(&path, b"this is not an SQLite database").unwrap();
 
     let db = Db::open(&path).unwrap();
@@ -924,8 +932,7 @@ fn a_corrupt_database_is_moved_aside_and_rebuilt() {
     for name in quarantined {
         let _ = std::fs::remove_file(dir.join(name));
     }
-    let _ = std::fs::remove_file(&path);
-    let _ = std::fs::remove_file(path.with_extension("db.lock"));
+    remove_test_database(&path);
 }
 
 fn local(path: &str, name: &str, is_dir: bool) -> LocalEntry {
@@ -1530,7 +1537,7 @@ fn migration_v17_adds_share_access_to_a_v16_fixture() {
     );
 
     drop(db);
-    let _ = std::fs::remove_file(path);
+    remove_test_database(&path);
 }
 
 #[test]
@@ -1634,7 +1641,7 @@ fn migration_v18_projects_v17_sync_folders_and_cascades_deletes() {
     );
 
     drop(db);
-    let _ = std::fs::remove_file(path);
+    remove_test_database(&path);
 }
 
 #[test]
@@ -1776,7 +1783,7 @@ fn refuses_a_schema_newer_than_the_running_build() {
         .unwrap();
     assert_eq!(version, "9999", "failed open must not rewrite the database");
     drop(conn);
-    let _ = std::fs::remove_file(path);
+    remove_test_database(&path);
 }
 
 /// A queued write whose baseline is restamped must keep everything else.
@@ -3606,8 +3613,8 @@ fn migration_v25_backfills_paths_for_an_existing_tree() {
     assert_eq!(stored_path(&db, "orphan").as_deref(), Some("Work"));
     assert_eq!(stored_path(&db, "f2").as_deref(), Some("Work/notes.txt"));
 
-    let _ = std::fs::remove_file(&path);
-    let _ = std::fs::remove_file(format!("{}.lock", path.display()));
+    drop(db);
+    remove_test_database(&path);
 }
 
 /// A queue carried over from V26 keeps its rows, and every one of them starts
@@ -3787,8 +3794,7 @@ fn a_read_does_not_wait_for_the_write_connection() {
     );
 
     drop(db);
-    let _ = std::fs::remove_file(&path);
-    let _ = std::fs::remove_file(format!("{}.lock", path.display()));
+    remove_test_database(&path);
 }
 
 /// §5: the drain is several workers over one queue, and the claim column is the

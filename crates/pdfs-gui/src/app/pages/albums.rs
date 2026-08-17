@@ -219,7 +219,7 @@ pub(crate) fn close_album(ui: &Rc<Ui>) {
     if ui.gallery.album.borrow_mut().take().is_none() {
         return;
     }
-    ui.gallery.title.set_label("Gallery");
+    ui.gallery.title.set_label("Photos");
     ui.gallery.filters.set_visible(true);
     ui.gallery.view_switch.set_visible(true);
     ui.gallery.upload.set_visible(true);

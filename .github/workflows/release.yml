@@ -31,6 +31,7 @@ jobs:
             libsecret-1-dev \
             libdbus-1-dev \
             desktop-file-utils \
+            libimage-exiftool-perl \
             rpm
 
       - name: Set up Rust
@@ -77,62 +78,9 @@ jobs:
           echo "VERSION=$VERSION" >> $GITHUB_ENV
           echo "Building version: $VERSION"
 
-      - name: Package raw binaries (.tar.gz)
+      - name: Package raw binaries and Debian package
         run: |
-          mkdir -p dist/binaries
-          cp target/release/pdfs dist/binaries/
-          cp target/release/pdfs-tray dist/binaries/
-          cp target/release/pdfs-app dist/binaries/
-          cp target/release/pdfs-prompt dist/binaries/
-          
-          # Create tarball
-          tar -czf proton-drive-linux-${{ env.VERSION }}-x86_64.tar.gz -C dist/binaries .
-
-      - name: Package Debian package (.deb)
-        run: |
-          mkdir -p deb/DEBIAN
-          mkdir -p deb/usr/bin
-          mkdir -p deb/usr/share/applications
-          mkdir -p deb/usr/share/icons/hicolor/scalable/apps
-          mkdir -p deb/usr/share/licenses/proton-drive-linux
-          mkdir -p deb/usr/lib/systemd/user
-          mkdir -p deb/etc/xdg/autostart
-
-          # Copy binaries
-          cp target/release/pdfs deb/usr/bin/
-          cp target/release/pdfs-tray deb/usr/bin/
-          cp target/release/pdfs-app deb/usr/bin/
-          cp target/release/pdfs-prompt deb/usr/bin/
-
-          # Copy desktop integration files
-          cp packaging/io.narl.proton-drive-linux.desktop deb/usr/share/applications/
-          cp packaging/io.narl.proton-drive-linux-tray.desktop deb/etc/xdg/autostart/
-          cp packaging/io.narl.proton-drive-linux.svg deb/usr/share/icons/hicolor/scalable/apps/
-          cp packaging/proton-drive.service deb/usr/lib/systemd/user/
-          cp LICENSE deb/usr/share/licenses/proton-drive-linux/
-
-          # Calculate Installed-Size in KB for the control file
-          INSTALLED_SIZE=$(du -sk deb | cut -f1)
-
-          # Write DEBIAN/control file
-          cat <<EOF > deb/DEBIAN/control
-          Package: proton-drive-linux
-          Version: ${{ env.VERSION }}
-          Section: utils
-          Priority: optional
-          Architecture: amd64
-          Maintainer: Nils Pukropp <contact@narl.io>
-          Depends: fuse3, libgtk-4-1 (>= 4.12.0), libadwaita-1-0 (>= 1.5.0), libsecret-1-0, libwebkitgtk-6.0-4
-          Installed-Size: ${INSTALLED_SIZE}
-          Description: Proton Drive client for Linux
-           Proton Drive client for Linux featuring:
-           - FUSE files-on-demand mount
-           - Command-line interface (CLI)
-           - GTK4 system tray, desktop application, and search launcher
-          EOF
-
-          # Build Debian package
-          dpkg-deb --build deb proton-drive-linux_${{ env.VERSION }}_amd64.deb
+          packaging/package-release.sh "${{ env.VERSION }}" "$PWD/dist"
 
       - name: Package Fedora package (.rpm)
         run: |
@@ -152,8 +100,8 @@ jobs:
             --define "_dbpath $PWD/rpmbuild/db" \
             packaging/proton-drive-linux.spec
             
-          # Copy built RPM to root directory
-          cp rpmbuild/RPMS/x86_64/*.rpm .
+          # Keep every release artifact in one directory.
+          cp rpmbuild/RPMS/x86_64/*.rpm dist/
 
       - name: Sign Fedora package (.rpm)
         env:
@@ -170,20 +118,21 @@ jobs:
           %__gpg_sign_cmd %{__gpg} gpg --batch --verbose --no-armor --pinentry-mode loopback --passphrase %{_gpg_passphrase} --no-secmem-warning -u "%{_gpg_name}" -sbo %{__signature_filename} --digest-algo sha256 %{__plaintext_filename}
           EOF
           
-            rpm --addsign --define "_gpg_passphrase $GPG_PASSPHRASE" *.rpm
+            rpm --addsign --define "_gpg_passphrase $GPG_PASSPHRASE" dist/*.rpm
           else
             echo "Skipping RPM signing: GPG_PRIVATE_KEY or GPG_KEY_NAME secret is not set."
           fi
 
+      - name: Write release checksums
+        run: |
+          cd dist
+          sha256sum ./*.deb ./*.tar.gz ./*.rpm > SHA256SUMS
 
       - name: Upload Workflow Artifacts
         uses: actions/upload-artifact@v4
         with:
           name: proton-drive-linux-builds
-          path: |
-            *.deb
-            *.tar.gz
-            *.rpm
+          path: dist/
           if-no-files-found: error
 
       - name: Create GitHub Release
@@ -191,9 +140,10 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            *.deb
-            *.tar.gz
-            *.rpm
+            dist/*.deb
+            dist/*.tar.gz
+            dist/*.rpm
+            dist/SHA256SUMS
           draft: false
           prerelease: false
         env:

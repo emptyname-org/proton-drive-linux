@@ -441,13 +441,9 @@ pub(crate) fn sync_progress_label(p: &SyncProgress) -> String {
 /// Pick a local folder and hand it to the daemon to sync to this device.
 pub(crate) fn prompt_add_sync_folder(ui: &Rc<Ui>) {
     let win = ui_window(ui);
-    let dialog = gtk4::FileDialog::builder()
-        .title("Add Folder to Sync")
-        .build();
     let ui = ui.clone();
-    dialog.select_folder(win.as_ref(), gio::Cancellable::NONE, move |res| {
-        let Ok(folder) = res else { return };
-        let Some(local_path) = folder.path().and_then(|p| p.to_str().map(str::to_string)) else {
+    choose_folder(win.as_ref(), "Add Folder to Sync", move |path| {
+        let Some(local_path) = path.to_str().map(str::to_string) else {
             return;
         };
         let rx = spawn_request(
@@ -545,7 +541,7 @@ fn show_restore_picker(ui: &Rc<Ui>, items: Vec<RestorableFolder>) {
         .max_content_height(420)
         .child(&group)
         .build();
-    let dialog = adw::AlertDialog::builder()
+    let dialog = adw::MessageDialog::builder()
         .heading("Restore folders")
         .body("These folders are backed up under this computer in Proton Drive.")
         .extra_child(&scroll)
@@ -582,7 +578,8 @@ fn show_restore_picker(ui: &Rc<Ui>, items: Vec<RestorableFolder>) {
             "Couldn't restore folders",
         );
     });
-    dialog.present(win.as_ref());
+    dialog.set_transient_for(win.as_ref());
+    dialog.present();
 }
 
 /// Flip a synced folder between `mirror` and `ondemand`. Reloads after so the
@@ -637,21 +634,26 @@ pub(crate) fn prompt_remove_sync_folder(ui: &Rc<Ui>, id: i64, path: &str, ondema
              being synced. Choose whether to also delete the copy in Proton Drive."
         )
     };
-    let dialog = adw::AlertDialog::builder()
+    let dialog = adw::MessageDialog::builder()
         .heading("Stop syncing folder")
         .body(body)
         .build();
     let group = adw::PreferencesGroup::new();
-    let delete_remote = adw::SwitchRow::builder()
+    let delete_setting_row = adw::ActionRow::builder()
         .title("Also delete from Proton Drive")
         .subtitle(if ondemand {
             "Deletes the only copy of these files."
         } else {
             "The local copy is unaffected."
         })
-        .active(false)
         .build();
-    group.add(&delete_remote);
+    let delete_remote = gtk4::Switch::builder()
+        .active(false)
+        .valign(gtk4::Align::Center)
+        .build();
+    delete_setting_row.add_suffix(&delete_remote);
+    delete_setting_row.set_activatable_widget(Some(&delete_remote));
+    group.add(&delete_setting_row);
     dialog.set_extra_child(Some(&group));
     dialog.add_response("cancel", "Cancel");
     dialog.add_response("remove", "Stop Syncing");
@@ -672,13 +674,14 @@ pub(crate) fn prompt_remove_sync_folder(ui: &Rc<Ui>, id: i64, path: &str, ondema
             );
         }
     });
-    dialog.present(win.as_ref());
+    dialog.set_transient_for(win.as_ref());
+    dialog.present();
 }
 
 /// Prompt for a new device name and rename it.
 pub(crate) fn prompt_rename_device(ui: &Rc<Ui>, uid: &str, current: &str) {
     let win = ui_window(ui);
-    let dialog = adw::AlertDialog::builder()
+    let dialog = adw::MessageDialog::builder()
         .heading("Rename device")
         .body(format!("Rename “{current}”."))
         .build();
@@ -716,13 +719,14 @@ pub(crate) fn prompt_rename_device(ui: &Rc<Ui>, uid: &str, current: &str) {
             "Couldn't rename the device",
         );
     });
-    dialog.present(win.as_ref());
+    dialog.set_transient_for(win.as_ref());
+    dialog.present();
 }
 
 /// Confirm, then remove (deregister) a device.
 pub(crate) fn prompt_remove_device(ui: &Rc<Ui>, uid: &str, name: &str) {
     let win = ui_window(ui);
-    let dialog = adw::AlertDialog::builder()
+    let dialog = adw::MessageDialog::builder()
         .heading("Remove computer")
         .body(format!(
             "Remove “{name}” from this account?\n\nEverything it backed up to Proton Drive is \
@@ -747,7 +751,8 @@ pub(crate) fn prompt_remove_device(ui: &Rc<Ui>, uid: &str, name: &str) {
             );
         }
     });
-    dialog.present(win.as_ref());
+    dialog.set_transient_for(win.as_ref());
+    dialog.present();
 }
 
 /// Confirm, then adopt another device as this machine's identity.
@@ -759,7 +764,7 @@ pub(crate) fn prompt_remove_device(ui: &Rc<Ui>, uid: &str, name: &str) {
 /// their folders diverge.
 pub(crate) fn prompt_adopt_device(ui: &Rc<Ui>, uid: &str, name: &str) {
     let win = ui_window(ui);
-    let dialog = adw::AlertDialog::builder()
+    let dialog = adw::MessageDialog::builder()
         .heading("Use this computer's identity")
         .body(format!(
             "Treat this machine as “{name}”?\n\nNew synced folders are created under that \
@@ -787,7 +792,8 @@ pub(crate) fn prompt_adopt_device(ui: &Rc<Ui>, uid: &str, name: &str) {
             );
         }
     });
-    dialog.present(win.as_ref());
+    dialog.set_transient_for(win.as_ref());
+    dialog.present();
 }
 
 /// Run a mutation raised from the Devices page and reload the page on success.

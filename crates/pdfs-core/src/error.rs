@@ -72,7 +72,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// [`ErrorKind`] the front-end actually branches on.
 ///
 /// This is what the daemon's request-serving methods return, as opposed to
-/// [`Error`] above, which is the plumbing error of the `pdfs-core` layer. The
+/// [`enum@Error`] above, which is the plumbing error of the `pdfs-core` layer. The
 /// two meet at the `From` impls below: a `rusqlite` or `io` failure carries no
 /// information a user can act on, so it arrives here as
 /// [`ErrorKind::Internal`] and keeps its text only for the log.

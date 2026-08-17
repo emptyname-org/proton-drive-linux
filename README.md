@@ -14,7 +14,8 @@ A fast, unofficial Proton Drive client for Linux. This client features an advanc
 - **Unified Search Launcher (HUD)**: A resident Google Drive-style launcher (`pdfs-prompt`) that searches Proton Drive and local files together, ranks the best matches, tolerates abbreviations and typos, and is ideal for a system-wide hotkey.
 - **Secure Credential Storage**: Integrates with the system Secret Service (GNOME Keyring, KWallet, etc.) with smart in-memory credential caching to avoid UI thread blockages.
 - **Proton Photos Support**: Access your Proton Photos timeline, view thumbnails, and download backed-up media natively (available in the GUI as a navigation tab and via the CLI).
-- **File Version History**: Every revision Proton Drive still holds for a file, from the browser's details pane (**Versions**) or `pdfs versions list|restore|save|rm`. Restoring is server-side — no re-upload — and an old version can be written out to a local file without touching the live one.
+- **Drive Thumbnails**: Build and cache thumbnails for ordinary images and camera RAW files while browsing Drive. RAW previews are extracted locally with ExifTool; the original files are never modified.
+- **File Version History**: Every revision Proton Drive still holds for a file, from **Versions…** in the file's context menu or `pdfs versions list|restore|save|rm`. Restoring is server-side — no re-upload — and an old version can be written out to a local file without touching the live one.
 - **Photo Favourites**: Star a photo in the lightbox, filter the gallery to favourites, or use `pdfs favorite <uid>` / `pdfs photos --favorites`.
 - **Photo Albums**: Browse your albums — including the ones shared with you — from the Albums view of the Photos page, or with `pdfs albums` / `pdfs album <uid>`. Album contents open in the same gallery as the timeline.
 - **Human Verification (CAPTCHA) Recovery**: Detects sign-in gates (VPN/new IP challenges) and launches an embedded `WebKitWebView` dialog to safely complete the challenge, transparently retrying authentication with the earned token.
@@ -270,19 +271,21 @@ sudo apt-get install -y \
   libadwaita-1-dev \
   libwebkitgtk-6.0-dev \
   libsecret-1-dev \
-  libdbus-1-dev
+  libdbus-1-dev \
+  libimage-exiftool-perl
 ```
 
 ### Arch Linux
 ```bash
-sudo pacman -S --needed pkgconf fuse3 gtk4 libadwaita libsecret dbus webkitgtk-6.0
+sudo pacman -S --needed pkgconf fuse3 gtk4 libadwaita libsecret dbus webkitgtk-6.0 perl-image-exiftool
 ```
 
 ### Fedora (44+)
 ```bash
 sudo dnf install -y \
   pkgconf-pkg-config fuse3-devel gtk4-devel libadwaita-devel \
-  webkitgtk6.0-devel libsecret-devel dbus-devel glib2-devel cargo rust
+  webkitgtk6.0-devel libsecret-devel dbus-devel glib2-devel cargo rust \
+  perl-Image-ExifTool
 ```
 
 Runtime extras (pick your desktop):

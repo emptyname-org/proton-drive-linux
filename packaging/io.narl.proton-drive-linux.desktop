@@ -9,4 +9,3 @@ Terminal=false
 Categories=Network;FileTransfer;GTK;
 Keywords=proton;drive;cloud;sync;storage;
 StartupNotify=true
-SingleMainWindow=true

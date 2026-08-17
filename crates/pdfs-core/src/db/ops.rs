@@ -67,7 +67,7 @@ pub fn op_supersedes(kind: &str) -> bool {
 }
 
 /// The volume id given to a node that exists only on this machine, so far. A
-/// real [`NodeUid`] is `{volume}~{link}`, so a placeholder is `local~<uuid>` and
+/// real `NodeUid` is `{volume}~{link}`, so a placeholder is `local~<uuid>` and
 /// round-trips through the same `Display`/parse path as any other uid.
 ///
 /// Nothing bearing this volume may be handed to the API — it would 404. The
@@ -131,7 +131,7 @@ pub struct PendingCounts {
     /// never drain on their own, so counting them as "waiting to upload" would
     /// have the front-end promise progress that is not coming.
     pub parked: i64,
-    /// Ops that have failed at least [`FAILING_ATTEMPTS`] times. A permanently
+    /// Ops that have failed at least `FAILING_ATTEMPTS` times. A permanently
     /// failing op never wedges the queue — the backoff sees to that — which is
     /// exactly why it needs surfacing: it retries forever, invisibly.
     pub failing: i64,
@@ -828,7 +828,7 @@ impl Db {
     }
 
     /// Record that this daemon sealed `revision_id` on `uid`, and prune entries
-    /// past [`OWN_SEALED_TTL_MS`].
+    /// past `OWN_SEALED_TTL_MS`.
     ///
     /// One row per node, overwritten as the node advances. See
     /// [`own_sealed_rev`](Self::own_sealed_rev) for what reads it.
@@ -850,7 +850,7 @@ impl Db {
     }
 
     /// The last revision of `uid` this daemon sealed itself, if it is still
-    /// within [`OWN_SEALED_TTL_MS`].
+    /// within `OWN_SEALED_TTL_MS`.
     ///
     /// The drain asks before treating a moved-on remote as a conflict: a
     /// revision we sealed means one writer stalled and resumed, which

@@ -258,6 +258,10 @@ fn main() -> Result<()> {
         .init();
 
     let dirs = AppDirs::new().context("resolve app dirs")?;
+    // A first run may not have created the state directory yet. The tray binds
+    // its single-instance socket there before it talks to the daemon, so prepare
+    // the private app directories up front.
+    dirs.ensure().context("prepare app directories")?;
 
     // Ensure only one instance of the tray runs.
     let tray_sock = dirs.tray_socket();

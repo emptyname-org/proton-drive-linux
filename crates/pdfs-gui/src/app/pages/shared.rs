@@ -151,6 +151,7 @@ pub(crate) fn load_shared(ui: &Rc<Ui>) {
     if ui.shared.inflight.get() {
         return;
     }
+    cancel_file_thumbnails(ui);
     let current = ui.shared.nav.borrow().last().cloned();
     if let Some((uid, _)) = current {
         load_shared_folder(ui, uid);
@@ -308,11 +309,7 @@ fn shared_entry_row(ui: &Rc<Ui>, entry: &DirEntry) -> adw::ActionRow {
     if let Some(badge) = role_badge(&entry.role) {
         row.add_suffix(&badge);
     }
-    row.add_prefix(&gtk4::Image::from_icon_name(if entry.is_dir {
-        "folder-symbolic"
-    } else {
-        "text-x-generic-symbolic"
-    }));
+    row.add_prefix(&file_thumbnail(ui, entry, 40, 24, true));
     let ui_act = ui.clone();
     let uid = entry.uid.clone();
     let name = entry.name.clone();
@@ -585,7 +582,7 @@ pub(crate) fn respond_invitation(ui: &Rc<Ui>, id: &str, accept: bool) {
 /// Confirm, then leave a node shared with me.
 pub(crate) fn prompt_leave_shared(ui: &Rc<Ui>, uid: &str, name: &str) {
     let win = ui_window(ui);
-    let dialog = adw::AlertDialog::builder()
+    let dialog = adw::MessageDialog::builder()
         .heading("Leave shared item")
         .body(format!(
             "Leave “{name}”? You'll lose access until you're invited again."
@@ -608,13 +605,14 @@ pub(crate) fn prompt_leave_shared(ui: &Rc<Ui>, uid: &str, name: &str) {
             );
         }
     });
-    dialog.present(win.as_ref());
+    dialog.set_transient_for(win.as_ref());
+    dialog.present();
 }
 
 /// Confirm, then remove a saved bookmark.
 pub(crate) fn prompt_remove_bookmark(ui: &Rc<Ui>, token: &str, name: &str) {
     let win = ui_window(ui);
-    let dialog = adw::AlertDialog::builder()
+    let dialog = adw::MessageDialog::builder()
         .heading("Remove bookmark")
         .body(format!("Remove the bookmark for “{name}”?"))
         .build();
@@ -637,13 +635,14 @@ pub(crate) fn prompt_remove_bookmark(ui: &Rc<Ui>, token: &str, name: &str) {
             );
         }
     });
-    dialog.present(win.as_ref());
+    dialog.set_transient_for(win.as_ref());
+    dialog.present();
 }
 
 /// Prompt for a public-link URL (and optional password) and save it as a bookmark.
 pub(crate) fn prompt_add_bookmark(ui: &Rc<Ui>) {
     let win = ui_window(ui);
-    let dialog = adw::AlertDialog::builder()
+    let dialog = adw::MessageDialog::builder()
         .heading("Add bookmark")
         .body("Paste a Proton Drive public link to save it here.")
         .build();
@@ -683,7 +682,8 @@ pub(crate) fn prompt_add_bookmark(ui: &Rc<Ui>) {
             "Couldn't add the bookmark",
         );
     });
-    dialog.present(win.as_ref());
+    dialog.set_transient_for(win.as_ref());
+    dialog.present();
 }
 
 /// Run a mutation raised from the Shared page and reload the page on success.

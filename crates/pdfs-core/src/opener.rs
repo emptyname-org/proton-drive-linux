@@ -197,7 +197,7 @@ fn default_policy() -> &'static OpenWith {
     })
 }
 
-/// `$PDFS_TERMINAL`, then `$TERMINAL`, then the first [`KNOWN_TERMINALS`] entry
+/// `$PDFS_TERMINAL`, then `$TERMINAL`, then the first built-in terminal entry
 /// on `PATH`. An env value may be a full command line (`"foot -e"`), in which
 /// case it is used verbatim; a bare program name gains that terminal's "run
 /// this" argument so `TERMINAL=alacritty` does the obvious thing.

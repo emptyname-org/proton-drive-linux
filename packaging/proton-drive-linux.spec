@@ -7,7 +7,7 @@
 # Match Arch PKGBUILD `!lto` — LTO has broken some GTK/Rust links in practice.
 %global _lto_cflags %{nil}
 
-%{!?version: %global version 0.4.0}
+%{!?version: %global version 1.7.0}
 
 Name:           proton-drive-linux
 Version:        %{version}
@@ -34,6 +34,7 @@ Requires:       libadwaita
 Requires:       libsecret
 Requires:       webkitgtk6.0
 Requires:       xdg-utils
+Requires:       perl-Image-ExifTool
 
 # DE-specific; do not Require a single desktop environment.
 Recommends:     gnome-keyring
@@ -53,14 +54,18 @@ test -f %{git_dir}/Cargo.toml
 cp -a %{git_dir}/LICENSE .
 %build
 cd %{git_dir}
-cargo build --release --locked \
+target_dir="%{?cargo_target_dir}"
+test -n "$target_dir" || target_dir="%{git_dir}/target"
+CARGO_TARGET_DIR="$target_dir" cargo build --release --locked \
   --bin pdfs \
   --bin pdfs-tray \
   --bin pdfs-app \
   --bin pdfs-prompt
 
 %install
-rel=%{git_dir}/target/release
+target_dir="%{?cargo_target_dir}"
+test -n "$target_dir" || target_dir="%{git_dir}/target"
+rel="$target_dir/release"
 install -D -m0755 "$rel/pdfs"        %{buildroot}%{_bindir}/pdfs
 install -D -m0755 "$rel/pdfs-tray"   %{buildroot}%{_bindir}/pdfs-tray
 install -D -m0755 "$rel/pdfs-app"    %{buildroot}%{_bindir}/pdfs-app
@@ -87,5 +92,5 @@ install -D -m0644 %{git_dir}/packaging/proton-drive.service \
 /usr/lib/systemd/user/proton-drive.service
 
 %changelog
-* Sun Jul 19 2026 Local Packager - 0.4.0-1
-- Initial Fedora local package (in-tree cargo build).
+* Mon Aug 17 2026 Proton Drive Linux contributors - 1.7.0-1
+- Add local and camera RAW thumbnails, including ExifTool runtime support.

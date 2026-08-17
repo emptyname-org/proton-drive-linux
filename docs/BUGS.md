@@ -492,8 +492,9 @@ than hanging; `path_relative_to` already carried a 1024 cap, which is the
 precedent. The `descendants` CTE in `upsert_node_tx` got the same guard for the
 write side. Cycles also stay out of the index (see B80).
 
-**Still open:** `pin_is_pinned`'s ancestor walk (`db/pins.rs`) has the same
-shape and no guard. Not reached from search, so it was left alone.
+The same depth cap now protects `Db::is_pinned`'s ancestor walk
+(`db/pins.rs`), so a corrupt `parent_uid` cycle cannot wedge pin-state checks
+either.
 
 ## B81 — Prompt labels every Drive hit "My files", including device folders
 

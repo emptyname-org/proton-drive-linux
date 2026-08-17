@@ -5,7 +5,7 @@
 //! the same data through the control socket. There is one write connection
 //! behind a `Mutex` — SQLite allows exactly one writer, and the single-instance
 //! `flock` makes sure it is ours — and a small pool of read-only connections
-//! behind [`Db::read`], which every `SELECT`-only method uses.
+//! behind the internal `Db::read` helper, which every `SELECT`-only method uses.
 //!
 //! The pool is what makes WAL worth having. The original justification for a
 //! single connection was that "FUSE callbacks already serialize behind the
@@ -205,11 +205,10 @@ fn open_read_only(path: &Path) -> Result<Connection> {
 
 impl Db {
     /// Open (creating if absent) the database at `path`, enable WAL, and bring
-    /// the schema up to [`SCHEMA_VERSION`].
+    /// the schema up to the current internal schema version.
     ///
-    /// Takes the single-instance lock first (see
-    /// [`acquire_single_writer_lock`]), and rebuilds from empty if what is on
-    /// disk turns out not to be a readable database (see [`is_corrupt`]).
+    /// Takes the single-instance lock first, and rebuilds from empty if what is
+    /// on disk turns out not to be a readable database.
     pub fn open(path: &Path) -> Result<Self> {
         let single_writer = acquire_single_writer_lock(path)?;
         let conn = match Self::open_configured(path) {

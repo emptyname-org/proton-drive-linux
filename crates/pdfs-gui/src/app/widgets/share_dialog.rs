@@ -153,10 +153,8 @@ pub(crate) fn open_share_dialog(ui: &Rc<Ui>, entry: &DirEntry) {
         ShareTarget::Path(entry_rel(ui, entry))
     };
 
-    let toolbar = adw::ToolbarView::new();
     let header = adw::HeaderBar::new();
     header.set_title_widget(Some(&adw::WindowTitle::new("Share", &entry.name)));
-    toolbar.add_top_bar(&header);
 
     // Invite section: emails + role + optional message.
     let invite_group = adw::PreferencesGroup::builder()
@@ -209,14 +207,16 @@ pub(crate) fn open_share_dialog(ui: &Rc<Ui>, entry: &DirEntry) {
         .hscrollbar_policy(gtk4::PolicyType::Never)
         .child(&clamp)
         .build();
-    toolbar.set_content(Some(&scroll));
+    let toolbar = toolbar_view(&header, &scroll);
 
-    let dialog = adw::Dialog::builder()
+    let dialog = adw::Window::builder()
         .title("Share")
-        .content_width(480)
-        .content_height(560)
-        .child(&toolbar)
+        .default_width(480)
+        .default_height(560)
+        .modal(true)
+        .content(&toolbar)
         .build();
+    dialog.set_transient_for(ui_window(ui).as_ref());
 
     let state = Rc::new(ShareDialog {
         ui: ui.clone(),
@@ -265,7 +265,7 @@ pub(crate) fn open_share_dialog(ui: &Rc<Ui>, entry: &DirEntry) {
     });
 
     share_dialog_reload(&state);
-    dialog.present(ui_window(ui).as_ref());
+    dialog.present();
 }
 
 /// Re-fetch the node's share and rebuild the people + public-link sections.

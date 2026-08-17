@@ -384,7 +384,7 @@ fn restrict_dir(dir: &Path) -> Result<()> {
 ///
 /// There is a window between `bind` and this call during which the socket
 /// carries the umask's mode. It is closed in practice by the containing
-/// directory: [`Dirs::ensure`] has already made the state directory `0700`, so
+/// directory: [`AppDirs::ensure`] has already made the state directory `0700`, so
 /// nothing else can reach the socket to exploit the window.
 pub fn restrict_socket(path: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;

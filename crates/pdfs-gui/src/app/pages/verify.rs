@@ -53,17 +53,17 @@ pub(crate) fn prompt_human_verification(
         .hexpand(true)
         .build();
 
-    let dialog = adw::Dialog::builder()
-        .title("Verification")
-        .content_width(420)
-        .content_height(560)
-        .build();
-
     let header = adw::HeaderBar::new();
     let body = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
     body.append(&header);
     body.append(&webview);
-    dialog.set_child(Some(&body));
+    let dialog = adw::Window::builder()
+        .title("Verification")
+        .default_width(420)
+        .default_height(560)
+        .modal(true)
+        .content(&body)
+        .build();
 
     // Taken on the first success *or* on close, so the token is sent at most
     // once and a cancelled dialog always drops the sender.
@@ -87,16 +87,18 @@ pub(crate) fn prompt_human_verification(
     });
 
     // Covers the close button, Escape, and the user giving up.
-    dialog.connect_closed(move |_| {
+    dialog.connect_close_request(move |_| {
         token_tx.borrow_mut().take();
+        glib::Propagation::Proceed
     });
 
     webview.load_uri(url);
 
     let parent = ui.login.login_button.root().and_downcast::<gtk4::Window>();
+    dialog.set_transient_for(parent.as_ref());
     // Returns immediately; the login worker stays blocked on the channel until
     // the handler above sends, or the dialog closes and drops the sender.
-    dialog.present(parent.as_ref());
+    dialog.present();
 }
 
 /// Pull the verification token out of a message posted by the verification page.

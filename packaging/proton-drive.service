@@ -12,6 +12,9 @@ Type=simple
 ExecStart=/usr/bin/pdfs daemon
 Restart=on-failure
 RestartSec=3
+# Cache files, temporary downloads, and generated previews are private by
+# default even if a code path does not set an explicit mode.
+UMask=0077
 # Give the lazy unmount time to finish before SIGKILL.
 TimeoutStopSec=15
 

@@ -1458,7 +1458,7 @@ fn cmd_daemon(mountpoint: Option<PathBuf>) -> Result<()> {
 }
 
 /// One mount run: resume the session, mount, and block until the mount ends
-/// (clean shutdown or external unmount). Returns the [`MountOutcome`] so the
+/// (clean shutdown or external unmount). Returns the [`pdfs_fuse::MountOutcome`] so the
 /// daemon loop can decide whether to exit or remount.
 fn mount_once(mountpoint: Option<PathBuf>) -> Result<pdfs_fuse::MountOutcome> {
     let dirs = AppDirs::new()?;

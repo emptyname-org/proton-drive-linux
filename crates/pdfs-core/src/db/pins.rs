@@ -68,7 +68,7 @@ impl Db {
     /// via a CTE; a direct pin is honoured even when the node has no `nodes` row
     /// yet (e.g. a CLI that never hydrates the node cache).
     ///
-    /// The walk is depth-capped like [`super::utils::path_of`]: a `parent_uid`
+    /// The walk is depth-capped like the internal path resolver: a `parent_uid`
     /// cycle is corrupt data the API can hand us, and `UNION ALL` over one never
     /// terminates — while holding the daemon's only SQLite connection, on a path
     /// that runs per cached read.

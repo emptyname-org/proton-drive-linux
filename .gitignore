@@ -3,3 +3,9 @@
 *.pdb
 .env
 /rpmbuild
+/deb
+/dist
+/*.deb
+/*.rpm
+/*.tar.gz
+/SHA256SUMS

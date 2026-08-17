@@ -6,7 +6,7 @@ members = ["crates/pdfs-core", "crates/pdfs-fuse", "crates/pdfs-cli", "crates/pd
 version = "1.8.2"
 edition = "2024"
 license = "MIT"
-authors = ["Nils Pukropp <contact@narl.io>"]
+authors = ["Proton Drive Linux contributors"]
 rust-version = "1.96"
 
 [workspace.dependencies]
@@ -20,6 +20,7 @@ pdfs-fuse = { path = "crates/pdfs-fuse" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "fs", "io-util", "time", "signal"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+base64 = "0.22"
 thiserror = "2"
 anyhow = "1"
 # Non-poisoning mutexes. A handler that panics while holding a lock must not

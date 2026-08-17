@@ -131,7 +131,7 @@ impl Db {
 
     /// Substring search over indexed local file names, newest-modified first
     /// within a relevance tier. Mirrors [`search`](Self::search): the trigram
-    /// index handles queries of at least [`TRIGRAM_MIN`] chars, shorter ones fall
+    /// index handles queries of at least `TRIGRAM_MIN` chars, shorter ones fall
     /// back to a `LIKE` scan.
     pub fn search_local(&self, query: &str, limit: usize) -> Result<Vec<LocalFileHit>> {
         let query = query.trim();

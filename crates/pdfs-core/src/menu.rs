@@ -173,7 +173,7 @@ pub enum MenuChoice {
     Cancelled,
 }
 
-/// The launcher to run: the configured one, or the first [`KNOWN_MENUS`] entry
+/// The launcher to run: the configured one, or the first built-in menu entry
 /// on `PATH`. Returns the argv as it should be spawned, filter-mode flags
 /// included.
 pub fn resolve_menu(configured: Option<&Vec<String>>) -> Option<Vec<String>> {

@@ -12,7 +12,7 @@ use crate::*;
 use pdfs_core::control::RevisionInfo;
 
 /// How an open Versions dialog addresses its file — the same split as
-/// [`ShareTarget`](super::share_dialog::ShareTarget), for the same reason: a
+/// [`ShareTarget`], for the same reason: a
 /// node reached from Shared or a device folder may have no path in the primary
 /// mount's namespace, and an older daemon must reject the request rather than
 /// resolve an empty path to the mount root.
@@ -98,10 +98,8 @@ pub(crate) fn open_versions_dialog(ui: &Rc<Ui>, entry: &DirEntry) {
         VersionTarget::Path(entry_rel(ui, entry))
     };
 
-    let toolbar = adw::ToolbarView::new();
     let header = adw::HeaderBar::new();
     header.set_title_widget(Some(&adw::WindowTitle::new("Versions", &entry.name)));
-    toolbar.add_top_bar(&header);
 
     let group = adw::PreferencesGroup::builder()
         .title("Version history")
@@ -120,14 +118,16 @@ pub(crate) fn open_versions_dialog(ui: &Rc<Ui>, entry: &DirEntry) {
         .hscrollbar_policy(gtk4::PolicyType::Never)
         .child(&clamp)
         .build();
-    toolbar.set_content(Some(&scroll));
+    let toolbar = toolbar_view(&header, &scroll);
 
-    let dialog = adw::Dialog::builder()
+    let dialog = adw::Window::builder()
         .title("Versions")
-        .content_width(520)
-        .content_height(520)
-        .child(&toolbar)
+        .default_width(520)
+        .default_height(520)
+        .modal(true)
+        .content(&toolbar)
         .build();
+    dialog.set_transient_for(ui_window(ui).as_ref());
 
     let state = Rc::new(VersionsDialog {
         ui: ui.clone(),
@@ -138,7 +138,7 @@ pub(crate) fn open_versions_dialog(ui: &Rc<Ui>, entry: &DirEntry) {
     });
 
     versions_dialog_reload(&state);
-    dialog.present(ui_window(ui).as_ref());
+    dialog.present();
 }
 
 /// Re-fetch the file's revisions and rebuild the rows.
@@ -241,7 +241,7 @@ fn repaint_versions(state: &Rc<VersionsDialog>, items: &[RevisionInfo]) {
 /// Confirm, then restore. Confirmed because it replaces the file's content for
 /// every device on the account, not only this one.
 fn prompt_restore_version(state: &Rc<VersionsDialog>, revision_id: &str) {
-    let dialog = adw::AlertDialog::builder()
+    let dialog = adw::MessageDialog::builder()
         .heading("Restore version")
         .body(format!(
             "Make this version the current content of “{}”? The version it replaces stays in the history.",
@@ -270,12 +270,13 @@ fn prompt_restore_version(state: &Rc<VersionsDialog>, revision_id: &str) {
             "Couldn't restore that version",
         );
     });
-    dialog.present(window.as_ref());
+    dialog.set_transient_for(window.as_ref());
+    dialog.present();
 }
 
 /// Confirm, then permanently delete one revision.
 fn prompt_delete_version(state: &Rc<VersionsDialog>, revision_id: &str) {
-    let dialog = adw::AlertDialog::builder()
+    let dialog = adw::MessageDialog::builder()
         .heading("Delete version")
         .body("Delete this version permanently? Its content can't be recovered.")
         .build();
@@ -299,7 +300,8 @@ fn prompt_delete_version(state: &Rc<VersionsDialog>, revision_id: &str) {
             "Couldn't delete that version",
         );
     });
-    dialog.present(window.as_ref());
+    dialog.set_transient_for(window.as_ref());
+    dialog.present();
 }
 
 /// Ask where to write an old version, then have the daemon download it there.
@@ -309,29 +311,30 @@ fn prompt_delete_version(state: &Rc<VersionsDialog>, revision_id: &str) {
 /// can.
 fn prompt_save_version(state: &Rc<VersionsDialog>, revision_id: &str) {
     let window = ui_window(&state.ui);
-    let dialog = gtk4::FileDialog::builder()
-        .title("Save version")
-        .initial_name(&state.name)
-        .build();
+    let initial_name = state.name.clone();
     let state = state.clone();
     let revision_id = revision_id.to_string();
-    dialog.save(window.as_ref(), gio::Cancellable::NONE, move |res| {
-        let Ok(file) = res else { return };
-        let Some(dest) = file.path().and_then(|p| p.to_str().map(str::to_string)) else {
-            toast_error(
-                &state.ui,
+    choose_save_file(
+        window.as_ref(),
+        "Save version",
+        &initial_name,
+        move |path| {
+            let Some(dest) = path.to_str().map(str::to_string) else {
+                toast_error(
+                    &state.ui,
+                    "Couldn't save that version",
+                    "That location isn't a local file.",
+                );
+                return;
+            };
+            versions_dialog_op(
+                &state,
+                state.target.save_as(revision_id.clone(), dest),
+                "Version saved",
                 "Couldn't save that version",
-                "That location isn't a local file.",
             );
-            return;
-        };
-        versions_dialog_op(
-            &state,
-            state.target.save_as(revision_id.clone(), dest),
-            "Version saved",
-            "Couldn't save that version",
-        );
-    });
+        },
+    );
 }
 
 /// Send one version request, toast the outcome, and refresh the list.

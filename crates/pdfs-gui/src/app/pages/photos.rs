@@ -151,7 +151,7 @@ pub(crate) const TEXTURE_CACHE_MAX: usize = 600;
 pub(crate) const RELAYOUT_DEBOUNCE: Duration = Duration::from_millis(80);
 
 /// One day-section of the photos timeline: a heading plus the photos captured
-/// that day, in timeline order. Built from the flat [`Ui::gallery_model`] by
+/// that day, in timeline order. Built from the flat gallery model by
 /// [`group_photos`] and rendered as one [`gtk4::ListView`] row.
 pub(crate) struct PhotoGroup {
     /// "Today", "Yesterday", or e.g. "3 June 2026".
@@ -198,7 +198,7 @@ pub(crate) struct GalleryWidgets {
 }
 
 /// The Photos page: a [`gtk4::ListView`] of day sections, each a heading over
-/// that day's photos laid out as justified rows (see [`justify_rows`]) — every
+/// that day's photos laid out as justified rows — every
 /// photo at its own aspect ratio, every row filled edge to edge.
 ///
 /// A ListView of sections rather than one flat GridView because GTK's grid has no
@@ -253,7 +253,7 @@ pub(crate) fn build_gallery_page() -> (gtk4::Widget, GalleryWidgets) {
         .build();
 
     let title_label = gtk4::Label::builder()
-        .label("Gallery")
+        .label("Photos")
         .halign(gtk4::Align::Start)
         .build();
     title_label.add_css_class("title-2");
@@ -283,7 +283,7 @@ pub(crate) fn build_gallery_page() -> (gtk4::Widget, GalleryWidgets) {
 
     let upload = gtk4::Button::builder()
         .label("Upload")
-        .icon_name("list-add-symbolic")
+        .icon_name("pdfs-cloud-upload-symbolic")
         .valign(gtk4::Align::Center)
         .build();
     upload.add_css_class("pill");
@@ -731,23 +731,17 @@ pub(crate) fn wire_gallery(ui: &Rc<Ui>, list: &gtk4::ListView, scroll: &gtk4::Sc
 
     let ui_upload = ui.clone();
     ui.gallery.upload.connect_clicked(move |_| {
-        let dialog = gtk4::FileDialog::builder()
-            .title("Select Photo to Upload")
-            .build();
-
         let filter = gtk4::FileFilter::new();
         filter.set_name(Some("Images"));
         filter.add_mime_type("image/*");
-        let filters = gio::ListStore::new::<gtk4::FileFilter>();
-        filters.append(&filter);
-        dialog.set_filters(Some(&filters));
 
         let ui = ui_upload.clone();
         let parent_win = ui.stack.root().and_downcast::<gtk4::Window>();
-        dialog.open(parent_win.as_ref(), gio::Cancellable::NONE, move |res| {
-            if let Ok(file) = res
-                && let Some(path) = file.path()
-            {
+        choose_file(
+            parent_win.as_ref(),
+            "Select Photo to Upload",
+            Some(&filter),
+            move |path| {
                 let name = path
                     .file_name()
                     .and_then(|n| n.to_str())
@@ -806,8 +800,8 @@ pub(crate) fn wire_gallery(ui: &Rc<Ui>, list: &gtk4::ListView, scroll: &gtk4::Sc
                         }
                     }
                 });
-            }
-        });
+            },
+        );
     });
 }
 

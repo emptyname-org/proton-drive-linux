@@ -234,7 +234,7 @@ pub(crate) fn spawn_login(
 /// login worker via `code_tx`. Cancelling (or closing) drops the sender, which
 /// the worker reads as a cancelled login.
 pub(crate) fn prompt_2fa(ui: &Rc<Ui>, code_tx: std::sync::mpsc::Sender<String>) {
-    let dialog = adw::AlertDialog::builder()
+    let dialog = adw::MessageDialog::builder()
         .heading("Two-factor authentication")
         .body("Enter the code from your authenticator app.")
         .build();
@@ -265,7 +265,8 @@ pub(crate) fn prompt_2fa(ui: &Rc<Ui>, code_tx: std::sync::mpsc::Sender<String>) 
     });
 
     let parent = ui.login.login_button.root().and_downcast::<gtk4::Window>();
-    dialog.present(parent.as_ref());
+    dialog.set_transient_for(parent.as_ref());
+    dialog.present();
 }
 
 /// Connect the sign-out button: disable+stop the mount service (so the daemon

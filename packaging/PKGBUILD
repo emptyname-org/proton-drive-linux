@@ -1,4 +1,4 @@
-# Maintainer: Nils Pukropp <contact@narl.io>
+# Maintainer: Proton Drive Linux contributors
 #
 # Local-build PKGBUILD. Builds the proton-drive-linux workspace from the
 # checkout this file lives in: this is NOT a source-fetch package, it compiles
@@ -15,7 +15,7 @@ pkgdesc="Proton Drive client for Linux: FUSE files-on-demand mount, CLI, GTK4 ap
 arch=('x86_64')
 url="https://github.com/narl/proton-drive-linux"
 license=('MIT')
-depends=('fuse3' 'gtk4' 'libadwaita' 'webkitgtk-6.0')
+depends=('fuse3' 'gtk4' 'libadwaita' 'webkitgtk-6.0' 'perl-image-exiftool')
 makedepends=('cargo' 'git')
 provides=('pdfs')
 # Files-on-demand mount + keyring need these at runtime.

@@ -66,7 +66,7 @@ pub struct LocalEntry {
 /// Walk `roots` in parallel, calling `sink` with batches of entries.
 ///
 /// Hidden files and anything under `excludes` (the Drive mountpoint, our own
-/// state/cache dirs) are skipped, as are the [`SKIP_DIRS`] names at any depth.
+/// state/cache dirs) are skipped, as are the internal skip-list names at any depth.
 /// Symlinks are not followed, so a link loop cannot hang the scan. Returns the
 /// number of entries handed to `sink`.
 ///

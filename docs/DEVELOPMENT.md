@@ -126,7 +126,7 @@ Derived from: [`BUGS.md`](BUGS.md)
 
 Proton Drive keeps every revision a client committed; the daemon only ever addressed the active one, so a file overwritten by a sync pass could be recovered only from whatever the local `recovery/` directory happened to hold.
 
-The control protocol gained `ListRevisions` / `RestoreRevision` / `DeleteRevision` / `SaveRevisionAs` (each with a `…ByUid` twin for nodes the primary mount cannot name), the CLI gained `pdfs versions list|restore|save|rm`, and the browser's details pane gained a **Versions** button opening a per-file dialog.
+The control protocol gained `ListRevisions` / `RestoreRevision` / `DeleteRevision` / `SaveRevisionAs` (each with a `…ByUid` twin for nodes the primary mount cannot name), the CLI gained `pdfs versions list|restore|save|rm`, and the browser's file context menu gained a **Versions…** action opening a per-file dialog.
 
 Three properties that shape the code:
 

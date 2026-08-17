@@ -40,13 +40,13 @@ impl Filesystem for ProtonFs {
 
     /// Free and total space, as `df` and every "will this fit?" preflight ask.
     ///
-    /// Reported in [`REPORTED_BLKSIZE`] units against the *account* quota, not
+    /// Reported in `REPORTED_BLKSIZE` units against the *account* quota, not
     /// the local cache: what a copy into the mount consumes is Drive storage.
     /// The default implementation answers all-zeroes, which reads as a full
     /// filesystem and makes installers and file managers refuse to write.
     ///
     /// On a worker, because a cold answer is a round trip
-    /// ([`Core::account_quota_cached`] serves a warm one from memory).
+    /// (the daemon's cached quota helper serves a warm one from memory).
     fn statfs(&self, _req: &Request, _ino: INodeNo, reply: ReplyStatfs) {
         let core = self.core.clone();
         self.core.workers.run(Lane::Meta, move || {

@@ -16,8 +16,8 @@ use pages::shared_by_me::*;
 use pages::status::*;
 use pages::trash::*;
 use pages::verify::*;
-use widgets::details::*;
 use widgets::share_dialog::*;
+use widgets::thumbnails::*;
 use widgets::versions_dialog::*;
 
 use std::cell::{Cell, RefCell};
@@ -48,8 +48,8 @@ use pdfs_core::control::{
     ActivityEntry, ActivityKind, AlbumInfo, BookmarkInfo, DeviceInfo, DirEntry, ErrorKind,
     InvitationInfo, JobItem, PhotoItem, PhotoKind, PublicLinkInfo, RefreshScope, Request, Response,
     RestorableFolder, RestoreItem, SearchHit, ShareEntry, ShareEntryKind, SharedItem,
-    SyncFolderInfo, SyncPhase, SyncProgress, TransferDirection, TransferItem, pending_summary,
-    send,
+    SyncFolderInfo, SyncPhase, SyncProgress, ThumbnailBuildStatus, TransferDirection, TransferItem,
+    pending_summary, send,
 };
 
 use pdfs_core::mounts::{MountAccess, MountKind, MountMode, MountSpec};
@@ -93,6 +93,9 @@ struct Ui {
     /// Keys (relative path / photo uid) of open requests currently in flight, so
     /// a double-click on the same entry is a no-op instead of a second download.
     opening: RefCell<HashSet<String>>,
+    /// Entry identities whose pin/unpin request is still running. A second click
+    /// cannot race an unfinished download or eviction for the same item.
+    offline_changing: RefCell<HashSet<String>>,
     /// Resolved login identity, cached so the periodic [`refresh`] never hits the
     /// keyring (a DBus round-trip). Populated at startup and updated only on
     /// login / logout. `None` = signed out.
@@ -103,16 +106,20 @@ struct Ui {
     /// Sidebar destination list (Files / Photos / Settings). Selecting a row swaps
     /// the page stack; [`sync_sidebar`] mirrors navigation that starts elsewhere.
     sidebar: gtk4::ListBox,
-    /// The sidebar/content split. Collapsed while signed out, so the login page
-    /// owns the whole window and no destination is reachable without a session.
-    nav: adw::NavigationSplitView,
+    /// The signed-in navigation sidebar. Hidden while signed out, so the login
+    /// page owns the whole window and no destination is reachable without a
+    /// session. A plain GTK box keeps this compatible with libadwaita 1.2.
+    nav: gtk4::Widget,
+    /// Shared thumbnails for ordinary image files outside the Photos gallery.
+    /// One cache and request queue serves Files, search, Shared and Trash, so
+    /// the same image is downloaded and decoded only once.
+    pub(crate) file_thumbs: FileThumbnailState,
 
     // Per-page state. Each page module owns its own struct; `Ui` keeps only
     // what more than one page genuinely shares.
     pub(crate) login: LoginState,
     pub(crate) status: StatusState,
     pub(crate) browser: BrowserState,
-    pub(crate) details: DetailsState,
     pub(crate) trash: TrashState,
     pub(crate) gallery: GalleryState,
     pub(crate) shared: SharedState,
@@ -172,7 +179,19 @@ fn main() -> glib::ExitCode {
         pdfs_core::shell::install_file_manager_scripts();
         spawn_tray();
     });
-    app.connect_activate(build_window);
+    app.connect_activate(|app| {
+        // Desktop-file launches, tray clicks and D-Bus activation all reach this
+        // signal. Raise the existing main window instead of constructing another
+        // independent UI and 2-second polling loop for every activation.
+        if let Some(window) = app
+            .active_window()
+            .or_else(|| app.windows().first().cloned())
+        {
+            window.present();
+            return;
+        }
+        build_window(app);
+    });
     app.run()
 }
 
@@ -205,10 +224,14 @@ fn load_proton_theme() {
          .file-grid {{ padding: 6px; }}\n\
          .file-tile {{ padding: 8px; border-radius: 10px; }}\n\
          .file-tile:hover {{ background: alpha({PROTON_PURPLE}, 0.10); }}\n\
+         .file-thumbnail {{ border-radius: 7px; }}\n\
          .file-badge {{ -gtk-icon-shadow: 0 1px 2px rgba(0, 0, 0, 0.5); }}\n\
          .badge-pinned {{ color: #f5c211; }}\n\
          .badge-cached {{ color: #2ec27e; }}\n\
-         .badge-cloud {{ color: #9aa0a6; }}\n\
+         .browser-statusbar {{ background-color: alpha(currentColor, 0.025); }}\n\
+         scale.browser-status-meter trough, progressbar.browser-status-meter trough {{ min-width: 104px; }}\n\
+         scale.browser-status-meter trough {{ min-height: 6px; }}\n\
+         progressbar.browser-status-meter trough, progressbar.browser-status-meter progress {{ min-height: 6px; }}\n\
          .photo-viewer-window {{ background-color: #111014; }}\n\
          .viewer-top-bar {{ background: linear-gradient(to bottom, rgba(0, 0, 0, 0.75), rgba(0, 0, 0, 0)); padding: 10px 16px 28px 20px; color: white; }}\n\
          .viewer-title {{ font-weight: 700; font-size: 1.05rem; text-shadow: 0 1px 3px rgba(0, 0, 0, 0.9); color: white; }}\n\
@@ -249,7 +272,7 @@ fn load_proton_theme() {
          .file-tile:selected, .file-tile:hover:selected {{ background: alpha({PROTON_PURPLE}, 0.20); }}\n"
     );
     let provider = gtk4::CssProvider::new();
-    provider.load_from_string(&css);
+    provider.load_from_data(&css);
     if let Some(display) = gtk4::gdk::Display::default() {
         gtk4::style_context_add_provider_for_display(
             &display,
@@ -275,6 +298,8 @@ fn build_window(app: &adw::Application) {
     };
 
     let stack = adw::ViewStack::new();
+    stack.set_hexpand(true);
+    stack.set_vexpand(true);
     let (login_page, login_widgets) = build_login_page();
     let (main_page, main_widgets) = build_main_page();
     let (browser_page, browser_widgets) = build_browser_page();
@@ -301,26 +326,25 @@ fn build_window(app: &adw::Application) {
     // login lands on Files).
     let (sidebar_page, sidebar_list) = build_sidebar();
 
-    // Header spinner, hidden until a background open/load is in flight.
+    // Global activity floats over the sidebar without reserving a blank footer
+    // while idle. App-level destinations/actions live on Settings now.
     let spinner = gtk4::Spinner::new();
     spinner.set_visible(false);
-    let header = adw::HeaderBar::new();
-    header.pack_end(&build_primary_menu());
-    header.pack_end(&spinner);
-    let toolbar = adw::ToolbarView::new();
-    toolbar.add_top_bar(&header);
-    toolbar.set_content(Some(&stack));
+    spinner.set_halign(gtk4::Align::End);
+    spinner.set_valign(gtk4::Align::End);
+    spinner.set_margin_bottom(8);
+    spinner.set_margin_end(8);
+    let sidebar = gtk4::Overlay::new();
+    sidebar.set_width_request(220);
+    sidebar.set_child(Some(&sidebar_page));
+    sidebar.add_overlay(&spinner);
 
-    let content_page = adw::NavigationPage::builder()
-        .title("Proton Drive")
-        .child(&toolbar)
-        .build();
-    let split = adw::NavigationSplitView::builder()
-        .sidebar(&sidebar_page)
-        .content(&content_page)
-        .min_sidebar_width(200.0)
-        .max_sidebar_width(240.0)
-        .build();
+    // NavigationSplitView arrived in libadwaita 1.4. Debian 12 ships 1.2, so
+    // use a fixed GTK sidebar beside the content. The sidebar is hidden on the
+    // login page below, preserving the important signed-out behaviour.
+    let split = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
+    split.append(&sidebar);
+    split.append(&stack);
 
     // Toasts float over everything, so a report from a background action reaches
     // the user whichever page they're on.
@@ -334,10 +358,12 @@ fn build_window(app: &adw::Application) {
         spinner: spinner.clone(),
         busy: Cell::new(0),
         opening: RefCell::new(HashSet::new()),
+        offline_changing: RefCell::new(HashSet::new()),
         session: RefCell::new(auth::load().ok()),
         mounted: RefCell::new(false),
         sidebar: sidebar_list.clone(),
-        nav: split.clone(),
+        nav: sidebar.clone().upcast(),
+        file_thumbs: FileThumbnailState::new(),
         login: LoginState {
             email: login_widgets.0,
             password: login_widgets.1,
@@ -360,6 +386,9 @@ fn build_window(app: &adw::Application) {
             quota_checked_at: Cell::new(None),
             autostart_row: main_widgets.autostart_row.clone(),
             budget_row: main_widgets.budget_row.clone(),
+            budget_source: RefCell::new(None),
+            budget_inflight: Cell::new(false),
+            budget_pending: Cell::new(None),
             mountpoint_row: main_widgets.mountpoint_row.clone(),
             settings_suppress: Cell::new(false),
             pins_group: main_widgets.pins_group.clone(),
@@ -373,20 +402,29 @@ fn build_window(app: &adw::Application) {
             back: browser_widgets.back.clone(),
             crumb: browser_widgets.crumb.clone(),
             content: browser_widgets.content.clone(),
+            view_stack: browser_widgets.view_stack.clone(),
             status: browser_widgets.status.clone(),
             retry: browser_widgets.retry.clone(),
-            split: browser_widgets.split.clone(),
             path: RefCell::new(String::new()),
             search: browser_widgets.search.clone(),
             new_folder: browser_widgets.new_folder.clone(),
             upload: browser_widgets.upload.clone(),
             upload_folder: browser_widgets.upload_folder.clone(),
+            build_thumbnails: browser_widgets.build_thumbnails.clone(),
+            thumbnail_build_row: browser_widgets.thumbnail_build_row.clone(),
+            thumbnail_progress: browser_widgets.thumbnail_progress.clone(),
+            thumbnail_status: browser_widgets.thumbnail_status.clone(),
+            thumbnail_poll: RefCell::new(None),
+            thumbnail_build_running: Cell::new(false),
             search_source: RefCell::new(None),
-        },
-        details: DetailsState {
-            details: browser_widgets.details,
-            details_entry: RefCell::new(None),
-            details_suppress: Cell::new(false),
+            load_generation: Cell::new(0),
+            summary: browser_widgets.summary.clone(),
+            zoom: browser_widgets.zoom.clone(),
+            grid_thumbnail_size: Cell::new(GRID_THUMB_DEFAULT),
+            grid_tiles: RefCell::new(Vec::new()),
+            quota_box: browser_widgets.quota_box.clone(),
+            quota: browser_widgets.quota.clone(),
+            quota_text: browser_widgets.quota_text.clone(),
             grid_selection: browser_widgets.grid_selection.clone(),
             list_selection: browser_widgets.list_selection.clone(),
         },
@@ -500,7 +538,7 @@ fn build_window(app: &adw::Application) {
     wire_settings(
         &ui,
         &main_widgets.purge_button,
-        &main_widgets.mountpoint_button,
+        &main_widgets.locations_button,
     );
     wire_sidebar(&ui);
     wire_browser(&ui, &browser_widgets.grid, &browser_widgets.column_view);
@@ -509,8 +547,8 @@ fn build_window(app: &adw::Application) {
         &browser_widgets.new_folder,
         &browser_widgets.upload,
         &browser_widgets.upload_folder,
+        &browser_widgets.build_thumbnails,
     );
-    wire_details(&ui);
     wire_search(&ui);
     wire_gallery(&ui, &gallery_widgets.list, &gallery_widgets.scroll);
     wire_albums(&ui);
@@ -539,9 +577,13 @@ fn build_window(app: &adw::Application) {
     // network round-trip only happens on demand rather than on every refresh.
     let ui_nav = ui.clone();
     stack.connect_visible_child_name_notify(move |st| {
+        // Rows from the page being left must not keep full-size image downloads
+        // alive in the daemon. The page being entered will establish a fresh
+        // thumbnail generation as it paints.
+        cancel_file_thumbnails(&ui_nav);
         sync_sidebar(&ui_nav);
         match st.visible_child_name().as_deref() {
-            Some("browser") => load_browser(&ui_nav),
+            Some("browser") => reload_listing(&ui_nav),
             Some("gallery") => load_gallery(&ui_nav, false),
             // Network-backed pages skip the fetch (and the "Loading…" flash) when
             // the rows on screen are still fresh; the Retry button and mutations
@@ -563,12 +605,15 @@ fn build_window(app: &adw::Application) {
         }
     });
 
-    let window = adw::ApplicationWindow::builder()
+    // No custom titlebar is installed: `decorated` asks the compositor/window
+    // manager for its native frame and title-bar controls.
+    let window = gtk4::ApplicationWindow::builder()
         .application(app)
         .title("Proton Drive")
         .default_width(980)
         .default_height(680)
-        .content(&toasts)
+        .decorated(true)
+        .child(&toasts)
         .build();
     install_shortcuts(&ui, &window);
     install_window_actions(&window);
@@ -594,22 +639,21 @@ fn build_window(app: &adw::Application) {
 
 /// The sidebar destinations, in order: the row index is the index into this table,
 /// and each entry is `(stack page name, label, icon)`.
-const DESTINATIONS: [(&str, &str, &str); 9] = [
+const DESTINATIONS: [(&str, &str, &str); 8] = [
     ("browser", "My files", "folder-symbolic"),
     ("sharedbyme", "Shared", "emblem-shared-symbolic"),
     ("shared", "Shared with me", "system-users-symbolic"),
-    ("locations", "Locations", "drive-harddisk-symbolic"),
     ("devices", "Computers", "computer-symbolic"),
-    ("gallery", "Gallery", "image-x-generic-symbolic"),
+    ("gallery", "Photos", "emblem-photos-symbolic"),
     ("activity", "Activity", "document-open-recent-symbolic"),
     ("trash", "Trash", "user-trash-symbolic"),
     ("main", "Settings", "emblem-system-symbolic"),
 ];
 
-/// The navigation sidebar: a Proton-branded header over one row per destination.
-/// Returns the page (for the split view) and the list (to drive + reflect the
-/// current page).
-fn build_sidebar() -> (adw::NavigationPage, gtk4::ListBox) {
+/// The navigation sidebar: one row per destination. The window manager owns the
+/// title bar; this returns the scrollable destination list that is wrapped with
+/// the activity overlay in [`build_window`].
+fn build_sidebar() -> (gtk4::Widget, gtk4::ListBox) {
     let list = gtk4::ListBox::new();
     list.set_selection_mode(gtk4::SelectionMode::Single);
     list.add_css_class("navigation-sidebar");
@@ -619,29 +663,12 @@ fn build_sidebar() -> (adw::NavigationPage, gtk4::ListBox) {
         list.append(&row);
     }
 
-    let brand = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
-    let icon = gtk4::Image::from_icon_name("folder-remote-symbolic");
-    icon.add_css_class("brand-icon");
-    brand.append(&icon);
-    brand.append(&gtk4::Label::new(Some("Proton Drive")));
-
-    let header = adw::HeaderBar::new();
-    header.set_title_widget(Some(&brand));
-
     let scroll = gtk4::ScrolledWindow::builder()
         .hscrollbar_policy(gtk4::PolicyType::Never)
         .vexpand(true)
         .child(&list)
         .build();
-    let toolbar = adw::ToolbarView::new();
-    toolbar.add_top_bar(&header);
-    toolbar.set_content(Some(&scroll));
-
-    let page = adw::NavigationPage::builder()
-        .title("Proton Drive")
-        .child(&toolbar)
-        .build();
-    (page, list)
+    (scroll.upcast(), list)
 }
 
 /// Selecting a sidebar row navigates the page stack. The reverse direction (stack
@@ -680,6 +707,20 @@ fn refresh_button() -> gtk4::Button {
     button
 }
 
+/// A Debian-12-compatible replacement for `AdwToolbarView`: keep the header and
+/// content in one vertical widget while retaining the same visual hierarchy.
+pub(crate) fn toolbar_view(
+    header: &impl IsA<gtk4::Widget>,
+    content: &impl IsA<gtk4::Widget>,
+) -> gtk4::Box {
+    let toolbar = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+    toolbar.set_hexpand(true);
+    toolbar.set_vexpand(true);
+    toolbar.append(header);
+    toolbar.append(content);
+    toolbar
+}
+
 /// Point every page's Refresh button at the current page. One handler for all of
 /// them: the button acts on whatever is on screen, so it can't refresh a page the
 /// user has since navigated away from.
@@ -700,6 +741,11 @@ fn wire_refresh(ui: &Rc<Ui>, buttons: &[&gtk4::Button]) {
 fn reload_current_page(ui: &Rc<Ui>) {
     match ui.stack.visible_child_name().as_deref() {
         Some("browser") => {
+            let query = ui.browser.search.text().trim().to_string();
+            if !query.is_empty() {
+                run_search(ui, &query);
+                return;
+            }
             let path = ui.browser.path.borrow().clone();
             refresh_then(ui, RefreshScope::Dir { path }, load_browser);
         }
@@ -825,21 +871,9 @@ fn toast_failure(ui: &Rc<Ui>, what: &str, message: &str, kind: ErrorKind) {
     }
 }
 
-/// The header's primary (hamburger) menu: the app-level entries that don't belong
-/// on any one page.
-fn build_primary_menu() -> gtk4::MenuButton {
-    let menu = gio::Menu::new();
-    menu.append(Some("Keyboard Shortcuts"), Some("win.shortcuts"));
-    menu.append(Some("About Proton Drive"), Some("win.about"));
-    gtk4::MenuButton::builder()
-        .icon_name("open-menu-symbolic")
-        .tooltip_text("Main menu")
-        .menu_model(&menu)
-        .build()
-}
-
-/// Back the primary menu's entries with window actions.
-fn install_window_actions(window: &adw::ApplicationWindow) {
+/// Back the Settings page's Keyboard shortcuts and About rows with native
+/// window actions.
+fn install_window_actions(window: &gtk4::ApplicationWindow) {
     let shortcuts = gio::SimpleAction::new("shortcuts", None);
     let win = window.clone();
     shortcuts.connect_activate(move |_, _| show_shortcuts(&win));
@@ -848,61 +882,60 @@ fn install_window_actions(window: &adw::ApplicationWindow) {
     let about = gio::SimpleAction::new("about", None);
     let win = window.clone();
     about.connect_activate(move |_, _| {
-        let dialog = adw::AboutDialog::builder()
+        let dialog = adw::AboutWindow::builder()
             .application_name("Proton Drive")
             .application_icon("folder-remote-symbolic")
             .version(pdfs_core::config::APP_VERSION)
             .developer_name("proton-drive-linux")
             .comments("On-demand Proton Drive sync for Linux.")
+            .transient_for(&win)
+            .modal(true)
             .build();
-        dialog.present(Some(&win));
+        dialog.present();
     });
     window.add_action(&about);
 }
 
-/// The keyboard-shortcut cheatsheet behind the menu entry, listing exactly what
-/// [`install_shortcuts`] binds.
-fn show_shortcuts(window: &adw::ApplicationWindow) {
-    const KEYS: [(&str, &str); 6] = [
-        ("Ctrl+F", "Search Drive"),
-        ("Ctrl+N", "New folder"),
-        ("Ctrl+U", "Upload file"),
+/// Show GTK's native shortcut reference window, listing exactly what
+/// [`install_shortcuts`] binds. GTK supplies the key-cap rendering, search,
+/// window chrome and keyboard navigation.
+fn show_shortcuts(window: &gtk4::ApplicationWindow) {
+    const KEYS: [(&str, &str); 7] = [
+        ("<Primary>f", "Search Drive"),
+        ("<Primary>n", "New folder"),
+        ("<Primary>u", "Upload files"),
         ("F2", "Rename selection"),
         ("Delete", "Move selection to Trash"),
-        ("Escape", "Close the details pane"),
+        ("F5", "Refresh current page"),
+        ("<Primary>r", "Refresh current page"),
     ];
-    let group = adw::PreferencesGroup::builder().title("Files").build();
-    for (keys, action) in KEYS {
-        let row = adw::ActionRow::builder().title(action).build();
-        let label = gtk4::Label::builder()
-            .label(keys)
-            .valign(gtk4::Align::Center)
+    let group = gtk4::ShortcutsGroup::builder().title("Files").build();
+    for (accelerator, title) in KEYS {
+        let shortcut = gtk4::ShortcutsShortcut::builder()
+            .accelerator(accelerator)
+            .title(title)
             .build();
-        label.add_css_class("dim-label");
-        label.add_css_class("monospace");
-        row.add_suffix(&label);
-        group.add(&row);
+        group.append(&shortcut);
     }
-    let page = adw::PreferencesPage::new();
-    page.add(&group);
-
-    let dialog = adw::Dialog::builder()
-        .title("Keyboard Shortcuts")
-        .content_width(420)
-        .child(&{
-            let toolbar = adw::ToolbarView::new();
-            toolbar.add_top_bar(&adw::HeaderBar::new());
-            toolbar.set_content(Some(&page));
-            toolbar
-        })
+    let section = gtk4::ShortcutsSection::builder()
+        .title("Keyboard shortcuts")
         .build();
-    dialog.present(Some(window));
+    section.append(&group);
+    let dialog = gtk4::ShortcutsWindow::builder()
+        .title("Keyboard shortcuts")
+        .default_width(420)
+        .default_height(480)
+        .transient_for(window)
+        .modal(true)
+        .child(&section)
+        .build();
+    dialog.show();
 }
 
 /// Window-level keyboard shortcuts, so the browser is usable without the mouse:
 /// Ctrl+F focuses search, Ctrl+N makes a folder, Ctrl+U uploads, F2 renames and
-/// Delete trashes the selected entry, Escape closes the details pane.
-fn install_shortcuts(ui: &Rc<Ui>, window: &adw::ApplicationWindow) {
+/// Delete trashes the selected entry.
+fn install_shortcuts(ui: &Rc<Ui>, window: &gtk4::ApplicationWindow) {
     let controller = gtk4::EventControllerKey::new();
     let ui = ui.clone();
     controller.connect_key_pressed(move |_, key, _, state| {
@@ -927,9 +960,6 @@ fn install_shortcuts(ui: &Rc<Ui>, window: &adw::ApplicationWindow) {
                 if let Some(entry) = selected_entry(&ui) {
                     prompt_delete(&ui, &entry);
                 }
-            }
-            gtk4::gdk::Key::Escape if on_browser && ui.browser.split.shows_sidebar() => {
-                hide_details(&ui);
             }
             _ => return glib::Propagation::Proceed,
         }
@@ -970,6 +1000,111 @@ fn spawn_request(
 /// The top-level window, for parenting dialogs.
 fn ui_window(ui: &Rc<Ui>) -> Option<gtk4::Window> {
     ui.stack.root().and_downcast::<gtk4::Window>()
+}
+
+/// Open a single-file chooser using GTK 4.8's native-dialog API.
+pub(crate) fn choose_file(
+    parent: Option<&gtk4::Window>,
+    title: &str,
+    filter: Option<&gtk4::FileFilter>,
+    on_accept: impl Fn(PathBuf) + 'static,
+) {
+    let dialog = gtk4::FileChooserNative::new(
+        Some(title),
+        parent,
+        gtk4::FileChooserAction::Open,
+        Some("Open"),
+        Some("Cancel"),
+    );
+    if let Some(filter) = filter {
+        dialog.add_filter(filter);
+        dialog.set_filter(filter);
+    }
+    dialog.connect_response(move |dialog, response| {
+        if response == gtk4::ResponseType::Accept
+            && let Some(path) = dialog.file().and_then(|file| file.path())
+        {
+            on_accept(path);
+        }
+    });
+    dialog.show();
+}
+
+/// Open a multiple-file chooser using GTK 4.8's native-dialog API.
+pub(crate) fn choose_files(
+    parent: Option<&gtk4::Window>,
+    title: &str,
+    on_accept: impl Fn(Vec<PathBuf>) + 'static,
+) {
+    let dialog = gtk4::FileChooserNative::new(
+        Some(title),
+        parent,
+        gtk4::FileChooserAction::Open,
+        Some("Open"),
+        Some("Cancel"),
+    );
+    dialog.set_select_multiple(true);
+    dialog.connect_response(move |dialog, response| {
+        if response != gtk4::ResponseType::Accept {
+            return;
+        }
+        let files = dialog.files();
+        let paths = (0..files.n_items())
+            .filter_map(|index| files.item(index))
+            .filter_map(|item| item.downcast::<gio::File>().ok())
+            .filter_map(|file| file.path())
+            .collect();
+        on_accept(paths);
+    });
+    dialog.show();
+}
+
+/// Open a folder chooser using GTK 4.8's native-dialog API.
+pub(crate) fn choose_folder(
+    parent: Option<&gtk4::Window>,
+    title: &str,
+    on_accept: impl Fn(PathBuf) + 'static,
+) {
+    let dialog = gtk4::FileChooserNative::new(
+        Some(title),
+        parent,
+        gtk4::FileChooserAction::SelectFolder,
+        Some("Select"),
+        Some("Cancel"),
+    );
+    dialog.connect_response(move |dialog, response| {
+        if response == gtk4::ResponseType::Accept
+            && let Some(path) = dialog.file().and_then(|file| file.path())
+        {
+            on_accept(path);
+        }
+    });
+    dialog.show();
+}
+
+/// Open a save chooser using GTK 4.8's native-dialog API.
+pub(crate) fn choose_save_file(
+    parent: Option<&gtk4::Window>,
+    title: &str,
+    initial_name: &str,
+    on_accept: impl Fn(PathBuf) + 'static,
+) {
+    let dialog = gtk4::FileChooserNative::new(
+        Some(title),
+        parent,
+        gtk4::FileChooserAction::Save,
+        Some("Save"),
+        Some("Cancel"),
+    );
+    dialog.set_current_name(initial_name);
+    dialog.connect_response(move |dialog, response| {
+        if response == gtk4::ResponseType::Accept
+            && let Some(path) = dialog.file().and_then(|file| file.path())
+        {
+            on_accept(path);
+        }
+    });
+    dialog.show();
 }
 
 /// A dim, non-interactive placeholder row for an empty section.

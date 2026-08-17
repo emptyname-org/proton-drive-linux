@@ -20,8 +20,8 @@ pub(crate) struct Viewer {
     /// Coordinates behind `info_map`, once a photo with GPS tags is shown.
     pub(crate) coords: RefCell<Option<(f64, f64)>>,
     /// The favourite toggle in the top bar, and whether it is being set from
-    /// the model rather than by the user — the same suppression the details pane
-    /// uses for its pin switch, so painting a photo doesn't fire a round-trip.
+    /// the model rather than by the user, so painting a photo doesn't fire a
+    /// round-trip.
     pub(crate) favorite: gtk4::ToggleButton,
     pub(crate) favorite_suppress: Cell<bool>,
     /// uid of the photo currently on screen.
@@ -220,7 +220,6 @@ pub(crate) fn show_info(viewer: &Rc<Viewer>, path: &str, info: ExifInfo) {
             let row = adw::ActionRow::builder()
                 .title(label)
                 .subtitle(value)
-                .subtitle_selectable(true)
                 .build();
             row.add_css_class("property");
             group.append(&row);
@@ -327,22 +326,19 @@ pub(crate) fn gps_degrees(reader: &exif::Exif, tag: exif::Tag, ref_tag: exif::Ta
 }
 
 pub(crate) fn save_photo_to_disk(window: &gtk4::Window, source_path: &str, original_name: &str) {
-    let dialog = gtk4::FileDialog::builder()
-        .title("Save Photo")
-        .initial_name(original_name)
-        .build();
     let source_path_str = source_path.to_string();
-    dialog.save(Some(window), gio::Cancellable::NONE, move |res| {
-        if let Ok(file) = res
-            && let Some(dest_path) = file.path()
-        {
+    choose_save_file(
+        Some(window),
+        "Save Photo",
+        original_name,
+        move |dest_path| {
             if let Err(e) = std::fs::copy(&source_path_str, &dest_path) {
                 tracing::error!("Failed to copy file to {:?}: {}", dest_path, e);
             } else {
                 tracing::info!("Saved photo to {:?}", dest_path);
             }
-        }
-    });
+        },
+    );
 }
 
 /// Step `delta` photos through the flat timeline model and load what lands there.

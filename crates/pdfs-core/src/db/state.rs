@@ -62,7 +62,7 @@ impl Db {
     /// the caller can delete it.
     ///
     /// Rows supersede only their own kind, and only the kinds
-    /// [`op_supersedes`] names. A create op for the same uid must survive —
+    /// `op_supersedes` names. A create op for the same uid must survive —
     /// dropping it would leave a file that exists nowhere but this machine with
     /// nothing left to create it. (Writes to a node that is itself still queued
     pub fn state_i64(&self, key: &str) -> Result<Option<i64>> {

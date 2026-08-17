@@ -2,7 +2,7 @@
 //!
 //! Everything here is blocking and GTK-free — the process exists for one
 //! round-trip and then exits, so there is no main loop to keep off. It reuses
-//! the GTK prompt's [`Hit`](crate::Hit) model and ranking, and its Drive
+//! the GTK prompt's [`Hit`] model and ranking, and its Drive
 //! activation policy, so the two front ends cannot drift on what "open" means.
 //!
 //! Launchers filter a static list; they cannot call back for a new one per

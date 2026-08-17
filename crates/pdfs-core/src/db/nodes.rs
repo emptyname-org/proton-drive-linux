@@ -352,7 +352,7 @@ impl Db {
     /// Full-text search over node names, newest schema's trigram index giving
     /// substring (not just prefix) matches. Returns up to `limit` non-trashed
     /// hits, each with its mountpoint-relative path resolved. Queries shorter
-    /// than [`TRIGRAM_MIN`] fall back to a `LIKE` scan since trigram indexes
+    /// than `TRIGRAM_MIN` fall back to a `LIKE` scan since trigram indexes
     /// nothing below 3 chars.
     pub fn search(&self, query: &str, limit: usize) -> Result<Vec<SearchHit>> {
         let query = query.trim();
