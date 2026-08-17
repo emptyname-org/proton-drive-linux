@@ -125,7 +125,7 @@ mod tests {
             saved_at: 1_700_000_000,
             folders: vec![ProfileFolder {
                 remote_uid: "vol~link".to_string(),
-                local_path: "/home/nils/Documents".to_string(),
+                local_path: "/home/user/Documents".to_string(),
                 mode: MountMode::Mirror,
             }],
             pins: vec![ProfilePin {
@@ -135,7 +135,7 @@ mod tests {
             }],
             ignore_patterns: Some(vec!["target/".to_string()]),
             cache_budget: Some(5_000_000_000),
-            mountpoint: Some("/home/nils/ProtonDrive".to_string()),
+            mountpoint: Some("/home/user/ProtonDrive".to_string()),
         }
     }
 

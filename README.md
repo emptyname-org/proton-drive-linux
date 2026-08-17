@@ -20,8 +20,8 @@ actions, explicit control over the mount service's lifetime, and reproducible
 Debian packaging.
 
 The underlying client retains upstream's files-on-demand FUSE mount with
-block-level caching, command-line interface, non-blocking GTK4 desktop app, and
-system tray integration. GitHub Releases for this fork contain an `amd64` `.deb`
+block-level caching, command-line interface, GTK4 desktop app, and system tray
+integration. Tagged GitHub releases from this fork contain an `amd64` `.deb`
 package only; the Arch and Fedora files remain available for local builds.
 
 ## Why this fork?
@@ -35,9 +35,9 @@ this repository does not imply a promise of support or long-term maintenance.
 
 ## Features
 
-- **Files-on-Demand (FUSE)**: Mount your Proton Drive as a virtual filesystem where files are downloaded only when opened, utilizing smart block-level caching and disk-backed writes.
+- **Files-on-Demand (FUSE)**: Mount your Proton Drive as a virtual filesystem that fetches file content as applications read it, with block-level caching and disk-backed writes. Building thumbnails and choosing **Offline copy** can deliberately fetch content earlier.
 - **Command-Line Interface (CLI)**: Manage your drive, authenticate, and monitor sync status directly from the terminal.
-- **Non-Blocking GTK4 Desktop App**: Browse files, manage pins, configure options, and monitor active transfers through a modern, native GUI with a fully non-blocking asynchronous main loop.
+- **Responsive GTK4 Desktop App**: Browse files, manage offline copies, configure options, and monitor active transfers through a modern native GUI. Network, control-socket, credential, and cache work is dispatched away from the GTK main loop.
 - **Background Service Control**: Keep mounts, sync, tray actions, and Drive search running after the app closes, or scope the mount service to the app session from Settings.
 - **Shared Links & Invites**: Browse files shared with you by other users, and view/manage your own public shared links directly in the GUI.
 - **Local Backup (Computers)**: Sync and back up local directories (like Downloads, Documents, Pictures, etc.) directly to your Proton Drive account.
@@ -75,14 +75,14 @@ pdfs-prompt --dmenu --query invoice                   # skip straight to a searc
 A launcher filters a fixed list — it cannot ask for a new one per keystroke — so
 searching takes two steps, and the prompt says which step you are on:
 
-- `Search Drive ›` lists your pinned files. Type anything that isn't one of them
-  and press Enter to search for it.
+- `Search Drive ›` lists the items explicitly kept offline (`pdfs pins` in the
+  CLI). Type anything that isn't one of them and press Enter to search for it.
 - `Drive: invoice ›` lists the results. Enter opens one; typing something else
   and pressing Enter searches again. Escape closes.
 
 `--query` skips the first step. fuzzel and rofi also get file-type icons.
 
-To make an existing keybinding use it without re-binding, and to pin the
+To make an existing keybinding use it without re-binding, and to configure the
 launcher command, set them in `config.json`:
 
 ```json
@@ -206,7 +206,7 @@ For the local metadata database and content cache:
 | `pdfs cache inspect` | Database size, reclaimable space, per-table row counts, cache usage against budget |
 | `pdfs cache inspect --deep` | Also runs SQLite's integrity check — reads every page, so it is slow on a large database |
 | `pdfs cache vacuum` | Checkpoints the write-ahead log and compacts the database |
-| `pdfs cache clear` | Deletes cached file content, keeping pinned files |
+| `pdfs cache clear` | Deletes cached file content while keeping explicit offline copies |
 
 `vacuum` takes a write lock for its duration and needs room for a second copy of
 the database while it runs, so it is a deliberate operation rather than
@@ -227,9 +227,10 @@ $ pdfs --json cache inspect | jq '.db_reclaimable_bytes'
 $ pdfs --json status | jq -r '.mount.mountpoint'
 ```
 
-Supported on `status`, `ls`, `pins`, `sync list`, `devices list`, `transfers`,
-`activity`, and `cache inspect`. Commands that perform an action keep their
-human output — a script that needs to know whether one worked has the exit code.
+Supported on `status`, `ls`, `pins`, `sync list`, `devices list`, `locations`,
+`transfers`, `activity`, and `cache inspect`. Commands that perform an action
+keep their human output — a script that needs to know whether one worked has the
+exit code.
 
 Two things worth relying on:
 
@@ -245,15 +246,15 @@ Two things worth relying on:
 
 The client includes several optimizations designed for high efficiency, a low memory footprint, and a responsive user experience:
 
-- **On-Demand Block Cache**: Files are read in fixed 4 MiB blocks. For unpinned files, the client fetches and caches only the blocks containing the requested byte ranges. This enables fast sequential and sparse reads (e.g. media streaming or metadata scanning) without downloading entire files.
+- **On-Demand Block Cache**: Files are read using the encrypted block geometry reported by each Drive revision. For files not explicitly kept offline, the client fetches and caches only the blocks covering requested byte ranges. This enables sequential and sparse reads (for example media streaming or metadata scanning) without downloading an entire file.
 - **Disk-Backed Writes**: Large file writes are staged on disk in temporary scratch files (rather than fully buffered in RAM) and track modified byte intervals. Only the unedited remote segments are fetched at commit time, keeping memory usage minimal.
-- **Non-Blocking GTK4 Loop**: To prevent UI freezes, all synchronous D-Bus credential checks, control socket requests, and cache usage calculations are offloaded to background worker threads or fetched asynchronously.
-- **Flicker-Free UI Rendering**: The GTK4 application performs differential rendering of the pins list, only modifying list rows when the list content changes, preserving the user's scroll position and widget focus.
+- **Responsive GTK4 Loop**: Potentially blocking D-Bus credential checks, control-socket requests, and cache calculations used by the GUI are dispatched to background work or fetched asynchronously.
+- **Bounded Status Polling**: Regular GUI status updates carry cache totals and an offline-item count rather than transferring the complete offline-copy registry every few seconds.
 - **Durable Staging**: Scratch metadata and staged writes are synced and atomically published before an upload is acknowledged locally. Rapid revisions supersede pending work transactionally.
 
 ## Filesystem Safety
 
-Version 1.0 strengthens the boundaries around local-only data and destructive reconciliation:
+The current client strengthens the boundaries around local-only data and destructive reconciliation:
 
 - Truncate composes with queued revisions, preserving the authoritative prefix and correct zero-filled growth.
 - Combined move-and-rename operations are queued durably and tolerate partially completed remote state.
@@ -266,7 +267,9 @@ Version 1.0 strengthens the boundaries around local-only data and destructive re
 
 ## Prerequisites
 
-To compile the application from source or run the built binaries, ensure you have the following system libraries installed on your distribution:
+To compile the application from source, install the native development packages
+for your distribution. Rust is installed separately in the next section. Users
+installing the `.deb` do not need to install these development packages.
 
 ### Ubuntu / Debian (24.04+)
 ```bash
@@ -291,18 +294,14 @@ sudo pacman -S --needed pkgconf fuse3 gtk4 libadwaita libsecret dbus webkitgtk-6
 ```bash
 sudo dnf install -y \
   pkgconf-pkg-config fuse3-devel gtk4-devel libadwaita-devel \
-  webkitgtk6.0-devel libsecret-devel dbus-devel glib2-devel cargo rust \
+  webkitgtk6.0-devel libsecret-devel dbus-devel glib2-devel \
   perl-Image-ExifTool
 ```
 
-Runtime extras (pick your desktop):
-```bash
-# GNOME — keyring + tray (AppIndicator)
-sudo dnf install -y gnome-keyring gnome-shell-extension-appindicator xdg-utils
-
-# KDE Plasma — KWallet (Secret Service); tray works via built-in SNI
-sudo dnf install -y kwallet xdg-utils
-```
+At runtime, credential storage needs a Secret Service provider such as GNOME
+Keyring or KWallet, and opening files with the default handler needs
+`xdg-utils`. GNOME Shell may also need its AppIndicator extension to display the
+tray icon. Exact integration package names vary by distribution and desktop.
 
 ---
 
@@ -332,7 +331,7 @@ The compiled binaries will be available under `target/release/`:
 
 ### Debian / Ubuntu release (`amd64`)
 
-This fork publishes only a `.deb` package on its
+Tagged releases from this fork publish only a `.deb` package on the
 [Releases page](https://github.com/emptyname-org/proton-drive-linux/releases).
 Download it and install it with `apt`:
 
@@ -368,11 +367,12 @@ sudo dnf install packaging/out/x86_64/proton-drive-linux-*.rpm
 
 ## Automated Releases (CI/CD)
 
-This project has a GitHub Actions CI workflow configured under `.github/workflows/release.yml`.
+This project uses `.github/workflows/ci.yml` for pushes and pull requests, and
+`.github/workflows/release.yml` for release builds.
 
 ### How it works:
-1. **Triggers**: 
-   - Pushing a git tag matching `v*` (e.g. `git tag v0.1.0 && git push origin v0.1.0`).
+1. **Triggers**:
+   - Pushing a git tag matching `v*` (for example `v1.8.2+fork.1`).
    - Manual runs via the **Actions** tab in GitHub (**workflow_dispatch**).
 2. **Quality Gates and Build Process**:
    - For tagged builds, verifies that the tag, workspace version, and `packaging/PKGBUILD` version agree.

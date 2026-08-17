@@ -335,7 +335,7 @@ mod tests {
     fn finished_names_are_not_transient() {
         for name in [
             "teamspeak.tar.gz",
-            "nils.zip",
+            "archive.zip",
             "report.xml",
             "archive.partly.zip", // ".partly" is not ".part"
             "template.dotx",

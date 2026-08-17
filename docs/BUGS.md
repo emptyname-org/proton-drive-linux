@@ -597,7 +597,7 @@ The on-demand fork itself says `Owner`. The **primary** state says `Unknown`:
   are on the same volume, in the same table.
 - A device folder's `parent_uid` is the **device root**, which is never
   persisted as a node. In this account's DB all six device-folder roots
-  (`Downloads`, `Pictures`, `Music`, `Documents`, `Videos`, `narl`) have
+  (`Downloads`, `Pictures`, `Music`, `Documents`, `Videos`, `Home`) have
   `parent_uid = <device root>` with no matching row, so pass 2 parks them at
   `ORPHAN_INO`.
 - `hydrate_access` then hit its "parent is not resident" branch, which had no
@@ -1256,7 +1256,7 @@ present in the destination listing — B1 is genuinely fixed — but stats as **
 bytes** and `cat` returns nothing:
 
 ```
--rw-r--r-- 1 narl narl 0 Jul 20 00:29 zz-b1-dst/zz-b1-src.txt
+-rw-r--r-- 1 user user 0 Jul 20 00:29 zz-b1-dst/zz-b1-src.txt
 ```
 
 A few seconds later the same file reads correctly (`3` bytes, `hi`). A control
@@ -1576,7 +1576,7 @@ now succeed with `x` holding `b`.
 sender failed to read its own source files:
 
 ```
-rsync: [sender] read errors mapping "/home/narl/ProtonDrive/Music/…/
+rsync: [sender] read errors mapping "/home/user/ProtonDrive/Music/…/
     Buunshin - i think i feel... (Original Mix).wav": No data available (61)
 ```
 
@@ -2339,7 +2339,7 @@ into that download, `RACING-LOCAL-EDIT-B39` was written to the destination path.
 
 ```
 WARN pdfs_fuse::sync: sync: local file changed while downloading; keeping it as a conflict copy
-  path=/home/narl/pdfs-live-mirror/b40.bin expected=None
+  path=/home/user/pdfs-live-mirror/b40.bin expected=None
   actual=Some(LocalSig { mtime: 1786916720, mtime_ns: Some(1786916720414151922), size: 21 })
 ```
 
@@ -3267,7 +3267,7 @@ B74 made read back as empty); with that out of the way the acceptance case
 **Found:** triaging the divergent conflict copies B69 left behind. In `~/Downloads`
 (an on-demand mount) the complete files had been forked into `(sync-conflict)`
 copies while their truncated partials kept the canonical name — e.g.
-`teamspeak.tar.gz` (30 MB partial live vs a 3.77 GB conflict copy) and `nils.zip`
+`teamspeak.tar.gz` (30 MB partial live vs a 3.77 GB conflict copy) and `archive.zip`
 (17 MB vs 3.18 GB). The conflict copies were byte-exact to the user's independent
 gdrive backups, proving the *conflict copy* was the finished download and the
 *live* file the stub. The smoking gun: four `Unconfirmed NNNNN (sync-conflict …).crdownload`
