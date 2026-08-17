@@ -13,7 +13,6 @@ jobs:
   build-release:
     name: Build and Release
     runs-on: ubuntu-24.04
-    environment: 'rpm signing'
 
     steps:
       - name: Checkout repository
@@ -31,8 +30,7 @@ jobs:
             libsecret-1-dev \
             libdbus-1-dev \
             desktop-file-utils \
-            libimage-exiftool-perl \
-            rpm
+            libimage-exiftool-perl
 
       - name: Set up Rust
         uses: actions-rust-lang/setup-rust-toolchain@v1
@@ -78,72 +76,22 @@ jobs:
           echo "VERSION=$VERSION" >> $GITHUB_ENV
           echo "Building version: $VERSION"
 
-      - name: Package raw binaries and Debian package
+      - name: Package Debian package
         run: |
-          packaging/package-release.sh "${{ env.VERSION }}" "$PWD/dist"
-
-      - name: Package Fedora package (.rpm)
-        run: |
-          # Sanitize version (replace hyphens with dots for RPM compatibility)
-          RPM_VERSION=$(echo "${{ env.VERSION }}" | tr '-' '.')
-          
-          # Create RPM build directories
-          mkdir -p rpmbuild/{BUILD,RPMS,SOURCES,SPECS,SRPMS,BUILDROOT,db}
-          
-          # Build RPM package
-          rpmbuild -bb \
-            --nodeps \
-            --define "_topdir $PWD/rpmbuild" \
-            --define "_sourcedir $PWD" \
-            --define "git_dir $PWD" \
-            --define "version ${RPM_VERSION}" \
-            --define "_dbpath $PWD/rpmbuild/db" \
-            packaging/proton-drive-linux.spec
-            
-          # Keep every release artifact in one directory.
-          cp rpmbuild/RPMS/x86_64/*.rpm dist/
-
-      - name: Sign Fedora package (.rpm)
-        env:
-          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
-          GPG_KEY_NAME: ${{ secrets.GPG_KEY_NAME }}
-          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
-        run: |
-          if [ -n "$GPG_PRIVATE_KEY" ] && [ -n "$GPG_KEY_NAME" ]; then
-            echo "$GPG_PRIVATE_KEY" | gpg --batch --pinentry-mode loopback --passphrase "$GPG_PASSPHRASE" --import
-            
-            cat <<EOF > ~/.rpmmacros
-          %_signature gpg
-          %_gpg_name ${GPG_KEY_NAME}
-          %__gpg_sign_cmd %{__gpg} gpg --batch --verbose --no-armor --pinentry-mode loopback --passphrase %{_gpg_passphrase} --no-secmem-warning -u "%{_gpg_name}" -sbo %{__signature_filename} --digest-algo sha256 %{__plaintext_filename}
-          EOF
-          
-            rpm --addsign --define "_gpg_passphrase $GPG_PASSPHRASE" dist/*.rpm
-          else
-            echo "Skipping RPM signing: GPG_PRIVATE_KEY or GPG_KEY_NAME secret is not set."
-          fi
-
-      - name: Write release checksums
-        run: |
-          cd dist
-          sha256sum ./*.deb ./*.tar.gz ./*.rpm > SHA256SUMS
+          packaging/package-deb.sh "${{ env.VERSION }}" "$PWD/dist"
 
       - name: Upload Workflow Artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: proton-drive-linux-builds
-          path: dist/
+          name: proton-drive-linux-deb
+          path: dist/*.deb
           if-no-files-found: error
 
       - name: Create GitHub Release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: |
-            dist/*.deb
-            dist/*.tar.gz
-            dist/*.rpm
-            dist/SHA256SUMS
+          files: dist/*.deb
           draft: false
           prerelease: false
         env:

@@ -14,7 +14,7 @@ Version:        %{version}
 Release:        1%{?dist}
 Summary:        Proton Drive client for Linux (FUSE, CLI, GTK4 app + tray)
 License:        MIT
-URL:            https://github.com/narl/proton-drive-linux
+URL:            https://github.com/emptyname-org/proton-drive-linux
 ExclusiveArch:  x86_64
 
 BuildRequires:  cargo
@@ -51,7 +51,7 @@ CLI, GTK4/Libadwaita GUI, system tray, and search launcher.
 # In-tree build: no Source tarball. Pass --define "git_dir /path/to/checkout".
 test -n "%{?git_dir}" || (echo 'Pass --define "git_dir $PWD" from the repo root' >&2; exit 1)
 test -f %{git_dir}/Cargo.toml
-cp -a %{git_dir}/LICENSE .
+cp -a %{git_dir}/LICENSE %{git_dir}/packaging/ICON-LICENSE.md .
 %build
 cd %{git_dir}
 target_dir="%{?cargo_target_dir}"
@@ -75,13 +75,13 @@ install -D -m0644 %{git_dir}/packaging/io.narl.proton-drive-linux.desktop \
   %{buildroot}%{_datadir}/applications/io.narl.proton-drive-linux.desktop
 install -D -m0644 %{git_dir}/packaging/io.narl.proton-drive-linux-tray.desktop \
   %{buildroot}%{_sysconfdir}/xdg/autostart/io.narl.proton-drive-linux-tray.desktop
-install -D -m0644 %{git_dir}/packaging/io.narl.proton-drive-linux.svg \
+install -D -m0644 %{git_dir}/packaging/linux_cloud_folder_1.svg \
   %{buildroot}%{_datadir}/icons/hicolor/scalable/apps/io.narl.proton-drive-linux.svg
 install -D -m0644 %{git_dir}/packaging/proton-drive.service \
   %{buildroot}/usr/lib/systemd/user/proton-drive.service
 
 %files
-%license LICENSE
+%license LICENSE ICON-LICENSE.md
 %{_bindir}/pdfs
 %{_bindir}/pdfs-tray
 %{_bindir}/pdfs-app

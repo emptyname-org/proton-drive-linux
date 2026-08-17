@@ -1,6 +1,23 @@
-# Proton Drive client for Linux (unofficial)
+<p align="center">
+  <img src="packaging/linux_cloud_folder_1.svg" alt="Linux cloud folder icon" width="144">
+</p>
+
+# Proton Drive client for Linux — experimental community fork
+
+> [!IMPORTANT]
+> This is an experimental community fork of
+> [`narrrl/proton-drive-linux`](https://github.com/narrrl/proton-drive-linux).
+> It is unofficial, is not affiliated with or endorsed by Proton AG, and is
+> shared as-is without a promise of support, compatibility, or continued
+> maintenance.
 
 A fast, unofficial Proton Drive client for Linux. This client features an advanced files-on-demand FUSE virtual mount with block-level caching, a command-line interface (CLI), and a fully non-blocking GTK4 desktop application with system tray integration.
+
+This fork focuses on a more native Linux desktop experience, responsive file
+and offline-copy actions, locally cached thumbnails (including camera RAW
+previews), and reproducible Debian packaging. GitHub Releases contain an
+`amd64` `.deb` package only; the Arch and Fedora files remain available for
+people who want to build locally.
 
 ## Features
 
@@ -305,7 +322,7 @@ Ensure you have Rust and Cargo installed (minimum supported Rust version is 1.96
 
 1. Clone the repository and navigate into the project directory:
    ```bash
-   git clone https://github.com/narl/proton-drive-linux.git
+   git clone https://github.com/emptyname-org/proton-drive-linux.git
    cd proton-drive-linux
    ```
 2. Build the workspace in release mode:
@@ -323,19 +340,27 @@ The compiled binaries will be available under `target/release/`:
 
 ## Installation & Packages
 
-### 1. Debian / Ubuntu (.deb)
-Install the debian package via `dpkg` or `apt`:
+### Debian / Ubuntu release (`amd64`)
+
+This fork publishes only a `.deb` package on its
+[Releases page](https://github.com/emptyname-org/proton-drive-linux/releases).
+Download it and install it with `apt`:
+
 ```bash
 sudo apt install ./proton-drive-linux_*.deb
 ```
 
-### 2. Arch Linux
+### Other distributions (local builds)
+
+#### Arch Linux
+
 A local `PKGBUILD` is available under the `packaging/` directory. You can build and install it using:
 ```bash
 cd packaging && makepkg -fi
 ```
 
-### 3. Fedora (local RPM)
+#### Fedora
+
 A local `.spec` is available under `packaging/`. From the repository root:
 ```bash
 sudo dnf install -y rpm-build
@@ -366,15 +391,20 @@ This project has a GitHub Actions CI workflow configured under `.github/workflow
    - Sets up the Rust compiler and caches build targets to speed up runs.
    - Compiles the workspace members in release mode.
 3. **Artifact Packaging**:
-   - Generates a `.tar.gz` containing the raw binaries (`pdfs`, `pdfs-app`, `pdfs-tray`, `pdfs-prompt`).
-   - Packs them into Debian (`.deb`) and Fedora (`.rpm`) packages.
-   - Includes the systemd user service and tray autostart entry in the Debian package.
+   - Builds one Debian/Ubuntu `amd64` (`.deb`) package.
+   - Includes the four binaries, systemd user service, desktop entry, icon, license, and tray autostart entry.
 4. **Publishing**:
-   - Creates a GitHub Release matching the pushed tag and uploads the `.deb`, `.rpm`, and `.tar.gz` packages as release assets.
-   - For manual runs, compiles and exposes the packages as workflow run artifacts for testing.
+   - Creates a GitHub Release matching the pushed tag and uploads only the `.deb` package.
+   - For manual runs, exposes the same `.deb` as a workflow artifact for testing.
 
 ---
 
 ## License
 
-This project is licensed under the [MIT License](LICENSE).
+The code is licensed under the [MIT License](LICENSE).
+
+The application icon is a composite containing Tux, originally created by
+Larry Ewing using GIMP. The SVG declares the
+[Free Art License](https://artlibre.org/licence/lal/en/) and is distributed
+separately from the MIT-licensed code. See the
+[icon attribution and license notice](packaging/ICON-LICENSE.md).

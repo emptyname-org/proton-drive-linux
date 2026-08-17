@@ -13,7 +13,7 @@ pkgver=1.8.2
 pkgrel=1
 pkgdesc="Proton Drive client for Linux: FUSE files-on-demand mount, CLI, GTK4 app + tray"
 arch=('x86_64')
-url="https://github.com/narl/proton-drive-linux"
+url="https://github.com/emptyname-org/proton-drive-linux"
 license=('MIT')
 depends=('fuse3' 'gtk4' 'libadwaita' 'webkitgtk-6.0' 'perl-image-exiftool')
 makedepends=('cargo' 'git')
@@ -63,7 +63,7 @@ package() {
     "$pkgdir/usr/share/applications/io.narl.proton-drive-linux.desktop"
   install -Dm644 "packaging/io.narl.proton-drive-linux-tray.desktop" \
     "$pkgdir/etc/xdg/autostart/io.narl.proton-drive-linux-tray.desktop"
-  install -Dm644 "packaging/io.narl.proton-drive-linux.svg" \
+  install -Dm644 "packaging/linux_cloud_folder_1.svg" \
     "$pkgdir/usr/share/icons/hicolor/scalable/apps/io.narl.proton-drive-linux.svg"
 
   # systemd user service that runs the auto-mount daemon. Enabled per-user by
@@ -72,4 +72,6 @@ package() {
     "$pkgdir/usr/lib/systemd/user/proton-drive.service"
 
   install -Dm644 "LICENSE" "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+  install -Dm644 "packaging/ICON-LICENSE.md" \
+    "$pkgdir/usr/share/licenses/$pkgname/ICON-LICENSE.md"
 }
