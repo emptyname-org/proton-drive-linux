@@ -7,7 +7,7 @@
 # Match Arch PKGBUILD `!lto` — LTO has broken some GTK/Rust links in practice.
 %global _lto_cflags %{nil}
 
-%{!?version: %global version 1.8.2+fork.1}
+%{!?version: %global version 1.8.2+fork.2}
 
 Name:           proton-drive-linux
 Version:        %{version}
@@ -92,6 +92,9 @@ install -D -m0644 %{git_dir}/packaging/proton-drive.service \
 /usr/lib/systemd/user/proton-drive.service
 
 %changelog
+* Mon Aug 17 2026 Proton Drive Linux contributors - 1.8.2+fork.2-1
+- Standardize application dialogs on one native GTK window template.
+
 * Mon Aug 17 2026 Proton Drive Linux contributors - 1.8.2+fork.1-1
 - First experimental fork release with Files thumbnails and desktop UI changes.
 

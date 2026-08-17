@@ -372,7 +372,7 @@ This project uses `.github/workflows/ci.yml` for pushes and pull requests, and
 
 ### How it works:
 1. **Triggers**:
-   - Pushing a git tag matching `v*` (for example `v1.8.2+fork.1`).
+   - Pushing a git tag matching `v*` (for example `v1.8.2+fork.2`).
    - Manual runs via the **Actions** tab in GitHub (**workflow_dispatch**).
 2. **Quality Gates and Build Process**:
    - For tagged builds, verifies that the tag, workspace version, and `packaging/PKGBUILD` version agree.
