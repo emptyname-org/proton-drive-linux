@@ -746,6 +746,220 @@ pub(crate) fn native_dialog_window(
     window
 }
 
+type DialogResponseHandler = Box<dyn Fn(&AppMessageDialog, &str)>;
+
+/// One reusable implementation for every application-owned prompt.
+///
+/// Unlike `adw::MessageDialog`, this uses the same decorated `gtk4::Window`
+/// shell as About, Share, Versions, Verification, Shortcuts, and the photo
+/// viewer. Native file choosers remain delegated to the desktop portal.
+#[derive(Clone)]
+pub(crate) struct AppMessageDialog {
+    inner: Rc<AppMessageDialogInner>,
+}
+
+struct AppMessageDialogInner {
+    window: gtk4::Window,
+    extra_slot: gtk4::Box,
+    actions: gtk4::Box,
+    buttons: RefCell<HashMap<String, gtk4::Button>>,
+    callbacks: RefCell<Vec<DialogResponseHandler>>,
+    close_response: RefCell<String>,
+    responded: Cell<bool>,
+    /// GTK keeps the native window visible after the Rust wrapper leaves the
+    /// caller's stack. Hold the response state for exactly that visible
+    /// lifetime, then break the self-reference from `close-request`.
+    self_hold: RefCell<Option<Rc<AppMessageDialogInner>>>,
+}
+
+#[derive(Default)]
+pub(crate) struct AppMessageDialogBuilder {
+    heading: String,
+    body: String,
+    extra_child: Option<gtk4::Widget>,
+}
+
+impl AppMessageDialog {
+    pub(crate) fn builder() -> AppMessageDialogBuilder {
+        AppMessageDialogBuilder::default()
+    }
+
+    pub(crate) fn add_response(&self, id: &str, label: &str) {
+        let button = gtk4::Button::with_label(label);
+        let id_owned = id.to_string();
+        let weak = Rc::downgrade(&self.inner);
+        button.connect_clicked(move |_| {
+            let Some(inner) = weak.upgrade() else {
+                return;
+            };
+            AppMessageDialog { inner }.dispatch_response(&id_owned, true);
+        });
+        self.inner.actions.append(&button);
+        self.inner
+            .buttons
+            .borrow_mut()
+            .insert(id.to_string(), button);
+    }
+
+    pub(crate) fn set_response_appearance(&self, id: &str, appearance: adw::ResponseAppearance) {
+        let Some(button) = self.inner.buttons.borrow().get(id).cloned() else {
+            return;
+        };
+        button.remove_css_class("suggested-action");
+        button.remove_css_class("destructive-action");
+        match appearance {
+            adw::ResponseAppearance::Suggested => button.add_css_class("suggested-action"),
+            adw::ResponseAppearance::Destructive => button.add_css_class("destructive-action"),
+            _ => {}
+        }
+    }
+
+    pub(crate) fn set_default_response(&self, id: Option<&str>) {
+        let button = id.and_then(|id| self.inner.buttons.borrow().get(id).cloned());
+        if let Some(button) = button.as_ref() {
+            button.set_receives_default(true);
+        }
+        self.inner.window.set_default_widget(button.as_ref());
+    }
+
+    pub(crate) fn set_close_response(&self, id: &str) {
+        *self.inner.close_response.borrow_mut() = id.to_string();
+    }
+
+    pub(crate) fn set_extra_child<W: IsA<gtk4::Widget>>(&self, child: Option<&W>) {
+        while let Some(existing) = self.inner.extra_slot.first_child() {
+            self.inner.extra_slot.remove(&existing);
+        }
+        if let Some(child) = child {
+            self.inner.extra_slot.append(child);
+        }
+    }
+
+    pub(crate) fn connect_response<F>(&self, _id: Option<&str>, callback: F)
+    where
+        F: Fn(&AppMessageDialog, &str) + 'static,
+    {
+        self.inner.callbacks.borrow_mut().push(Box::new(callback));
+    }
+
+    pub(crate) fn set_transient_for(&self, parent: Option<&gtk4::Window>) {
+        self.inner.window.set_transient_for(parent);
+    }
+
+    pub(crate) fn present(&self) {
+        *self.inner.self_hold.borrow_mut() = Some(self.inner.clone());
+        self.inner.window.present();
+    }
+
+    fn dispatch_response(&self, id: &str, close: bool) {
+        if self.inner.responded.replace(true) {
+            return;
+        }
+        for callback in self.inner.callbacks.borrow().iter() {
+            callback(self, id);
+        }
+        if close {
+            self.inner.window.close();
+        }
+    }
+}
+
+impl AppMessageDialogBuilder {
+    pub(crate) fn heading(mut self, heading: impl Into<String>) -> Self {
+        self.heading = heading.into();
+        self
+    }
+
+    pub(crate) fn body(mut self, body: impl Into<String>) -> Self {
+        self.body = body.into();
+        self
+    }
+
+    pub(crate) fn extra_child<W: IsA<gtk4::Widget>>(mut self, child: &W) -> Self {
+        self.extra_child = Some(child.clone().upcast());
+        self
+    }
+
+    pub(crate) fn build(self) -> AppMessageDialog {
+        let content = gtk4::Box::new(gtk4::Orientation::Vertical, 16);
+        content.set_margin_top(20);
+        content.set_margin_bottom(20);
+        content.set_margin_start(20);
+        content.set_margin_end(20);
+
+        if !self.body.is_empty() {
+            let body = gtk4::Label::builder()
+                .label(&self.body)
+                .wrap(true)
+                .xalign(0.0)
+                .max_width_chars(54)
+                .build();
+            content.append(&body);
+        }
+
+        let extra_slot = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+        if let Some(child) = self.extra_child.as_ref() {
+            extra_slot.append(child);
+        }
+        content.append(&extra_slot);
+
+        let actions = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+        actions.set_halign(gtk4::Align::End);
+        content.append(&actions);
+
+        let clamp = adw::Clamp::builder()
+            .maximum_size(560)
+            .child(&content)
+            .build();
+        let window = native_dialog_window(None, &self.heading, 480, 260);
+        window.set_child(Some(&clamp));
+
+        let dialog = AppMessageDialog {
+            inner: Rc::new(AppMessageDialogInner {
+                window,
+                extra_slot,
+                actions,
+                buttons: RefCell::new(HashMap::new()),
+                callbacks: RefCell::new(Vec::new()),
+                close_response: RefCell::new("cancel".to_string()),
+                responded: Cell::new(false),
+                self_hold: RefCell::new(None),
+            }),
+        };
+
+        let weak = Rc::downgrade(&dialog.inner);
+        dialog.inner.window.connect_close_request(move |_| {
+            if let Some(inner) = weak.upgrade() {
+                let response = inner.close_response.borrow().clone();
+                AppMessageDialog {
+                    inner: inner.clone(),
+                }
+                .dispatch_response(&response, false);
+                inner.self_hold.borrow_mut().take();
+            }
+            glib::Propagation::Proceed
+        });
+
+        let keys = gtk4::EventControllerKey::new();
+        let weak = Rc::downgrade(&dialog.inner);
+        keys.connect_key_pressed(move |_, key, _, state| {
+            let close = key == gtk4::gdk::Key::Escape
+                || (key == gtk4::gdk::Key::w
+                    && state.contains(gtk4::gdk::ModifierType::CONTROL_MASK));
+            if close {
+                if let Some(inner) = weak.upgrade() {
+                    inner.window.close();
+                }
+                glib::Propagation::Stop
+            } else {
+                glib::Propagation::Proceed
+            }
+        });
+        dialog.inner.window.add_controller(keys);
+        dialog
+    }
+}
+
 /// Point every page's Refresh button at the current page. One handler for all of
 /// them: the button acts on whatever is on screen, so it can't refresh a page the
 /// user has since navigated away from.
@@ -969,9 +1183,9 @@ fn install_window_actions(window: &gtk4::ApplicationWindow) {
     window.add_action(&about);
 }
 
-/// Show GTK's native shortcut reference window, listing exactly what
-/// [`install_shortcuts`] binds. GTK supplies the key-cap rendering, search,
-/// window chrome and keyboard navigation.
+/// Show the shortcut reference in the application's shared native dialog shell,
+/// listing exactly what [`install_shortcuts`] binds. GTK still supplies the
+/// key-cap rendering and keyboard navigation.
 fn show_shortcuts(window: &gtk4::ApplicationWindow) {
     const KEYS: [(&str, &str); 7] = [
         ("<Primary>f", "Search Drive"),
@@ -994,15 +1208,9 @@ fn show_shortcuts(window: &gtk4::ApplicationWindow) {
         .title("Keyboard shortcuts")
         .build();
     section.append(&group);
-    let dialog = gtk4::ShortcutsWindow::builder()
-        .title("Keyboard shortcuts")
-        .default_width(420)
-        .default_height(480)
-        .transient_for(window)
-        .modal(true)
-        .child(&section)
-        .build();
-    dialog.show();
+    let dialog = native_dialog_window(Some(window.upcast_ref()), "Keyboard shortcuts", 420, 480);
+    dialog.set_child(Some(&section));
+    dialog.present();
 }
 
 /// Window-level keyboard shortcuts, so the browser is usable without the mouse:

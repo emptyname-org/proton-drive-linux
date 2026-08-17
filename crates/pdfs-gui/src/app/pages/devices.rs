@@ -541,7 +541,7 @@ fn show_restore_picker(ui: &Rc<Ui>, items: Vec<RestorableFolder>) {
         .max_content_height(420)
         .child(&group)
         .build();
-    let dialog = adw::MessageDialog::builder()
+    let dialog = AppMessageDialog::builder()
         .heading("Restore folders")
         .body("These folders are backed up under this computer in Proton Drive.")
         .extra_child(&scroll)
@@ -634,7 +634,7 @@ pub(crate) fn prompt_remove_sync_folder(ui: &Rc<Ui>, id: i64, path: &str, ondema
              being synced. Choose whether to also delete the copy in Proton Drive."
         )
     };
-    let dialog = adw::MessageDialog::builder()
+    let dialog = AppMessageDialog::builder()
         .heading("Stop syncing folder")
         .body(body)
         .build();
@@ -681,7 +681,7 @@ pub(crate) fn prompt_remove_sync_folder(ui: &Rc<Ui>, id: i64, path: &str, ondema
 /// Prompt for a new device name and rename it.
 pub(crate) fn prompt_rename_device(ui: &Rc<Ui>, uid: &str, current: &str) {
     let win = ui_window(ui);
-    let dialog = adw::MessageDialog::builder()
+    let dialog = AppMessageDialog::builder()
         .heading("Rename device")
         .body(format!("Rename “{current}”."))
         .build();
@@ -726,7 +726,7 @@ pub(crate) fn prompt_rename_device(ui: &Rc<Ui>, uid: &str, current: &str) {
 /// Confirm, then remove (deregister) a device.
 pub(crate) fn prompt_remove_device(ui: &Rc<Ui>, uid: &str, name: &str) {
     let win = ui_window(ui);
-    let dialog = adw::MessageDialog::builder()
+    let dialog = AppMessageDialog::builder()
         .heading("Remove computer")
         .body(format!(
             "Remove “{name}” from this account?\n\nEverything it backed up to Proton Drive is \
@@ -764,7 +764,7 @@ pub(crate) fn prompt_remove_device(ui: &Rc<Ui>, uid: &str, name: &str) {
 /// their folders diverge.
 pub(crate) fn prompt_adopt_device(ui: &Rc<Ui>, uid: &str, name: &str) {
     let win = ui_window(ui);
-    let dialog = adw::MessageDialog::builder()
+    let dialog = AppMessageDialog::builder()
         .heading("Use this computer's identity")
         .body(format!(
             "Treat this machine as “{name}”?\n\nNew synced folders are created under that \

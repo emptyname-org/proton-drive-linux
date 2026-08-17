@@ -235,7 +235,7 @@ fn repaint_versions(state: &Rc<VersionsDialog>, items: &[RevisionInfo]) {
 /// Confirm, then restore. Confirmed because it replaces the file's content for
 /// every device on the account, not only this one.
 fn prompt_restore_version(state: &Rc<VersionsDialog>, revision_id: &str) {
-    let dialog = adw::MessageDialog::builder()
+    let dialog = AppMessageDialog::builder()
         .heading("Restore version")
         .body(format!(
             "Make this version the current content of “{}”? The version it replaces stays in the history.",
@@ -270,7 +270,7 @@ fn prompt_restore_version(state: &Rc<VersionsDialog>, revision_id: &str) {
 
 /// Confirm, then permanently delete one revision.
 fn prompt_delete_version(state: &Rc<VersionsDialog>, revision_id: &str) {
-    let dialog = adw::MessageDialog::builder()
+    let dialog = AppMessageDialog::builder()
         .heading("Delete version")
         .body("Delete this version permanently? Its content can't be recovered.")
         .build();

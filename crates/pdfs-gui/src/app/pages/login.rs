@@ -235,7 +235,7 @@ pub(crate) fn spawn_login(
 /// login worker via `code_tx`. Cancelling (or closing) drops the sender, which
 /// the worker reads as a cancelled login.
 pub(crate) fn prompt_2fa(ui: &Rc<Ui>, code_tx: std::sync::mpsc::Sender<String>) {
-    let dialog = adw::MessageDialog::builder()
+    let dialog = AppMessageDialog::builder()
         .heading("Two-factor authentication")
         .body("Enter the code from your authenticator app.")
         .build();

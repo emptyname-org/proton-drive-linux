@@ -355,7 +355,7 @@ pub(crate) fn wire_settings(
     let ui_purge = ui.clone();
     purge_button.connect_clicked(move |_| {
         let ui = ui_purge.clone();
-        let dialog = adw::MessageDialog::builder()
+        let dialog = AppMessageDialog::builder()
             .heading("Clear local cache?")
             .body("Cached files will be removed. Offline copies will stay on this device.")
             .build();
@@ -549,7 +549,7 @@ pub(crate) fn prompt_mountpoint(ui: &Rc<Ui>) {
         }
 
         // The daemon only reads the mountpoint at mount time, so offer a restart.
-        let confirm = adw::MessageDialog::builder()
+        let confirm = AppMessageDialog::builder()
             .heading("Restart to apply")
             .body(format!(
                 "The mountpoint is now “{path_str}”. Restart the Drive mount to use it?"

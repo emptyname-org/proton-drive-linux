@@ -343,7 +343,7 @@ pub(crate) fn prompt_delete_forever(ui: &Rc<Ui>, entry: &DirEntry) {
     let win = ui_window(ui);
     let uid = entry.uid.clone();
     let name = entry.name.clone();
-    let dialog = adw::MessageDialog::builder()
+    let dialog = AppMessageDialog::builder()
         .heading("Delete permanently")
         .body(format!(
             "Permanently delete “{name}”? This cannot be undone."
@@ -376,7 +376,7 @@ pub(crate) fn prompt_delete_forever(ui: &Rc<Ui>, entry: &DirEntry) {
 pub(crate) fn prompt_empty_trash(ui: &Rc<Ui>) {
     let win = ui_window(ui);
     let count = ui.trash.model.n_items();
-    let dialog = adw::MessageDialog::builder()
+    let dialog = AppMessageDialog::builder()
         .heading("Empty Trash")
         .body(format!(
             "Permanently delete all {count} item(s) in the trash? This cannot be undone."

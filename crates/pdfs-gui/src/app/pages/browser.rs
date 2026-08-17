@@ -1488,7 +1488,7 @@ pub(crate) fn prompt_rename(ui: &Rc<Ui>, entry: &DirEntry) {
     let parent = ui_window(ui);
     let rel = entry_rel(ui, entry);
     let original = entry.name.clone();
-    let dialog = adw::MessageDialog::builder()
+    let dialog = AppMessageDialog::builder()
         .heading("Rename")
         .body(format!("Rename “{original}”."))
         .build();
@@ -1536,7 +1536,7 @@ pub(crate) fn prompt_move(ui: &Rc<Ui>, entry: &DirEntry) {
     let parent = ui_window(ui);
     let rel = entry_rel(ui, entry);
     let name = entry.name.clone();
-    let dialog = adw::MessageDialog::builder()
+    let dialog = AppMessageDialog::builder()
         .heading("Move")
         .body(format!(
             "Move “{}” into another folder. Enter its path from the Drive root \
@@ -1586,7 +1586,7 @@ pub(crate) fn prompt_delete(ui: &Rc<Ui>, entry: &DirEntry) {
     let win = ui_window(ui);
     let rel = entry_rel(ui, entry);
     let name = entry.name.clone();
-    let dialog = adw::MessageDialog::builder()
+    let dialog = AppMessageDialog::builder()
         .heading("Move to Trash")
         .body(format!("Move “{}” to Trash?", entry.name))
         .build();
@@ -1615,7 +1615,7 @@ pub(crate) fn prompt_delete(ui: &Rc<Ui>, entry: &DirEntry) {
 pub(crate) fn prompt_new_folder(ui: &Rc<Ui>) {
     let win = ui_window(ui);
     let parent = ui.browser.path.borrow().clone();
-    let dialog = adw::MessageDialog::builder()
+    let dialog = AppMessageDialog::builder()
         .heading("New folder")
         .body("Create a folder in the current directory.")
         .build();

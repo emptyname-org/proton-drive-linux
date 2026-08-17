@@ -582,7 +582,7 @@ pub(crate) fn respond_invitation(ui: &Rc<Ui>, id: &str, accept: bool) {
 /// Confirm, then leave a node shared with me.
 pub(crate) fn prompt_leave_shared(ui: &Rc<Ui>, uid: &str, name: &str) {
     let win = ui_window(ui);
-    let dialog = adw::MessageDialog::builder()
+    let dialog = AppMessageDialog::builder()
         .heading("Leave shared item")
         .body(format!(
             "Leave “{name}”? You'll lose access until you're invited again."
@@ -612,7 +612,7 @@ pub(crate) fn prompt_leave_shared(ui: &Rc<Ui>, uid: &str, name: &str) {
 /// Confirm, then remove a saved bookmark.
 pub(crate) fn prompt_remove_bookmark(ui: &Rc<Ui>, token: &str, name: &str) {
     let win = ui_window(ui);
-    let dialog = adw::MessageDialog::builder()
+    let dialog = AppMessageDialog::builder()
         .heading("Remove bookmark")
         .body(format!("Remove the bookmark for “{name}”?"))
         .build();
@@ -642,7 +642,7 @@ pub(crate) fn prompt_remove_bookmark(ui: &Rc<Ui>, token: &str, name: &str) {
 /// Prompt for a public-link URL (and optional password) and save it as a bookmark.
 pub(crate) fn prompt_add_bookmark(ui: &Rc<Ui>) {
     let win = ui_window(ui);
-    let dialog = adw::MessageDialog::builder()
+    let dialog = AppMessageDialog::builder()
         .heading("Add bookmark")
         .body("Paste a Proton Drive public link to save it here.")
         .build();
