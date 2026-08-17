@@ -74,7 +74,7 @@ Priority: optional
 Architecture: amd64
 Maintainer: Proton Drive Linux contributors <noreply@github.com>
 Homepage: https://github.com/emptyname-org/proton-drive-linux
-Depends: fuse3, libgtk-4-1 (>= 4.8.0), libadwaita-1-0 (>= 1.2.0), libsecret-1-0, libwebkitgtk-6.0-4, libimage-exiftool-perl
+Depends: fuse3, libgtk-4-1 (>= 4.8.0), libadwaita-1-0 (>= 1.2.0), libsecret-1-0, libwebkitgtk-6.0-4, libimage-exiftool-perl, xdg-utils
 Installed-Size: $installed_size
 Description: Proton Drive client for Linux
  Proton Drive client for Linux featuring:
