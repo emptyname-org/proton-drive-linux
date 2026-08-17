@@ -264,31 +264,6 @@ Version 1.0 strengthens the boundaries around local-only data and destructive re
 - State, cache, and config directories must be real, current-user-owned `0700` directories; control sockets are `0600`.
 
 
-## Screenshots
-
-### GUI Application & Launcher
-
-<table>
-  <tr>
-    <td align="center" width="50%"><img src="images/login.png" alt="Login Screen" width="100%"><br><sub><b>Login Screen</b></sub></td>
-    <td align="center" width="50%"><img src="images/files.png" alt="Files Browser" width="100%"><br><sub><b>Files Browser</b></sub></td>
-  </tr>
-  <tr>
-    <td align="center" width="50%"><img src="images/shared.png" alt="Shared Links" width="100%"><br><sub><b>Shared Links</b></sub></td>
-    <td align="center" width="50%"><img src="images/shared_with_me.png" alt="Shared with me" width="100%"><br><sub><b>Shared with me</b></sub></td>
-  </tr>
-  <tr>
-    <td align="center" width="50%"><img src="images/computers.png" alt="Local Backups (Computers)" width="100%"><br><sub><b>Local Backups (Computers)</b></sub></td>
-    <td align="center" width="50%"><img src="images/photos.png" alt="Photos Timeline" width="100%"><br><sub><b>Photos Timeline</b></sub></td>
-  </tr>
-  <tr>
-    <td align="center" width="50%"><img src="images/prompt.png" alt="Search Launcher Prompt" width="100%"><br><sub><b>Search Launcher Prompt</b></sub></td>
-    <td align="center" width="50%"><img src="images/settings.png" alt="Settings" width="100%"><br><sub><b>Settings</b></sub></td>
-  </tr>
-</table>
-
----
-
 ## Prerequisites
 
 To compile the application from source or run the built binaries, ensure you have the following system libraries installed on your distribution:
