@@ -249,6 +249,7 @@ fn load_proton_theme() {
          .navigation-sidebar row:selected {{ background: alpha({PROTON_PURPLE}, 0.16); color: {PROTON_PURPLE}; font-weight: 600; }}\n\
          .navigation-sidebar row:selected image {{ color: {PROTON_PURPLE}; }}\n\
          .file-tile:selected, .file-tile:hover:selected {{ background: alpha({PROTON_PURPLE}, 0.20); }}\n\
+         .bulk-bar {{ padding: 6px 8px; border-radius: 12px; background: alpha({PROTON_PURPLE}, 0.12); }}\n\
          .dropzone {{ border: 2px dashed alpha(currentColor, 0.25); border-radius: 16px; padding: 28px 18px; transition: background 160ms ease, border-color 160ms ease; }}\n\
          .dropzone-active {{ border-color: {PROTON_PURPLE}; background: alpha({PROTON_PURPLE}, 0.10); }}\n"
     );
@@ -368,6 +369,8 @@ fn build_window(app: &adw::Application) {
             budget_row: main_widgets.budget_row.clone(),
             mountpoint_row: main_widgets.mountpoint_row.clone(),
             settings_suppress: Cell::new(false),
+            budget_source: RefCell::new(None),
+            pins_expanded: Cell::new(false),
             pins_group: main_widgets.pins_group.clone(),
             pin_rows: RefCell::new(Vec::new()),
             pins_state: RefCell::new(None),
@@ -388,6 +391,13 @@ fn build_window(app: &adw::Application) {
             upload: browser_widgets.upload.clone(),
             upload_folder: browser_widgets.upload_folder.clone(),
             search_source: RefCell::new(None),
+            views: browser_widgets.views.clone(),
+            bulk: browser_widgets.bulk.clone(),
+            bulk_label: browser_widgets.bulk_label.clone(),
+            bulk_trash: browser_widgets.bulk_trash.clone(),
+            bulk_pin: browser_widgets.bulk_pin.clone(),
+            bulk_unpin: browser_widgets.bulk_unpin.clone(),
+            empty_actions: browser_widgets.empty_actions.clone(),
         },
         details: DetailsState {
             details: browser_widgets.details,
@@ -414,6 +424,7 @@ fn build_window(app: &adw::Application) {
             more: gallery_widgets.more.clone(),
             upload: gallery_widgets.upload.clone(),
             import: gallery_widgets.import.clone(),
+            empty_actions: gallery_widgets.empty_actions.clone(),
             title: gallery_widgets.title.clone(),
             subtitle: gallery_widgets.subtitle.clone(),
             albums: gallery_widgets.albums.clone(),
@@ -530,6 +541,12 @@ fn build_window(app: &adw::Application) {
     );
     wire_sidebar(&ui);
     wire_browser(&ui, &browser_widgets.grid, &browser_widgets.column_view);
+    wire_bulk(
+        &ui,
+        &browser_widgets.bulk_clear,
+        &browser_widgets.empty_upload,
+        &browser_widgets.empty_new_folder,
+    );
     wire_browser_actions(
         &ui,
         &browser_widgets.new_folder,
@@ -539,6 +556,11 @@ fn build_window(app: &adw::Application) {
     wire_details(&ui);
     wire_search(&ui);
     wire_gallery(&ui, &gallery_widgets.list, &gallery_widgets.scroll);
+    wire_gallery_empty(
+        &ui,
+        &gallery_widgets.empty_upload,
+        &gallery_widgets.empty_import,
+    );
     wire_albums(&ui);
     wire_trash(&ui, &trash_widgets.list, &trash_widgets.empty);
     wire_shared(&ui, &shared_widgets.retry, &shared_widgets.add_bookmark);
@@ -822,6 +844,22 @@ fn toast(ui: &Rc<Ui>, message: &str) {
     ui.toasts.add_toast(adw::Toast::new(message));
 }
 
+/// Show a toast that offers one follow-up action — an Undo, or a way to the page
+/// the outcome landed on.
+///
+/// Given a longer timeout than a plain toast: an action the user has to notice,
+/// read and reach is not the same ask as a line of confirmation they can ignore.
+fn toast_action(ui: &Rc<Ui>, message: &str, label: &str, action: impl Fn(&Rc<Ui>) + 'static) {
+    let toast = adw::Toast::builder()
+        .title(message)
+        .button_label(label)
+        .timeout(8)
+        .build();
+    let ui_action = ui.clone();
+    toast.connect_button_clicked(move |_| action(&ui_action));
+    ui.toasts.add_toast(toast);
+}
+
 /// Show a toast for a failure. Same surface as [`toast`], but the message is
 /// prefixed with what was being attempted, since a bare daemon error ("no such
 /// file") reads as noise without it.
@@ -959,7 +997,13 @@ fn install_shortcuts(ui: &Rc<Ui>, window: &adw::ApplicationWindow) {
             // browser-only bindings.
             gtk4::gdk::Key::F5 => reload_current_page(&ui),
             gtk4::gdk::Key::r | gtk4::gdk::Key::R if ctrl => reload_current_page(&ui),
-            gtk4::gdk::Key::f | gtk4::gdk::Key::F if ctrl && on_browser => {
+            // Search lives on Files, but the shortcut works from anywhere:
+            // wanting to find a file is not a reason to first have to remember
+            // which page owns the search box.
+            gtk4::gdk::Key::f | gtk4::gdk::Key::F if ctrl => {
+                if !on_browser {
+                    ui.stack.set_visible_child_name("browser");
+                }
                 ui.browser.search.grab_focus();
             }
             gtk4::gdk::Key::n | gtk4::gdk::Key::N if ctrl && on_browser => prompt_new_folder(&ui),
@@ -969,12 +1013,21 @@ fn install_shortcuts(ui: &Rc<Ui>, window: &adw::ApplicationWindow) {
                     prompt_rename(&ui, &entry);
                 }
             }
+            // Acts on the whole selection: Delete with five files highlighted
+            // means those five, not whichever one the details pane happens to
+            // be describing.
             gtk4::gdk::Key::Delete if on_browser => {
-                if let Some(entry) = selected_entry(&ui) {
-                    prompt_delete(&ui, &entry);
+                let entries = selected_entries(&ui);
+                if !entries.is_empty() {
+                    prompt_delete_many(&ui, entries);
                 }
             }
-            gtk4::gdk::Key::Escape if on_browser && ui.browser.split.shows_sidebar() => {
+            gtk4::gdk::Key::Escape
+                if on_browser
+                    && (ui.browser.split.shows_sidebar() || ui.browser.bulk.reveals_child()) =>
+            {
+                clear_selection(&ui);
+                sync_bulk_bar(&ui);
                 hide_details(&ui);
             }
             _ => return glib::Propagation::Proceed,

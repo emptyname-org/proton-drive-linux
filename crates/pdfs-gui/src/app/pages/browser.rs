@@ -31,6 +31,21 @@ pub(crate) struct BrowserState {
     /// Pending debounce timer for the search box; replaced on every keystroke so
     /// only the last pause actually fires a [`Request::Search`].
     pub(crate) search_source: RefCell<Option<glib::SourceId>>,
+    /// The grid/list view stack, read to find out which of the two selections is
+    /// the one the user is actually working in.
+    pub(crate) views: gtk4::Stack,
+    /// The bulk-action bar, revealed once more than one entry is selected.
+    pub(crate) bulk: gtk4::Revealer,
+    pub(crate) bulk_label: gtk4::Label,
+    /// Bulk buttons, sensitive only where they apply (offline state is a
+    /// file-only notion, so a folder in the selection disables those two).
+    pub(crate) bulk_trash: gtk4::Button,
+    pub(crate) bulk_pin: gtk4::Button,
+    pub(crate) bulk_unpin: gtk4::Button,
+    /// Upload / New folder offered on the *empty folder* status page, so that
+    /// state is a place to act rather than a dead end. Hidden on every other
+    /// status (a load error is not the moment to offer an upload).
+    pub(crate) empty_actions: gtk4::Box,
 }
 
 /// Idle pause after the last keystroke before a search query is sent, so typing
@@ -76,9 +91,20 @@ pub(crate) struct BrowserWidgets {
     pub(crate) split: adw::OverlaySplitView,
     pub(crate) details: DetailsWidgets,
     /// The two selection models, so a selection change can drive the details pane
-    /// and so an action can re-read the entry the user has highlighted.
-    pub(crate) grid_selection: gtk4::SingleSelection,
-    pub(crate) list_selection: gtk4::SingleSelection,
+    /// and so an action can re-read the entries the user has highlighted.
+    pub(crate) grid_selection: gtk4::MultiSelection,
+    pub(crate) list_selection: gtk4::MultiSelection,
+    /// The grid/list stack, so the page can tell which selection is live.
+    pub(crate) views: gtk4::Stack,
+    pub(crate) bulk: gtk4::Revealer,
+    pub(crate) bulk_label: gtk4::Label,
+    pub(crate) bulk_trash: gtk4::Button,
+    pub(crate) bulk_pin: gtk4::Button,
+    pub(crate) bulk_unpin: gtk4::Button,
+    pub(crate) bulk_clear: gtk4::Button,
+    pub(crate) empty_actions: gtk4::Box,
+    pub(crate) empty_upload: gtk4::Button,
+    pub(crate) empty_new_folder: gtk4::Button,
 }
 
 pub(crate) fn build_browser_page() -> (gtk4::Widget, BrowserWidgets) {
@@ -166,19 +192,34 @@ pub(crate) fn build_browser_page() -> (gtk4::Widget, BrowserWidgets) {
     retry.add_css_class("pill");
     retry.add_css_class("suggested-action");
     retry.set_visible(false);
+    // The empty-folder state's way out. `StatusPage` takes one child, so Retry
+    // and these share a box; each is shown only for the state it belongs to.
+    let empty_upload = gtk4::Button::builder().label("Upload files").build();
+    empty_upload.add_css_class("pill");
+    empty_upload.add_css_class("suggested-action");
+    let empty_new_folder = gtk4::Button::builder().label("New folder").build();
+    empty_new_folder.add_css_class("pill");
+    let empty_actions = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+    empty_actions.set_halign(gtk4::Align::Center);
+    empty_actions.set_visible(false);
+    empty_actions.append(&empty_upload);
+    empty_actions.append(&empty_new_folder);
+
+    let status_child = gtk4::Box::new(gtk4::Orientation::Vertical, 12);
+    status_child.append(&retry);
+    status_child.append(&empty_actions);
+
     let status = adw::StatusPage::builder()
         .icon_name("folder-symbolic")
         .vexpand(true)
-        .child(&retry)
+        .child(&status_child)
         .build();
     status.add_css_class("compact");
 
-    // Icon grid.
-    let grid_selection = gtk4::SingleSelection::builder()
-        .model(&model)
-        .autoselect(false)
-        .can_unselect(true)
-        .build();
+    // Icon grid. Multi-select: acting on a batch is the common case for trashing
+    // and for taking a folder's worth of files offline, and doing it one
+    // confirmation dialog at a time is not a workflow.
+    let grid_selection = gtk4::MultiSelection::new(Some(model.clone()));
     let grid = gtk4::GridView::builder()
         .model(&grid_selection)
         .min_columns(2)
@@ -190,12 +231,8 @@ pub(crate) fn build_browser_page() -> (gtk4::Widget, BrowserWidgets) {
         .child(&grid)
         .build();
 
-    // Column list.
-    let list_selection = gtk4::SingleSelection::builder()
-        .model(&model)
-        .autoselect(false)
-        .can_unselect(true)
-        .build();
+    // Column list, with its own selection over the same model.
+    let list_selection = gtk4::MultiSelection::new(Some(model.clone()));
     let column_view = gtk4::ColumnView::builder().model(&list_selection).build();
     column_view.add_css_class("data-table");
     let column_scroll = gtk4::ScrolledWindow::builder()
@@ -239,12 +276,51 @@ pub(crate) fn build_browser_page() -> (gtk4::Widget, BrowserWidgets) {
         .sidebar(&details_pane)
         .build();
 
+    // Bulk-action bar. A revealer rather than a hidden box so it slides in
+    // instead of making the whole view jump when a second entry is selected.
+    let bulk_label = gtk4::Label::builder().hexpand(true).xalign(0.0).build();
+    let bulk_pin = gtk4::Button::builder()
+        .label("Keep offline")
+        .valign(gtk4::Align::Center)
+        .build();
+    bulk_pin.add_css_class("flat");
+    let bulk_unpin = gtk4::Button::builder()
+        .label("Remove offline copy")
+        .valign(gtk4::Align::Center)
+        .build();
+    bulk_unpin.add_css_class("flat");
+    let bulk_trash = gtk4::Button::builder()
+        .label("Move to Trash")
+        .valign(gtk4::Align::Center)
+        .build();
+    bulk_trash.add_css_class("destructive-action");
+    let bulk_clear = gtk4::Button::builder()
+        .icon_name("window-close-symbolic")
+        .tooltip_text("Clear selection (Esc)")
+        .valign(gtk4::Align::Center)
+        .build();
+    bulk_clear.add_css_class("flat");
+    bulk_clear.add_css_class("circular");
+    let bulk_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+    bulk_box.add_css_class("toolbar");
+    bulk_box.add_css_class("bulk-bar");
+    bulk_box.append(&bulk_label);
+    bulk_box.append(&bulk_pin);
+    bulk_box.append(&bulk_unpin);
+    bulk_box.append(&bulk_trash);
+    bulk_box.append(&bulk_clear);
+    let bulk = gtk4::Revealer::builder()
+        .transition_type(gtk4::RevealerTransitionType::SlideDown)
+        .child(&bulk_box)
+        .build();
+
     let inner = gtk4::Box::new(gtk4::Orientation::Vertical, 12);
     inner.set_margin_top(12);
     inner.set_margin_bottom(12);
     inner.set_margin_start(12);
     inner.set_margin_end(12);
     inner.append(&header);
+    inner.append(&bulk);
     inner.append(&split);
 
     (
@@ -267,6 +343,16 @@ pub(crate) fn build_browser_page() -> (gtk4::Widget, BrowserWidgets) {
             details,
             grid_selection,
             list_selection,
+            views: view_stack,
+            bulk,
+            bulk_label,
+            bulk_trash,
+            bulk_pin,
+            bulk_unpin,
+            bulk_clear,
+            empty_actions,
+            empty_upload,
+            empty_new_folder,
         },
     )
 }
@@ -278,8 +364,271 @@ pub(crate) fn browser_status(ui: &Rc<Ui>, icon: &str, title: &str, description: 
     ui.browser.status.set_title(title);
     ui.browser.status.set_description(Some(description));
     ui.browser.retry.set_visible(retry);
+    // Only the empty-folder state offers a way to fill the folder; every other
+    // status (loading, offline, error) turns them back off.
+    ui.browser.empty_actions.set_visible(false);
     ui.browser.content.set_visible_child_name("status");
     hide_details(ui);
+}
+
+/// The selection model of whichever view is on screen. The grid and the list
+/// each own one over the same model, so "what is selected" depends on which the
+/// user is looking at.
+pub(crate) fn active_selection(ui: &Rc<Ui>) -> gtk4::MultiSelection {
+    if ui.browser.views.visible_child_name().as_deref() == Some("list") {
+        ui.details.list_selection.clone()
+    } else {
+        ui.details.grid_selection.clone()
+    }
+}
+
+/// Every entry highlighted in the view on screen, in model order.
+///
+/// Walks the model rather than the selection bitset: a listing is at most a few
+/// thousand rows, and asking each position whether it is selected keeps this
+/// free of bitset-iterator lifetimes for no measurable cost.
+pub(crate) fn selected_entries(ui: &Rc<Ui>) -> Vec<DirEntry> {
+    let selection = active_selection(ui);
+    let count = selection.n_items();
+    (0..count)
+        .filter(|i| selection.is_selected(*i))
+        .filter_map(|i| entry_at(Some(&selection), i))
+        .collect()
+}
+
+/// Drop the selection in both views, which also retracts the bulk bar.
+pub(crate) fn clear_selection(ui: &Rc<Ui>) {
+    ui.details.grid_selection.unselect_all();
+    ui.details.list_selection.unselect_all();
+}
+
+/// Reflect the current selection in the bulk bar: how many are selected, and
+/// which bulk actions apply to that mix. Offline state is a file-only notion, so
+/// a folder anywhere in the selection disables the two pin buttons rather than
+/// half-failing once pressed.
+pub(crate) fn sync_bulk_bar(ui: &Rc<Ui>) {
+    let entries = selected_entries(ui);
+    // One selected entry is the details pane's job; the bar is for a batch.
+    if entries.len() < 2 {
+        ui.browser.bulk.set_reveal_child(false);
+        return;
+    }
+    let files_only = entries.iter().all(|e| !e.is_dir);
+    let any_pinned = entries.iter().any(|e| e.pinned);
+    let any_unpinned = entries.iter().any(|e| !e.pinned);
+    let mounted = *ui.mounted.borrow();
+    ui.browser
+        .bulk_label
+        .set_label(&format!("{} selected", entries.len()));
+    ui.browser.bulk_trash.set_sensitive(mounted);
+    ui.browser
+        .bulk_pin
+        .set_sensitive(mounted && files_only && any_unpinned);
+    ui.browser
+        .bulk_unpin
+        .set_sensitive(mounted && files_only && any_pinned);
+    ui.browser.bulk.set_reveal_child(true);
+}
+
+/// Confirm and move every selected entry to Trash.
+///
+/// One dialog for the batch, one pass over the daemon, one toast — and one Undo
+/// that restores the whole batch, because a mis-aimed bulk delete is exactly the
+/// action a user most needs to take back.
+pub(crate) fn prompt_delete_many(ui: &Rc<Ui>, entries: Vec<DirEntry>) {
+    if entries.len() < 2 {
+        if let Some(entry) = entries.first() {
+            prompt_delete(ui, entry);
+        }
+        return;
+    }
+    let win = ui_window(ui);
+    let dialog = adw::AlertDialog::builder()
+        .heading("Move to Trash")
+        .body(format!(
+            "Move {} items to Trash? Anything inside a selected folder goes with it.",
+            entries.len()
+        ))
+        .build();
+    dialog.add_response("cancel", "Cancel");
+    dialog.add_response("trash", "Move to Trash");
+    dialog.set_response_appearance("trash", adw::ResponseAppearance::Destructive);
+    dialog.set_default_response(Some("cancel"));
+    dialog.set_close_response("cancel");
+
+    let ui = ui.clone();
+    dialog.connect_response(None, move |_, resp| {
+        if resp == "trash" {
+            run_bulk_delete(&ui, entries.clone());
+        }
+    });
+    dialog.present(win.as_ref());
+}
+
+/// Trash a batch, one request at a time.
+///
+/// Sequential rather than parallel: the daemon serialises these anyway, and a
+/// burst of threads against one socket buys nothing but a harder failure to
+/// report. Partial success is reported as such — the entries that did move are
+/// still restorable through the Undo.
+pub(crate) fn run_bulk_delete(ui: &Rc<Ui>, entries: Vec<DirEntry>) {
+    if !*ui.mounted.borrow() {
+        toast_error(
+            ui,
+            "Couldn't move to Trash",
+            "Proton Drive isn't connected.",
+        );
+        return;
+    }
+    let socket = ui.dirs.control_socket();
+    // A one-entry batch is still a batch, but it is worth naming in the toast:
+    // "Moved “notes.txt” to Trash" tells the user which file far better than a
+    // count of one does.
+    let single = (entries.len() == 1).then(|| entries[0].name.clone());
+    let paths: Vec<(String, String)> = entries
+        .iter()
+        .map(|e| (entry_rel(ui, e), e.uid.clone()))
+        .collect();
+    ui.busy_begin();
+    clear_selection(ui);
+    let ui = ui.clone();
+    glib::spawn_future_local(async move {
+        let mut trashed: Vec<String> = Vec::new();
+        let mut failure: Option<String> = None;
+        for (path, uid) in paths {
+            let rx = spawn_request(socket.clone(), Request::Delete { path });
+            match rx.recv().await {
+                Ok(Ok(Response::Ok { .. })) => trashed.push(uid),
+                Ok(Ok(Response::Error { message, .. })) => {
+                    failure.get_or_insert(message);
+                }
+                _ => {
+                    failure.get_or_insert_with(|| "The mount service didn't respond.".to_string());
+                }
+            }
+        }
+        ui.busy_end();
+        reload_listing(&ui);
+        match (trashed.len(), failure) {
+            (0, Some(message)) => toast_error(&ui, "Couldn't move to Trash", &message),
+            (0, None) => {}
+            (n, failure) => {
+                let message = match (failure, &single) {
+                    (Some(_), _) => format!("Moved {n} items to Trash — some couldn't be moved"),
+                    (None, Some(name)) => format!("Moved “{name}” to Trash"),
+                    (None, None) => format!("Moved {n} items to Trash"),
+                };
+                toast_action(&ui, &message, "Undo", move |ui| {
+                    restore_uids(ui, trashed.clone(), n);
+                });
+            }
+        }
+    });
+}
+
+/// Put trashed nodes back where they came from — the Undo behind a trash toast.
+pub(crate) fn restore_uids(ui: &Rc<Ui>, uids: Vec<String>, count: usize) {
+    run_mutation(
+        ui,
+        Request::Restore { uids },
+        if count == 1 {
+            "Restored from Trash".to_string()
+        } else {
+            format!("Restored {count} items from Trash")
+        },
+        "Couldn't restore from Trash",
+    );
+}
+
+/// Pin or unpin every selected file, one request at a time.
+pub(crate) fn run_bulk_pin(ui: &Rc<Ui>, entries: Vec<DirEntry>, pin: bool) {
+    let socket = ui.dirs.control_socket();
+    // Only the entries that need changing: re-pinning an already-pinned file is
+    // a wasted round-trip, and it would inflate the count the toast reports.
+    let paths: Vec<String> = entries
+        .iter()
+        .filter(|e| !e.is_dir && e.pinned != pin)
+        .map(|e| entry_rel(ui, e))
+        .collect();
+    if paths.is_empty() {
+        return;
+    }
+    ui.busy_begin();
+    clear_selection(ui);
+    let ui = ui.clone();
+    glib::spawn_future_local(async move {
+        let mut done = 0usize;
+        let mut failure: Option<String> = None;
+        for path in paths {
+            let req = if pin {
+                Request::Pin { path }
+            } else {
+                Request::Unpin { path }
+            };
+            let rx = spawn_request(socket.clone(), req);
+            match rx.recv().await {
+                Ok(Ok(Response::Ok { .. })) => done += 1,
+                Ok(Ok(Response::Error { message, .. })) => {
+                    failure.get_or_insert(message);
+                }
+                _ => {
+                    failure.get_or_insert_with(|| "The mount service didn't respond.".to_string());
+                }
+            }
+        }
+        ui.busy_end();
+        load_browser(&ui);
+        match (done, failure) {
+            (0, Some(message)) => toast_error(&ui, "Couldn't change offline state", &message),
+            (0, None) => {}
+            (n, _) => toast(
+                &ui,
+                &if pin {
+                    format!("{n} files are now available offline")
+                } else {
+                    format!("{n} files are no longer kept offline")
+                },
+            ),
+        }
+    });
+}
+
+/// Wire the bulk-action bar and the empty-folder state's buttons.
+pub(crate) fn wire_bulk(
+    ui: &Rc<Ui>,
+    bulk_clear: &gtk4::Button,
+    empty_upload: &gtk4::Button,
+    empty_new_folder: &gtk4::Button,
+) {
+    let ui_trash = ui.clone();
+    ui.browser
+        .bulk_trash
+        .connect_clicked(move |_| prompt_delete_many(&ui_trash, selected_entries(&ui_trash)));
+    let ui_pin = ui.clone();
+    ui.browser
+        .bulk_pin
+        .connect_clicked(move |_| run_bulk_pin(&ui_pin, selected_entries(&ui_pin), true));
+    let ui_unpin = ui.clone();
+    ui.browser
+        .bulk_unpin
+        .connect_clicked(move |_| run_bulk_pin(&ui_unpin, selected_entries(&ui_unpin), false));
+    let ui_clear = ui.clone();
+    bulk_clear.connect_clicked(move |_| {
+        clear_selection(&ui_clear);
+        sync_bulk_bar(&ui_clear);
+    });
+
+    // Switching views switches which selection is live, so the bar has to be
+    // re-derived rather than left showing the other view's count.
+    let ui_view = ui.clone();
+    ui.browser
+        .views
+        .connect_visible_child_name_notify(move |_| sync_bulk_bar(&ui_view));
+
+    let ui_upload = ui.clone();
+    empty_upload.connect_clicked(move |_| prompt_upload(&ui_upload));
+    let ui_new = ui.clone();
+    empty_new_folder.connect_clicked(move |_| prompt_new_folder(&ui_new));
 }
 
 /// Swap the Files content area back to the grid/list views.
@@ -474,7 +823,14 @@ pub(crate) fn attach_context_menu(ui: &Rc<Ui>, item: &gtk4::ListItem, anchor: &g
     gesture.connect_pressed(move |_, _, x, y| {
         if let Some(obj) = item.item().and_downcast::<BoxedAnyObject>() {
             let entry = obj.borrow::<DirEntry>().clone();
-            show_context_menu(&ui, &entry, &target, x, y);
+            // Right-clicking a row that is part of a multi-selection acts on the
+            // batch; right-clicking outside one acts on the row, as before.
+            let selected = selected_entries(&ui);
+            if selected.len() > 1 && selected.iter().any(|e| e.uid == entry.uid) {
+                show_bulk_context_menu(&ui, selected, &target, x, y);
+            } else {
+                show_context_menu(&ui, &entry, &target, x, y);
+            }
         }
     });
     anchor.add_controller(gesture);
@@ -582,6 +938,75 @@ pub(crate) fn show_context_menu(ui: &Rc<Ui>, entry: &DirEntry, anchor: &gtk4::Bo
     trash.connect_clicked(move |_| {
         pop.popdown();
         prompt_delete(&ui_tr, &entry_tr);
+    });
+    menu.append(&trash);
+
+    popover.popup();
+}
+
+/// The context menu for a multi-selection: the batch-capable actions only.
+/// Rename, Move, Share and the revision history all need a single subject, so
+/// they are simply absent here rather than offered and then refused.
+pub(crate) fn show_bulk_context_menu(
+    ui: &Rc<Ui>,
+    entries: Vec<DirEntry>,
+    anchor: &gtk4::Box,
+    x: f64,
+    y: f64,
+) {
+    let menu = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+    let popover = gtk4::Popover::builder()
+        .has_arrow(false)
+        .position(gtk4::PositionType::Bottom)
+        .pointing_to(&gtk4::gdk::Rectangle::new(x as i32, y as i32, 1, 1))
+        .child(&menu)
+        .build();
+    popover.set_parent(anchor);
+    popover.connect_closed(|p| p.unparent());
+
+    let header = gtk4::Label::builder()
+        .label(format!("{} selected", entries.len()))
+        .halign(gtk4::Align::Start)
+        .build();
+    header.add_css_class("dim-label");
+    header.add_css_class("caption");
+    header.set_margin_top(6);
+    header.set_margin_bottom(4);
+    header.set_margin_start(10);
+    menu.append(&header);
+
+    let files_only = entries.iter().all(|e| !e.is_dir);
+    if files_only && entries.iter().any(|e| !e.pinned) {
+        let pin = menu_item("Keep offline", "starred-symbolic");
+        let ui_pin = ui.clone();
+        let batch = entries.clone();
+        let pop = popover.clone();
+        pin.connect_clicked(move |_| {
+            pop.popdown();
+            run_bulk_pin(&ui_pin, batch.clone(), true);
+        });
+        menu.append(&pin);
+    }
+    if files_only && entries.iter().any(|e| e.pinned) {
+        let unpin = menu_item("Remove offline copy", "non-starred-symbolic");
+        let ui_unpin = ui.clone();
+        let batch = entries.clone();
+        let pop = popover.clone();
+        unpin.connect_clicked(move |_| {
+            pop.popdown();
+            run_bulk_pin(&ui_unpin, batch.clone(), false);
+        });
+        menu.append(&unpin);
+    }
+
+    menu.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
+
+    let trash = menu_item("Move to Trash", "user-trash-symbolic");
+    let ui_tr = ui.clone();
+    let pop = popover.clone();
+    trash.connect_clicked(move |_| {
+        pop.popdown();
+        prompt_delete_many(&ui_tr, entries.clone());
     });
     menu.append(&trash);
 
@@ -976,8 +1401,6 @@ pub(crate) fn prompt_move(ui: &Rc<Ui>, entry: &DirEntry) {
 /// Confirm and move the entry to Trash through the daemon.
 pub(crate) fn prompt_delete(ui: &Rc<Ui>, entry: &DirEntry) {
     let win = ui_window(ui);
-    let rel = entry_rel(ui, entry);
-    let name = entry.name.clone();
     let dialog = adw::AlertDialog::builder()
         .heading("Move to Trash")
         .body(format!("Move “{}” to Trash?", entry.name))
@@ -988,15 +1411,13 @@ pub(crate) fn prompt_delete(ui: &Rc<Ui>, entry: &DirEntry) {
     dialog.set_default_response(Some("cancel"));
     dialog.set_close_response("cancel");
 
+    // Routed through the batch path so a single trash gets the same Undo: one
+    // mis-click on one file is no less worth taking back than fifty.
+    let entry = entry.clone();
     let ui = ui.clone();
     dialog.connect_response(None, move |_, resp| {
         if resp == "trash" {
-            run_mutation(
-                &ui,
-                Request::Delete { path: rel.clone() },
-                format!("Moved “{name}” to Trash"),
-                "Couldn't move to Trash",
-            );
+            run_bulk_delete(&ui, vec![entry.clone()]);
         }
     });
     dialog.present(win.as_ref());
@@ -1346,6 +1767,7 @@ pub(crate) fn repaint_browser(ui: &Rc<Ui>, entries: &[DirEntry]) {
             "Upload a file or create a folder to get started.",
             false,
         );
+        ui.browser.empty_actions.set_visible(true);
         return;
     }
     browser_views(ui);

@@ -9,9 +9,12 @@ release ships. Migrations are forward-only — a database written by a newer cli
 refuse-to-open, not a downgrade, so rolling back a release means restoring the cache from
 scratch (user data in `staging/` and `recovery/` is never touched by this).
 
-## [Unreleased]
+## [1.9.0] — 2026-08-18
 
-Google Photos import. No schema change. Schema: **28**.
+Google Photos import, and a pass over the desktop app's interaction gaps. No schema change.
+Schema: **28**. Builds against the published `proton-sdk` / `proton-drive-rs` **0.6.1** — the album
+writes this release needs are in the registry crates, so the local `[patch.crates-io]` shim the
+feature was developed against is gone and no local path dependency remains.
 
 ### Added
 - **Import a Google Photos Takeout export into Proton Photos** — `pdfs import-google-photos
@@ -38,14 +41,35 @@ Google Photos import. No schema change. Schema: **28**.
   outlives the page, it is polled wherever the user navigates and its completion is reported as a
   desktop notification.
 
-- SDK (`proton-sdk-rs`): album **writes** — `ProtonPhotosClient::create_album` and
+- SDK (`proton-sdk-rs` **0.6.1**): album **writes** — `ProtonPhotosClient::create_album` and
   `add_photos_to_album`, ported from the TypeScript SDK (upstream C# has no album write API), plus
-  batch duplicate detection (`find_duplicates_many`, `name_collisions`). Adding a photo from an
+  batch duplicate detection (`find_duplicates_many`, `name_collisions`). The workspace deps moved
+  `"0.6.0"` → `"0.6.1"` and `Cargo.lock` re-resolved to the registry crates. Adding a photo from an
   album *shared with us* (a different volume) is still unported and fails that photo's outcome.
+- **Multi-select in Files.** Both views select a batch (click-drag, Ctrl-click, Shift-click); a bar
+  slides in reporting the count and offering Move to Trash and offline on/off for the whole
+  selection. Delete acts on everything selected, Esc clears it, and right-clicking inside a
+  selection offers the batch actions rather than the one row under the pointer. Actions that need a
+  single subject — rename, move, share, revisions — stay single-entry, and the details pane steps
+  aside for a batch instead of speaking for it.
+- **Undo on trash.** "Moved *X* to Trash" now carries an Undo that restores the batch, single files
+  included.
+- **The empty states are a place to act**: an empty folder offers Upload files / New folder, and an
+  empty photo timeline offers Upload photos / Import from Google Photos, instead of describing what
+  the user could go and do elsewhere.
+- **Ctrl+F works from any page**, navigating to Files and focusing the search box, rather than being
+  silently inert everywhere but Files.
+- Staged Takeout archives survive closing the window; archives that have since been moved or deleted
+  are dropped from the restored set.
 
 ### Fixed
 - Settings showed the local cache as "X of 0 B used" when no cache budget was set. An unset budget
   means *unlimited*, so it now reads "X cached — no limit set" rather than implying a zero cap.
+- The cache-budget editor fired a `SetCacheBudget` round-trip — and a toast — on every step, so a
+  run of `+` clicks applied a series of caps the user never asked for and stacked a column of
+  toasts. It now waits for the value to settle.
+- A long pin list pushed everything below it off the end of Settings. It shows the first six with a
+  "Show all N" row for the rest.
 
 ## [1.8.2] — 2026-08-17
 

@@ -11,8 +11,8 @@ pub(crate) struct DetailsState {
     pub(crate) details_suppress: Cell<bool>,
     /// The grid's and list's selection models. Both wrap the one browser model, so
     /// a selection in either drives the details pane.
-    pub(crate) grid_selection: gtk4::SingleSelection,
-    pub(crate) list_selection: gtk4::SingleSelection,
+    pub(crate) grid_selection: gtk4::MultiSelection,
+    pub(crate) list_selection: gtk4::MultiSelection,
 }
 
 /// The widgets in the browser's details pane that a selection repaints.
@@ -158,24 +158,22 @@ pub(crate) fn wire_details(ui: &Rc<Ui>) {
         ui.details.list_selection.clone(),
     ] {
         let ui_sel = ui.clone();
-        selection.connect_selection_changed(move |sel, _, _| {
-            match entry_at(sel.model().as_ref(), sel.selected()) {
-                Some(entry) => show_details(&ui_sel, &entry),
-                None => hide_details(&ui_sel),
+        selection.connect_selection_changed(move |_, _, _| {
+            // The details pane describes *one* entry. A batch is the bulk bar's
+            // business, so the pane steps aside rather than picking a member of
+            // the selection to speak for the rest.
+            let entries = selected_entries(&ui_sel);
+            match entries.as_slice() {
+                [entry] => show_details(&ui_sel, entry),
+                _ => hide_details(&ui_sel),
             }
+            sync_bulk_bar(&ui_sel);
         });
     }
 
     let ui_close = ui.clone();
     ui.details.details.close_button.connect_clicked(move |_| {
-        ui_close
-            .details
-            .grid_selection
-            .set_selected(gtk4::INVALID_LIST_POSITION);
-        ui_close
-            .details
-            .list_selection
-            .set_selected(gtk4::INVALID_LIST_POSITION);
+        clear_selection(&ui_close);
         hide_details(&ui_close);
     });
 
@@ -289,8 +287,9 @@ pub(crate) fn hide_details(ui: &Rc<Ui>) {
     *ui.details.details_entry.borrow_mut() = None;
 }
 
-/// The entry highlighted in whichever browser view is on screen, if any. Backs the
-/// F2 / Delete shortcuts.
+/// The single entry the details pane is showing, if any. Backs the actions that
+/// only make sense on one entry (rename, versions); the batch-capable ones ask
+/// [`selected_entries`] instead.
 pub(crate) fn selected_entry(ui: &Rc<Ui>) -> Option<DirEntry> {
     ui.details.details_entry.borrow().clone()
 }

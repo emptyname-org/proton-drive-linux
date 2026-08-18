@@ -21,6 +21,10 @@ pub(crate) struct GalleryState {
     pub(crate) upload: gtk4::Button,
     /// Opens the Google Photos Takeout import chooser.
     pub(crate) import: gtk4::Button,
+    /// Upload / Import offered on the *empty timeline* status page, so a fresh
+    /// account is a place to start rather than a dead end. Hidden on every other
+    /// status: a load error is not the moment to offer an upload.
+    pub(crate) empty_actions: gtk4::Box,
     /// "Photos", or the album's name while one is open.
     pub(crate) title: gtk4::Label,
     /// "1,204 photos" under the page title.
@@ -180,6 +184,9 @@ pub(crate) struct GalleryWidgets {
     pub(crate) retry: gtk4::Button,
     pub(crate) upload: gtk4::Button,
     pub(crate) import: gtk4::Button,
+    pub(crate) empty_actions: gtk4::Box,
+    pub(crate) empty_upload: gtk4::Button,
+    pub(crate) empty_import: gtk4::Button,
     pub(crate) refresh: gtk4::Button,
     /// The Albums grid, its own status page and the stack between them, plus the
     /// Photos/Albums switcher and the back button out of an album.
@@ -230,10 +237,29 @@ pub(crate) fn build_gallery_page() -> (gtk4::Widget, GalleryWidgets) {
     retry.add_css_class("suggested-action");
     retry.set_visible(false);
 
+    // The empty-timeline state's two ways forward. `StatusPage` takes one child,
+    // so Retry and these share a box and each is shown only for its own state.
+    let empty_upload = gtk4::Button::builder().label("Upload photos").build();
+    empty_upload.add_css_class("pill");
+    empty_upload.add_css_class("suggested-action");
+    let empty_import = gtk4::Button::builder()
+        .label("Import from Google Photos")
+        .build();
+    empty_import.add_css_class("pill");
+    let empty_actions = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+    empty_actions.set_halign(gtk4::Align::Center);
+    empty_actions.set_visible(false);
+    empty_actions.append(&empty_upload);
+    empty_actions.append(&empty_import);
+
+    let status_child = gtk4::Box::new(gtk4::Orientation::Vertical, 12);
+    status_child.append(&retry);
+    status_child.append(&empty_actions);
+
     let status = adw::StatusPage::builder()
         .icon_name("image-x-generic-symbolic")
         .vexpand(true)
-        .child(&retry)
+        .child(&status_child)
         .build();
     status.add_css_class("compact");
 
@@ -443,6 +469,9 @@ pub(crate) fn build_gallery_page() -> (gtk4::Widget, GalleryWidgets) {
             retry,
             upload,
             import,
+            empty_actions,
+            empty_upload,
+            empty_import,
             refresh,
             tabs,
             favorites_btn,
@@ -569,6 +598,15 @@ pub(crate) fn thousands(n: usize) -> String {
 /// Wire the gallery: install the section factory, the zoom gestures, the pager
 /// and the upload button. Activating a thumbnail downloads the photo and opens it
 /// in the in-app lightbox.
+/// Wire the empty-timeline buttons. Upload re-fires the header's own Upload
+/// rather than duplicating its file-chooser, so the two can't drift apart.
+pub(crate) fn wire_gallery_empty(ui: &Rc<Ui>, upload: &gtk4::Button, import: &gtk4::Button) {
+    let ui_upload = ui.clone();
+    upload.connect_clicked(move |_| ui_upload.gallery.upload.emit_clicked());
+    let ui_import = ui.clone();
+    import.connect_clicked(move |_| ui_import.stack.set_visible_child_name("takeout"));
+}
+
 pub(crate) fn wire_gallery(ui: &Rc<Ui>, list: &gtk4::ListView, scroll: &gtk4::ScrolledWindow) {
     let factory = gtk4::SignalListItemFactory::new();
     factory.connect_setup(|_, item| {
@@ -1483,6 +1521,12 @@ pub(crate) fn load_gallery(ui: &Rc<Ui>, append: bool) {
                         )
                     };
                     gallery_status(&ui, "image-x-generic-symbolic", title, description, false);
+                    // Only the whole-timeline empty state: an empty *album* is
+                    // filled by adding existing photos to it, not by uploading
+                    // into it, so the buttons would point the wrong way.
+                    ui.gallery
+                        .empty_actions
+                        .set_visible(ui.gallery.album.borrow().is_none());
                     return;
                 }
                 ui.gallery.content.set_visible_child_name("timeline");
@@ -1525,6 +1569,9 @@ pub(crate) fn gallery_status(ui: &Rc<Ui>, icon: &str, title: &str, description: 
     ui.gallery.status.set_title(title);
     ui.gallery.status.set_description(Some(description));
     ui.gallery.retry.set_visible(retry);
+    // Only the empty timeline offers a way to fill it; every other status turns
+    // those buttons back off.
+    ui.gallery.empty_actions.set_visible(false);
     ui.gallery.more.set_visible(false);
     ui.gallery.content.set_visible_child_name("status");
 }

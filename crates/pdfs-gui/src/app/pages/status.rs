@@ -37,7 +37,16 @@ pub(crate) struct StatusState {
     /// Set while a settings widget is being populated programmatically, so its
     /// change handler skips the IPC/systemd side effect.
     pub(crate) settings_suppress: Cell<bool>,
+    /// Pending debounce for the cache-budget editor. Each `+` click is a value
+    /// change, and firing a `SetCacheBudget` (and a toast) per click means a
+    /// stack of toasts and a series of caps the user never asked to apply — so
+    /// only the value they settle on is sent.
+    pub(crate) budget_source: RefCell<Option<glib::SourceId>>,
     pub(crate) pins_group: adw::PreferencesGroup,
+    /// Whether the pin list is showing every pin or only the first
+    /// [`PINS_COLLAPSED`]. A long pin list would otherwise push everything below
+    /// it — including the Developer group — off the end of the page.
+    pub(crate) pins_expanded: Cell<bool>,
     /// Rows currently shown under [`Self::pins_group`], retained so a refresh can
     /// diff against them and only rebuild when the pin set actually changes.
     pub(crate) pin_rows: RefCell<Vec<PinRow>>,
@@ -316,6 +325,15 @@ pub(crate) fn build_main_page() -> (gtk4::Widget, MainWidgets) {
     )
 }
 
+/// How many pins the Settings list shows before collapsing the rest behind a
+/// "Show all" row. Enough to recognise the list at a glance; short enough that
+/// the groups below it stay reachable.
+pub(crate) const PINS_COLLAPSED: usize = 6;
+
+/// How long the cache-budget editor waits after the last change before applying
+/// it, so a run of `+` clicks is one request rather than one per click.
+pub(crate) const BUDGET_DEBOUNCE: Duration = Duration::from_millis(600);
+
 /// Bytes per GiB, for the cache-budget editor's unit conversion.
 pub(crate) const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
 
@@ -350,13 +368,22 @@ pub(crate) fn wire_settings(
         if ui_budget.status.settings_suppress.get() {
             return;
         }
+        // Replace any pending apply, so only the value the user stops on is sent.
+        if let Some(src) = ui_budget.status.budget_source.borrow_mut().take() {
+            src.remove();
+        }
         let bytes = (row.value() * GIB).round() as u64;
-        settings_request(
-            &ui_budget,
-            Request::SetCacheBudget { bytes },
-            "Cache budget updated",
-            "Couldn't set cache budget",
-        );
+        let ui_fire = ui_budget.clone();
+        let src = glib::timeout_add_local_once(BUDGET_DEBOUNCE, move || {
+            ui_fire.status.budget_source.borrow_mut().take();
+            settings_request(
+                &ui_fire,
+                Request::SetCacheBudget { bytes },
+                "Cache budget updated",
+                "Couldn't set cache budget",
+            );
+        });
+        *ui_budget.status.budget_source.borrow_mut() = Some(src);
     });
 
     // Purge: confirm, then drop all unpinned cached content via the daemon.
@@ -903,7 +930,15 @@ pub(crate) fn repaint_pins(ui: &Rc<Ui>, pins: &[pdfs_core::cache::Pin], mounted:
         return;
     }
 
-    for pin in pins {
+    // Only the first page of pins is rendered; the rest sit behind the row
+    // below, so a device with hundreds of pins doesn't bury the groups after it.
+    let expanded = ui.status.pins_expanded.get();
+    let shown = if expanded {
+        pins.len()
+    } else {
+        pins.len().min(PINS_COLLAPSED)
+    };
+    for pin in &pins[..shown] {
         let name = Path::new(&pin.path)
             .file_name()
             .and_then(|n| n.to_str())
@@ -940,5 +975,38 @@ pub(crate) fn repaint_pins(ui: &Rc<Ui>, pins: &[pdfs_core::cache::Pin], mounted:
             row,
             unpin: Some(unpin),
         });
+    }
+
+    if pins.len() > PINS_COLLAPSED {
+        let row = adw::ActionRow::builder()
+            .title(if expanded {
+                "Show fewer".to_string()
+            } else {
+                format!("Show all {} pinned files", pins.len())
+            })
+            .activatable(true)
+            .build();
+        row.add_suffix(&gtk4::Image::from_icon_name(if expanded {
+            "go-up-symbolic"
+        } else {
+            "go-down-symbolic"
+        }));
+        let ui_more = ui.clone();
+        row.connect_activated(move |_| {
+            ui_more
+                .status
+                .pins_expanded
+                .set(!ui_more.status.pins_expanded.get());
+            // The diff guard compares pin *paths*; the same paths render
+            // differently now, so the baseline has to be dropped for the next
+            // repaint to actually rebuild.
+            *ui_more.status.pins_state.borrow_mut() = None;
+            refresh(&ui_more);
+        });
+        ui.status.pins_group.add(&row);
+        ui.status
+            .pin_rows
+            .borrow_mut()
+            .push(PinRow { row, unpin: None });
     }
 }

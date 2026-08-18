@@ -29,6 +29,47 @@ const IMPORT_JOB: &str = "Importing Google Photos";
 /// What the archive list says before anything is staged. `repaint_archives`
 /// swaps in the count and total once there is something to report, and swaps
 /// this back when the list is emptied again.
+/// Where the staged set is remembered between runs, under the app's state
+/// directory. Staging an export means picking dozens of files out of a file
+/// chooser; losing that to a window close (or a crash mid-import) and having to
+/// redo it is the kind of small cruelty that makes a migration not get finished.
+fn staged_path(ui: &Rc<Ui>) -> PathBuf {
+    ui.dirs.state_dir().join("takeout-staged.json")
+}
+
+/// Read the remembered set, dropping any archive that has since been moved or
+/// deleted — a stale path would only fail at launch, and silently is worse.
+fn load_staged(ui: &Rc<Ui>) -> Vec<PathBuf> {
+    let Ok(text) = std::fs::read_to_string(staged_path(ui)) else {
+        return Vec::new();
+    };
+    let paths: Vec<String> = serde_json::from_str(&text).unwrap_or_default();
+    paths
+        .into_iter()
+        .map(PathBuf::from)
+        .filter(|p| p.is_file())
+        .collect()
+}
+
+/// Remember the staged set. Best-effort: failing to write it costs the user a
+/// re-pick next time, which is not worth interrupting them over now.
+fn save_staged(ui: &Rc<Ui>) {
+    let paths: Vec<String> = ui
+        .takeout
+        .archives
+        .borrow()
+        .iter()
+        .map(|p| p.display().to_string())
+        .collect();
+    let path = staged_path(ui);
+    let written = serde_json::to_string(&paths)
+        .map_err(|e| e.to_string())
+        .and_then(|text| std::fs::write(&path, text).map_err(|e| e.to_string()));
+    if let Err(e) = written {
+        tracing::warn!("cannot remember staged Takeout archives: {e}");
+    }
+}
+
 const EMPTY_LIST_DESCRIPTION: &str = "Photos already in Proton Photos are matched by name and content and skipped, so \
      re-running an interrupted import is safe.";
 
@@ -390,6 +431,9 @@ pub(crate) fn wire_takeout(ui: &Rc<Ui>, widgets: &TakeoutWidgets) {
         .back_button
         .connect_clicked(move |_| ui_back.stack.set_visible_child_name("main"));
 
+    // Restore whatever was staged when the window last closed, before the first
+    // paint, so the page comes up as the user left it.
+    *ui.takeout.archives.borrow_mut() = load_staged(ui);
     repaint_archives(ui);
 }
 
@@ -489,6 +533,7 @@ pub(crate) fn repaint_archives(ui: &Rc<Ui>) {
     }
     *ui.takeout.rows.borrow_mut() = rows;
 
+    save_staged(ui);
     sync_takeout_actions(ui);
 }
 
