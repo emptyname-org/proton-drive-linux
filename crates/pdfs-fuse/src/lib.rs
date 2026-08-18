@@ -96,6 +96,7 @@ mod shutdown;
 mod state;
 mod sweep;
 mod sync;
+mod takeout;
 mod transfers;
 mod upload;
 mod r#virtual;

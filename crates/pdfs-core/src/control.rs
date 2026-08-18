@@ -103,6 +103,33 @@ pub enum Request {
     /// re-encrypted for our timeline, which the SDK does not implement yet; the
     /// daemon reports that as an error rather than silently doing nothing.
     SetPhotoFavorite { uid: String, favorite: bool },
+    /// Import Google Photos **Takeout** archives into Proton Photos.
+    ///
+    /// `archives` are absolute paths to the export's `.zip` parts on the
+    /// daemon's own filesystem — the whole set at once, because a photo and its
+    /// metadata sidecar routinely land in different parts. Photos already on the
+    /// account (matched by name *and* content digest) are skipped, so a library
+    /// partly synced by Proton Photos elsewhere does not import twice, and an
+    /// interrupted import resumes by simply being run again.
+    ///
+    /// With `dry_run` the daemon scans and reports what it *would* do without
+    /// uploading anything. Otherwise it acks immediately with
+    /// [`Response::Ok`] and works in the background — an export is hours of
+    /// upload, far past any socket timeout. Progress shows up in
+    /// [`Request::GetQueueStatus`] as a job, and the final counts in
+    /// [`Request::ImportStatus`].
+    ImportTakeout {
+        archives: Vec<String>,
+        #[serde(default)]
+        dry_run: bool,
+    },
+    /// How the running (or last finished) Takeout import is doing. Replies with
+    /// [`Response::ImportStatus`].
+    ImportStatus,
+    /// Ask the running Takeout import to stop. It finishes the photo on the wire
+    /// and files what it has uploaded into its albums, then reports
+    /// `cancelled`. Replies with [`Response::Ok`].
+    CancelImport,
     /// Upload the photo at `source_path` under the given name and media type.
     ///
     /// A path, not the bytes: this protocol is line-delimited JSON, and
@@ -1052,6 +1079,35 @@ pub struct PhotoMonth {
     pub count: usize,
 }
 
+/// How a Google Photos Takeout import is going, or how the last one ended
+/// ([`Response::ImportStatus`]).
+///
+/// The counts are cumulative for the run, so the same shape serves progress and
+/// the final report. `found` counts *distinct* photos: Google stores a separate
+/// copy of a photo in each album folder it appears in, and those fold into one
+/// upload that joins several albums.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+pub struct ImportSummary {
+    /// Distinct photos the export holds.
+    pub found: usize,
+    /// Photos uploaded by this run.
+    pub uploaded: usize,
+    /// Photos already on the account, matched by name *and* content digest.
+    pub duplicates: usize,
+    /// Photos that could not be read or uploaded.
+    pub failed: usize,
+    /// Photos in the export's trash bucket, which are never imported.
+    pub skipped_trashed: usize,
+    /// Albums created by this run.
+    pub albums_created: usize,
+    /// Album memberships added by this run.
+    pub album_links: usize,
+    /// Bytes uploaded.
+    pub bytes: u64,
+    /// True when the run stopped early because it was cancelled.
+    pub cancelled: bool,
+}
+
 /// One album in a [`Response::Albums`] listing.
 ///
 /// An album is a folder node on the photos volume carrying album properties, so
@@ -1269,6 +1325,14 @@ pub enum Response {
     Albums {
         available: bool,
         items: Vec<AlbumInfo>,
+    },
+    /// How the Takeout import is doing (reply to [`Request::ImportStatus`]).
+    /// `running` is false once it has finished, when `summary` is the final
+    /// report; `summary` is `None` when no import has run this session.
+    ImportStatus {
+        running: bool,
+        #[serde(default)]
+        summary: Option<ImportSummary>,
     },
     /// The months the timeline spans (reply to [`Request::PhotoMonths`]),
     /// newest first.

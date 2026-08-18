@@ -32,6 +32,12 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 directories = "5"
 ignore = "0.4"
 sha2 = "0.10"
+# Google Takeout exports are zip sets; the importer reads their central
+# directories and streams entries out without extracting to disk first.
+zip = { version = "8", default-features = false, features = ["deflate"] }
+# Proton's photo duplicate detection is keyed on the plaintext SHA-1, so an
+# import has to speak SHA-1 whatever its age.
+sha1 = "0.10"
 # Thumbnail generation for photos the server has none for. Decoders only for the
 # formats a camera or phone actually produces — the rest of the crate's codecs
 # would be dead weight in the daemon.
@@ -44,3 +50,10 @@ async-trait = "0.1"
 futures = "0.3"
 fuser = "0.17"
 libc = "0.2"
+
+# LOCAL ONLY — do not commit. The Takeout import needs album writes and batch
+# duplicate detection, which are in the working tree of proton-sdk-rs but not in
+# a published 0.6.x. Releases build against the registry versions.
+[patch.crates-io]
+proton-sdk = { path = "../proton-sdk-rs/crates/proton-sdk" }
+proton-drive-rs = { path = "../proton-sdk-rs/crates/proton-drive-rs" }

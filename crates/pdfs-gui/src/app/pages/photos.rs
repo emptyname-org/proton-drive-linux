@@ -19,6 +19,8 @@ pub(crate) struct GalleryState {
     pub(crate) retry: gtk4::Button,
     pub(crate) more: gtk4::Button,
     pub(crate) upload: gtk4::Button,
+    /// Opens the Google Photos Takeout import chooser.
+    pub(crate) import: gtk4::Button,
     /// "Photos", or the album's name while one is open.
     pub(crate) title: gtk4::Label,
     /// "1,204 photos" under the page title.
@@ -177,6 +179,7 @@ pub(crate) struct GalleryWidgets {
     pub(crate) scroll: gtk4::ScrolledWindow,
     pub(crate) retry: gtk4::Button,
     pub(crate) upload: gtk4::Button,
+    pub(crate) import: gtk4::Button,
     pub(crate) refresh: gtk4::Button,
     /// The Albums grid, its own status page and the stack between them, plus the
     /// Photos/Albums switcher and the back button out of an album.
@@ -288,12 +291,23 @@ pub(crate) fn build_gallery_page() -> (gtk4::Widget, GalleryWidgets) {
         .build();
     upload.add_css_class("pill");
     upload.add_css_class("suggested-action");
+
+    // Importing an export is a rarer, heavier action than adding one photo, so
+    // it sits beside Upload as a plain button rather than a second accent one.
+    let import = gtk4::Button::builder()
+        .icon_name("folder-download-symbolic")
+        .tooltip_text("Import a Google Photos Takeout export")
+        .valign(gtk4::Align::Center)
+        .build();
+    import.add_css_class("flat");
+    import.add_css_class("circular");
     let refresh = refresh_button();
 
     let header_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
     header_box.append(&back);
     header_box.append(&titles);
     header_box.append(&refresh);
+    header_box.append(&import);
     header_box.append(&upload);
 
     // All / Photos / Videos / Raw filter. Linked toggles acting as one segmented
@@ -428,6 +442,7 @@ pub(crate) fn build_gallery_page() -> (gtk4::Widget, GalleryWidgets) {
             scroll,
             retry,
             upload,
+            import,
             refresh,
             tabs,
             favorites_btn,
@@ -728,6 +743,14 @@ pub(crate) fn wire_gallery(ui: &Rc<Ui>, list: &gtk4::ListView, scroll: &gtk4::Sc
         ui_dates.gallery.range.set(range);
         load_gallery(&ui_dates, false);
     });
+
+    // The import is a staged, hours-long migration, so the button hands over to
+    // the Import page rather than opening a file chooser here: the archives need
+    // reviewing before anything is sent, and the run needs somewhere to report.
+    let ui_import = ui.clone();
+    ui.gallery
+        .import
+        .connect_clicked(move |_| ui_import.stack.set_visible_child_name("takeout"));
 
     let ui_upload = ui.clone();
     ui.gallery.upload.connect_clicked(move |_| {

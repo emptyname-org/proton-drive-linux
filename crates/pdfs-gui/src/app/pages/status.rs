@@ -104,6 +104,8 @@ pub(crate) struct MainWidgets {
     /// which is where the folder is changed.
     pub(crate) mountpoint_row: adw::ActionRow,
     pub(crate) mountpoint_button: gtk4::Button,
+    /// Opens the Google Photos Takeout import page.
+    pub(crate) import_row: adw::ActionRow,
 }
 
 /// The main (logged-in) page: a libadwaita settings surface — account header,
@@ -233,6 +235,22 @@ pub(crate) fn build_main_page() -> (gtk4::Widget, MainWidgets) {
     mountpoint_row.add_suffix(&mountpoint_button);
     system_group.add(&mountpoint_row);
 
+    // Import: a one-off migration rather than a setting, so it is a doorway to
+    // its own page rather than controls inlined here — staging a set of archives
+    // and watching an hours-long upload needs the room.
+    let import_group = adw::PreferencesGroup::builder()
+        .title("Import")
+        .description("Bring a photo library from another service into Proton Photos.")
+        .build();
+    let import_row = adw::ActionRow::builder()
+        .title("Import from Google Photos")
+        .subtitle("Add a Google Takeout export to your timeline.")
+        .activatable(true)
+        .build();
+    import_row.add_prefix(&gtk4::Image::from_icon_name("folder-download-symbolic"));
+    import_row.add_suffix(&gtk4::Image::from_icon_name("go-next-symbolic"));
+    import_group.add(&import_row);
+
     // Pins group: filled in by refresh.
     let pins_group = adw::PreferencesGroup::builder()
         .title("Pinned files")
@@ -265,6 +283,7 @@ pub(crate) fn build_main_page() -> (gtk4::Widget, MainWidgets) {
     inner.append(&transfers_group);
     inner.append(&storage_group);
     inner.append(&system_group);
+    inner.append(&import_group);
     inner.append(&pins_group);
     inner.append(&dev_group);
 
@@ -292,6 +311,7 @@ pub(crate) fn build_main_page() -> (gtk4::Widget, MainWidgets) {
             purge_button,
             mountpoint_row,
             mountpoint_button,
+            import_row,
         },
     )
 }
@@ -308,6 +328,7 @@ pub(crate) fn wire_settings(
     ui: &Rc<Ui>,
     purge_button: &gtk4::Button,
     mountpoint_button: &gtk4::Button,
+    import_row: &adw::ActionRow,
 ) {
     let config = ui.dirs.load_config();
 
@@ -382,6 +403,10 @@ pub(crate) fn wire_settings(
     // local path; this button is the way there.
     let ui_mp = ui.clone();
     mountpoint_button.connect_clicked(move |_| ui_mp.stack.set_visible_child_name("locations"));
+
+    // Import: a doorway, not a setting — everything about it lives on its page.
+    let ui_import = ui.clone();
+    import_row.connect_activated(move |_| ui_import.stack.set_visible_child_name("takeout"));
 }
 
 /// Run a settings control-socket round-trip (budget / purge) on a worker thread,
@@ -513,6 +538,12 @@ pub(crate) fn refresh(ui: &Rc<Ui>) {
     refresh_transfers(ui);
     // Both of these pages show work as it happens, so they follow the tick while
     // they are on screen. Every other page loads on navigation only.
+    // A Takeout import outlives the page that started it, so it is polled
+    // wherever the user has navigated to — otherwise leaving the page means
+    // never being told it finished.
+    if ui.stack.visible_child_name().as_deref() == Some("takeout") || ui.takeout.running.get() {
+        refresh_takeout(ui);
+    }
     match ui.stack.visible_child_name().as_deref() {
         Some("main") => refresh_quota(ui),
         Some("locations") => refresh_locations(ui),
@@ -653,6 +684,10 @@ pub(crate) fn repaint_transfers(ui: &Rc<Ui>, items: &[TransferItem], jobs: &[Job
     // count falling to zero is what "the sync finished" looks like from here.
     // Jobs are deliberately not counted — a bulk upload retires its scan job and
     // starts its upload job mid-flight, which is not a thing finishing.
+    // The Import page reads its progress off the same snapshot rather than
+    // polling the daemon a second time for numbers already on the wire.
+    takeout_progress(ui, jobs);
+
     let previous = ui.status.active_transfers.replace(items.len());
     if items.is_empty() && previous > 0 {
         let files = if previous == 1 {
@@ -808,11 +843,14 @@ pub(crate) fn refresh_status(ui: &Rc<Ui>) {
                     (used as f64 / budget as f64).min(1.0)
                 };
                 ui.status.cache_bar.set_fraction(fraction);
-                ui.status.cache_label.set_text(&format!(
-                    "{} of {} used",
-                    human_bytes(used),
-                    human_bytes(budget)
-                ));
+                // A 0 budget means *unlimited*, not a zero-byte cap — "of 0 B
+                // used" reads as a broken read-out, and there is no fraction to
+                // draw against no limit.
+                ui.status.cache_label.set_text(&if budget == 0 {
+                    format!("{} cached — no limit set", human_bytes(used))
+                } else {
+                    format!("{} of {} used", human_bytes(used), human_bytes(budget))
+                });
                 repaint_pins(&ui, &pins, true);
             }
             // Daemon unreachable (still starting, or down): report not-mounted and

@@ -158,6 +158,28 @@ enum Command {
     },
     /// List the photo albums (including ones shared with this account).
     Albums,
+    /// Import a Google Photos Takeout export into Proton Photos.
+    ///
+    /// Pass every zip of the export at once — Google splits one export across
+    /// numbered parts, and a photo's metadata often sits in a different part
+    /// than the photo. Albums in the export are recreated as Proton albums, and
+    /// photos already on the account (same name and same content) are skipped,
+    /// so an interrupted import can simply be run again.
+    ImportGooglePhotos {
+        /// The export's `.zip` files (e.g. `takeout-*.zip`).
+        #[arg(required = true)]
+        archives: Vec<PathBuf>,
+        /// Report what would be imported without uploading anything.
+        #[arg(long)]
+        dry_run: bool,
+        /// Stay attached and print progress until the import finishes.
+        #[arg(long)]
+        wait: bool,
+    },
+    /// Show how the running (or last) Google Photos import is doing.
+    ImportStatus,
+    /// Stop the running Google Photos import.
+    CancelImport,
     /// List the photos in one album (newest capture first).
     Album {
         /// Album node uid in `volume~link` form (from `pdfs albums`).
@@ -589,6 +611,13 @@ fn main() -> Result<()> {
         } => cmd_photos(limit, offset, favorites),
         Command::Favorite { uid, remove } => cmd_favorite(uid, remove),
         Command::Albums => cmd_albums(),
+        Command::ImportGooglePhotos {
+            archives,
+            dry_run,
+            wait,
+        } => cmd_import_google_photos(archives, dry_run, wait),
+        Command::ImportStatus => cmd_import_status(),
+        Command::CancelImport => cmd_cancel_import(),
         Command::Album { uid, limit, offset } => cmd_album(uid, limit, offset),
         Command::OpenPhoto { uid } => cmd_open_photo(uid),
         Command::Search { query, limit } => cmd_search(query, limit),
@@ -1709,6 +1738,104 @@ fn cmd_albums() -> Result<()> {
         other => bail!("unexpected response: {other:?}"),
     }
     Ok(())
+}
+
+fn cmd_import_google_photos(archives: Vec<PathBuf>, dry_run: bool, wait: bool) -> Result<()> {
+    // The daemon opens the archives itself off the shared filesystem, so it gets
+    // absolute paths — the same arrangement `pdfs upload` uses.
+    let mut absolute = Vec::with_capacity(archives.len());
+    for archive in &archives {
+        let path = std::fs::canonicalize(archive)
+            .with_context(|| format!("resolve {}", archive.display()))?;
+        absolute.push(
+            path.to_str()
+                .ok_or_else(|| anyhow!("path is not valid UTF-8: {}", path.display()))?
+                .to_owned(),
+        );
+    }
+
+    match control_request(CtlRequest::ImportTakeout {
+        archives: absolute,
+        dry_run,
+    })? {
+        CtlResponse::Ok { message } => println!("{message}"),
+        CtlResponse::Error { message, kind } => bail!("{}", cli_error(kind, &message)),
+        other => bail!("unexpected response: {other:?}"),
+    }
+    if !wait {
+        println!("Run `pdfs import-status` to follow it.");
+        return Ok(());
+    }
+
+    // Poll rather than stream: the control protocol is request/response, and an
+    // import runs for hours — a held-open socket would be the only long-lived
+    // connection the daemon has.
+    loop {
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        match control_request(CtlRequest::ImportStatus)? {
+            CtlResponse::ImportStatus {
+                running: true,
+                summary: _,
+            } => continue,
+            CtlResponse::ImportStatus { summary, .. } => {
+                print_import_summary(summary.as_ref());
+                return Ok(());
+            }
+            CtlResponse::Error { message, kind } => bail!("{}", cli_error(kind, &message)),
+            other => bail!("unexpected response: {other:?}"),
+        }
+    }
+}
+
+fn cmd_import_status() -> Result<()> {
+    match control_request(CtlRequest::ImportStatus)? {
+        CtlResponse::ImportStatus { running, summary } => {
+            if running {
+                println!("Import running. `pdfs transfers` shows its progress.");
+            }
+            print_import_summary(summary.as_ref());
+        }
+        CtlResponse::Error { message, kind } => bail!("{}", cli_error(kind, &message)),
+        other => bail!("unexpected response: {other:?}"),
+    }
+    Ok(())
+}
+
+fn cmd_cancel_import() -> Result<()> {
+    match control_request(CtlRequest::CancelImport)? {
+        CtlResponse::Ok { message } => println!("{message}"),
+        CtlResponse::Error { message, kind } => bail!("{}", cli_error(kind, &message)),
+        other => bail!("unexpected response: {other:?}"),
+    }
+    Ok(())
+}
+
+fn print_import_summary(summary: Option<&pdfs_core::control::ImportSummary>) {
+    let Some(summary) = summary else {
+        println!("No import has run yet.");
+        return;
+    };
+    println!("Photos in export : {}", summary.found);
+    println!("Uploaded         : {}", summary.uploaded);
+    println!("Already on Proton: {}", summary.duplicates);
+    if summary.skipped_trashed > 0 {
+        println!("Skipped (trash)  : {}", summary.skipped_trashed);
+    }
+    if summary.albums_created > 0 || summary.album_links > 0 {
+        println!(
+            "Albums           : {} created, {} photos filed",
+            summary.albums_created, summary.album_links
+        );
+    }
+    if summary.failed > 0 {
+        println!("Failed           : {}", summary.failed);
+    }
+    if summary.bytes > 0 {
+        println!("Uploaded bytes   : {}", summary.bytes);
+    }
+    if summary.cancelled {
+        println!("Import was cancelled before it finished.");
+    }
 }
 
 fn cmd_album(uid: String, limit: usize, offset: usize) -> Result<()> {

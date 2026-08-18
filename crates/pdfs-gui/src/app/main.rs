@@ -14,6 +14,7 @@ use pages::photos::*;
 use pages::shared::*;
 use pages::shared_by_me::*;
 use pages::status::*;
+use pages::takeout::*;
 use pages::trash::*;
 use pages::verify::*;
 use widgets::details::*;
@@ -46,10 +47,10 @@ use pdfs_core::config::AppDirs;
 
 use pdfs_core::control::{
     ActivityEntry, ActivityKind, AlbumInfo, BookmarkInfo, DeviceInfo, DirEntry, ErrorKind,
-    InvitationInfo, JobItem, PhotoItem, PhotoKind, PublicLinkInfo, RefreshScope, Request, Response,
-    RestorableFolder, RestoreItem, SearchHit, ShareEntry, ShareEntryKind, SharedItem,
-    SyncFolderInfo, SyncPhase, SyncProgress, TransferDirection, TransferItem, pending_summary,
-    send,
+    ImportSummary, InvitationInfo, JobItem, PhotoItem, PhotoKind, PublicLinkInfo, RefreshScope,
+    Request, Response, RestorableFolder, RestoreItem, SearchHit, ShareEntry, ShareEntryKind,
+    SharedItem, SyncFolderInfo, SyncPhase, SyncProgress, TransferDirection, TransferItem,
+    pending_summary, send,
 };
 
 use pdfs_core::mounts::{MountAccess, MountKind, MountMode, MountSpec};
@@ -120,6 +121,7 @@ struct Ui {
     pub(crate) devices: DevicesState,
     pub(crate) locations: LocationsState,
     pub(crate) activity: ActivityState,
+    pub(crate) takeout: TakeoutState,
 }
 
 impl Ui {
@@ -246,7 +248,9 @@ fn load_proton_theme() {
          .navigation-sidebar row {{ border-radius: 8px; margin: 2px 6px; }}\n\
          .navigation-sidebar row:selected {{ background: alpha({PROTON_PURPLE}, 0.16); color: {PROTON_PURPLE}; font-weight: 600; }}\n\
          .navigation-sidebar row:selected image {{ color: {PROTON_PURPLE}; }}\n\
-         .file-tile:selected, .file-tile:hover:selected {{ background: alpha({PROTON_PURPLE}, 0.20); }}\n"
+         .file-tile:selected, .file-tile:hover:selected {{ background: alpha({PROTON_PURPLE}, 0.20); }}\n\
+         .dropzone {{ border: 2px dashed alpha(currentColor, 0.25); border-radius: 16px; padding: 28px 18px; transition: background 160ms ease, border-color 160ms ease; }}\n\
+         .dropzone-active {{ border-color: {PROTON_PURPLE}; background: alpha({PROTON_PURPLE}, 0.10); }}\n"
     );
     let provider = gtk4::CssProvider::new();
     provider.load_from_string(&css);
@@ -285,6 +289,7 @@ fn build_window(app: &adw::Application) {
     let (locations_page, locations_widgets) = build_locations_page();
     let (activity_page, activity_widgets) = build_activity_page();
     let (trash_page, trash_widgets) = build_trash_page();
+    let (takeout_page, takeout_widgets) = build_takeout_page();
     stack.add_named(&login_page, Some("login"));
     stack.add_named(&main_page, Some("main"));
     stack.add_named(&browser_page, Some("browser"));
@@ -295,6 +300,7 @@ fn build_window(app: &adw::Application) {
     stack.add_named(&locations_page, Some("locations"));
     stack.add_named(&activity_page, Some("activity"));
     stack.add_named(&trash_page, Some("trash"));
+    stack.add_named(&takeout_page, Some("takeout"));
 
     // Sidebar: the signed-in destinations. Selecting a row swaps the page stack;
     // `sync_sidebar` pushes the other way when navigation happens elsewhere (e.g.
@@ -407,6 +413,7 @@ fn build_window(app: &adw::Application) {
             retry: gallery_widgets.retry.clone(),
             more: gallery_widgets.more.clone(),
             upload: gallery_widgets.upload.clone(),
+            import: gallery_widgets.import.clone(),
             title: gallery_widgets.title.clone(),
             subtitle: gallery_widgets.subtitle.clone(),
             albums: gallery_widgets.albums.clone(),
@@ -494,6 +501,24 @@ fn build_window(app: &adw::Application) {
             inflight: Cell::new(false),
             key: RefCell::new(None),
         },
+        takeout: TakeoutState {
+            archives: RefCell::new(Vec::new()),
+            list_group: takeout_widgets.list_group.clone(),
+            rows: RefCell::new(Vec::new()),
+            dropzone: takeout_widgets.dropzone.clone(),
+            scan_button: takeout_widgets.scan_button.clone(),
+            import_button: takeout_widgets.import_button.clone(),
+            cancel_button: takeout_widgets.cancel_button.clone(),
+            clear_button: takeout_widgets.clear_button.clone(),
+            progress_group: takeout_widgets.progress_group.clone(),
+            progress_label: takeout_widgets.progress_label.clone(),
+            progress_bar: takeout_widgets.progress_bar.clone(),
+            summary_group: takeout_widgets.summary_group.clone(),
+            summary_rows: RefCell::new(Vec::new()),
+            inflight: Cell::new(false),
+            running: Cell::new(false),
+            dry_run: Cell::new(false),
+        },
     });
     wire_login(&ui);
     wire_logout(&ui, &main_widgets.logout_button);
@@ -501,6 +526,7 @@ fn build_window(app: &adw::Application) {
         &ui,
         &main_widgets.purge_button,
         &main_widgets.mountpoint_button,
+        &main_widgets.import_row,
     );
     wire_sidebar(&ui);
     wire_browser(&ui, &browser_widgets.grid, &browser_widgets.column_view);
@@ -520,6 +546,7 @@ fn build_window(app: &adw::Application) {
     wire_devices(&ui, &devices_widgets.retry, &devices_widgets.restore);
     wire_locations(&ui, &locations_widgets.retry, &locations_widgets.add_folder);
     wire_activity(&ui, &activity_widgets.retry);
+    wire_takeout(&ui, &takeout_widgets);
     wire_refresh(
         &ui,
         &[
@@ -559,6 +586,9 @@ fn build_window(app: &adw::Application) {
             // every visit to stay live.
             Some("activity") => load_activity(&ui_nav),
             Some("trash") => load_trash(&ui_nav),
+            // The import runs in the daemon and outlives this page, so arriving
+            // here asks straight away whether one is in flight.
+            Some("takeout") => refresh_takeout(&ui_nav),
             _ => {}
         }
     });
@@ -644,6 +674,17 @@ fn build_sidebar() -> (adw::NavigationPage, gtk4::ListBox) {
     (page, list)
 }
 
+/// The sidebar destination a page belongs under. Most pages are their own
+/// destination; a sub-page reached from one (Import, off Settings) has no row of
+/// its own and answers with its parent, so the sidebar highlights where the user
+/// came from rather than clearing — which would read as "nowhere".
+fn destination_of(page: &str) -> &str {
+    match page {
+        "takeout" => "main",
+        other => other,
+    }
+}
+
 /// Selecting a sidebar row navigates the page stack. The reverse direction (stack
 /// → sidebar highlight) is [`sync_sidebar`], so the two can't fight: this handler
 /// only ever writes the stack.
@@ -654,7 +695,11 @@ fn wire_sidebar(ui: &Rc<Ui>) {
         let Some((page, _, _)) = DESTINATIONS.get(row.index() as usize) else {
             return;
         };
-        if ui_row.stack.visible_child_name().as_deref() != Some(*page) {
+        // Compared by *destination*, not by page: while a sub-page is open its
+        // parent's row is the selected one, and re-asserting it here would kick
+        // the user off the sub-page the moment they arrived.
+        let current = ui_row.stack.visible_child_name();
+        if current.as_deref().map(destination_of) != Some(*page) {
             ui_row.stack.set_visible_child_name(page);
         }
     });
@@ -755,6 +800,7 @@ fn sync_sidebar(ui: &Rc<Ui>) {
     let Some(current) = ui.stack.visible_child_name() else {
         return;
     };
+    let current = destination_of(&current);
     let index = DESTINATIONS
         .iter()
         .position(|(page, _, _)| *page == current);

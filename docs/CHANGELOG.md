@@ -9,6 +9,44 @@ release ships. Migrations are forward-only — a database written by a newer cli
 refuse-to-open, not a downgrade, so rolling back a release means restoring the cache from
 scratch (user data in `staging/` and `recovery/` is never touched by this).
 
+## [Unreleased]
+
+Google Photos import. No schema change. Schema: **28**.
+
+### Added
+- **Import a Google Photos Takeout export into Proton Photos** — `pdfs import-google-photos
+  takeout-*.zip` (add `--dry-run` to see what it would do, `--wait` to follow it), or the import
+  button in the Photos header, which multi-selects the export's zips. Albums in the export are
+  recreated as Proton albums and their photos filed into them; year folders and `Archive/` import
+  into the timeline; `Trash/` is skipped. Capture times and favourites come from Google's per-photo
+  JSON sidecars, including the truncated and `(N)`-swapped sidecar names Google produces.
+- Photos already on the account are **not re-uploaded**: the import asks the photos volume which of
+  the export's names exist (batched, 150 per request), reads and SHA-1s only those files, and skips
+  the ones whose content digest matches too — Proton's own duplicate rule. A library already partly
+  synced by Proton Photos on a phone therefore imports only what is missing, and an interrupted
+  import resumes by being run again. Google keeps a full copy of a photo in every album folder it
+  appears in; those fold into one upload that joins several albums.
+- The import streams each photo straight out of its zip, so an export needs no scratch space to
+  unpack into, and reports as a job in `pdfs transfers` and the GUI's activity view. `pdfs
+  import-status` shows the counts, `pdfs cancel-import` stops it — a cancelled run still files what
+  it uploaded into its albums.
+- **An Import page in the GUI** (Settings → *Import from Google Photos*, or the import button in
+  the Photos header). Archives are staged by drag-and-drop onto the page or through the file
+  chooser, listed with their sizes so the set can be checked before anything is sent, and launched
+  as either a Scan (dry run) or a confirmed Import. The page shows live progress off the import's
+  job, keeps the finished run's report on screen, and can stop a run in flight; because the import
+  outlives the page, it is polled wherever the user navigates and its completion is reported as a
+  desktop notification.
+
+- SDK (`proton-sdk-rs`): album **writes** — `ProtonPhotosClient::create_album` and
+  `add_photos_to_album`, ported from the TypeScript SDK (upstream C# has no album write API), plus
+  batch duplicate detection (`find_duplicates_many`, `name_collisions`). Adding a photo from an
+  album *shared with us* (a different volume) is still unported and fails that photo's outcome.
+
+### Fixed
+- Settings showed the local cache as "X of 0 B used" when no cache budget was set. An unset budget
+  means *unlimited*, so it now reads "X cached — no limit set" rather than implying a zero cap.
+
 ## [1.8.2] — 2026-08-17
 
 Closes the two findings 1.8.1's live verification produced (B85, B86) and finishes the data-safety

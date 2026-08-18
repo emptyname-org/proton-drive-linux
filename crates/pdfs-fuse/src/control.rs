@@ -329,6 +329,51 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
             },
             None => CtlResponse::error(CoreError::invalid(format!("bad uid: {uid}"))),
         },
+        // The scan alone walks every archive's central directory, so even the
+        // dry run goes to a background thread and is read back through
+        // `ImportStatus` rather than answered inline.
+        Ok(CtlRequest::ImportTakeout { archives, dry_run }) => {
+            if archives.is_empty() {
+                CtlResponse::error(CoreError::invalid("no Takeout archives given"))
+            } else {
+                let paths: Vec<PathBuf> = archives.into_iter().map(PathBuf::from).collect();
+                let missing: Vec<String> = paths
+                    .iter()
+                    .filter(|path| !path.is_file())
+                    .map(|path| path.display().to_string())
+                    .collect();
+                if !missing.is_empty() {
+                    CtlResponse::error(CoreError::not_found(format!(
+                        "cannot read: {}",
+                        missing.join(", ")
+                    )))
+                } else {
+                    let count = paths.len();
+                    match core.spawn_takeout_import(paths, dry_run) {
+                        Ok(()) => CtlResponse::Ok {
+                            message: format!(
+                                "{} {count} archive(s)",
+                                if dry_run { "scanning" } else { "importing" }
+                            ),
+                        },
+                        Err(e) => CtlResponse::error(e),
+                    }
+                }
+            }
+        }
+        Ok(CtlRequest::ImportStatus) => {
+            let (running, summary) = crate::takeout::import_status();
+            CtlResponse::ImportStatus { running, summary }
+        }
+        Ok(CtlRequest::CancelImport) => {
+            if crate::takeout::cancel_import() {
+                CtlResponse::Ok {
+                    message: "stopping the import".to_string(),
+                }
+            } else {
+                CtlResponse::error(CoreError::invalid("no import is running"))
+            }
+        }
         Ok(CtlRequest::UploadPhoto {
             name,
             media_type,
