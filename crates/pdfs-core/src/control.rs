@@ -93,6 +93,26 @@ pub enum Request {
     /// already cached (one batched round-trip) and replying with their on-disk
     /// paths. Keep the batch small — it is served on demand, as tiles scroll in.
     PhotoThumbs { uids: Vec<String> },
+    /// Fetch thumbnails for ordinary Drive image files shown outside the Photos
+    /// timeline. The modification time is the cache validity tag, so replacing
+    /// an image can never reuse its previous revision's thumbnail.
+    FileThumbs {
+        items: Vec<FileThumbRequest>,
+        /// Identifies the front-end's current listing. Moving to another page or
+        /// folder advances it, allowing the daemon to stop work for rows that
+        /// are no longer visible.
+        #[serde(default)]
+        generation: u64,
+    },
+    /// Stop ordinary-file thumbnail work belonging to older listings. Photos
+    /// timeline work and an explicit recursive build are deliberately separate.
+    CancelFileThumbs { generation: u64 },
+    /// Start building local thumbnails for every supported image below `path`.
+    /// The request returns immediately; progress is read with
+    /// [`Request::ThumbnailBuildStatus`].
+    StartThumbnailBuild { path: String },
+    /// Read progress for the recursive ordinary-file thumbnail build.
+    ThumbnailBuildStatus,
     /// Download a photo's full content into the cache; replies with its path.
     OpenPhoto { uid: String },
     /// Add or remove Proton's `Favorite` tag on a photo. Replies with
@@ -679,6 +699,10 @@ pub struct SharedItem {
     /// The shared node's decrypted name.
     pub name: String,
     pub is_dir: bool,
+    /// Modification time used to validate an image thumbnail. Older daemons
+    /// omit it, in which case clients use `0` as a conservative fallback tag.
+    #[serde(default)]
+    pub modified: i64,
     /// Mountpoint-relative path, when the daemon can resolve it (the node lives in
     /// my own tree). Empty when the path is unknown.
     #[serde(default)]
@@ -1187,6 +1211,110 @@ pub struct PhotoThumb {
     pub pending: bool,
 }
 
+/// One ordinary Drive file whose thumbnail a front-end wants to paint.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct FileThumbRequest {
+    /// Node uid in `volume~link` form.
+    pub uid: String,
+    /// File modification time, used as the thumbnail cache validity tag.
+    pub modified: i64,
+    /// Original Drive name. Local RAW-preview extraction uses the extension as a
+    /// format hint; defaulted for wire compatibility with older front-ends.
+    #[serde(default)]
+    pub name: String,
+}
+
+/// Whether a Drive name is a raster image that the built-in decoder can read,
+/// or a concrete camera RAW format whose embedded preview exiftool can extract.
+/// Keep this list shared by the daemon and every GUI surface so a visible tile
+/// is never advertised without a matching generation path.
+pub fn is_thumbnail_image_name(name: &str) -> bool {
+    let Some((_, extension)) = name.rsplit_once('.') else {
+        return false;
+    };
+    matches!(
+        extension.to_ascii_lowercase().as_str(),
+        "bmp"
+            | "gif"
+            | "jpeg"
+            | "jpg"
+            | "png"
+            | "tif"
+            | "tiff"
+            | "webp"
+            | "arw"
+            | "cr2"
+            | "cr3"
+            | "crw"
+            | "dng"
+            | "k25"
+            | "kdc"
+            | "mrw"
+            | "nef"
+            | "nrw"
+            | "orf"
+            | "pef"
+            | "raf"
+            | "rw"
+            | "rw2"
+            | "sr2"
+            | "srf"
+            | "x3f"
+    )
+}
+
+/// Whether `name` is one of the concrete RAW formats handled by the exiftool
+/// embedded-preview path. Deliberately excludes generic/legacy grab-bags whose
+/// preview availability is not dependable.
+pub fn is_raw_image_name(name: &str) -> bool {
+    let Some((_, extension)) = name.rsplit_once('.') else {
+        return false;
+    };
+    matches!(
+        extension.to_ascii_lowercase().as_str(),
+        "arw"
+            | "cr2"
+            | "cr3"
+            | "crw"
+            | "dng"
+            | "k25"
+            | "kdc"
+            | "mrw"
+            | "nef"
+            | "nrw"
+            | "orf"
+            | "pef"
+            | "raf"
+            | "rw"
+            | "rw2"
+            | "sr2"
+            | "srf"
+            | "x3f"
+    )
+}
+
+/// Progress of the one recursive ordinary-file thumbnail build the daemon may
+/// run at a time.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+pub struct ThumbnailBuildStatus {
+    pub running: bool,
+    /// True while folders are still being discovered, before the final image
+    /// count is known and the progress bar can become determinate.
+    pub scanning: bool,
+    /// Mountpoint-relative root selected when the build started.
+    pub path: String,
+    pub folders_scanned: u64,
+    pub images_found: u64,
+    /// Images already cached or processed during this build. Includes failures,
+    /// so `completed == images_found` still means the job has finished.
+    pub completed: u64,
+    /// Images that could not be downloaded or decoded.
+    pub failed: u64,
+    /// A traversal-level problem, such as a folder that could not be listed.
+    #[serde(default)]
+    pub message: Option<String>,
+}
+
 /// A daemon too old to report connectivity is assumed online — it could not
 /// have mounted at all otherwise.
 fn default_online() -> bool {
@@ -1339,6 +1467,8 @@ pub enum Response {
     PhotoMonths { months: Vec<PhotoMonth> },
     /// Thumbnails for a [`Request::PhotoThumbs`] batch.
     Thumbs { items: Vec<PhotoThumb> },
+    /// Current recursive thumbnail-build progress.
+    ThumbnailBuild { status: ThumbnailBuildStatus },
     /// An on-disk path the front-end can open (e.g. a downloaded photo).
     FilePath { path: String },
     /// Full-text search results (reply to [`Request::Search`]).
@@ -1473,7 +1603,7 @@ impl ErrorKind {
 }
 
 /// Send one [`Request`] to the daemon listening on `socket` and read its
-/// [`Response`]. Errors (e.g. [`Error::Io`]) if no daemon is listening.
+/// [`Response`]. Returns a crate [`crate::Error`] if no daemon is listening.
 ///
 /// Shared by the CLI and GUI so both speak the wire format identically.
 pub fn send(socket: &Path, req: &Request) -> Result<Response> {
@@ -1630,6 +1760,74 @@ mod tests {
             // Round-trip is lossless: re-serializing yields the same bytes.
             assert_eq!(line, serde_json::to_string(&back).unwrap());
         }
+    }
+
+    #[test]
+    fn file_thumbnail_requests_keep_their_revision_tags() {
+        let request = Request::FileThumbs {
+            items: vec![
+                FileThumbRequest {
+                    uid: "volume~first".into(),
+                    modified: 1_700_000_001,
+                    name: "first.jpg".into(),
+                },
+                FileThumbRequest {
+                    uid: "volume~second".into(),
+                    modified: 1_700_000_002,
+                    name: "second.nef".into(),
+                },
+            ],
+            generation: 42,
+        };
+        let line = serde_json::to_string(&request).unwrap();
+        let decoded: Request = serde_json::from_str(&line).unwrap();
+        assert_eq!(line, serde_json::to_string(&decoded).unwrap());
+    }
+
+    #[test]
+    fn legacy_file_thumbnail_requests_default_the_name() {
+        let decoded: Request = serde_json::from_str(
+            r#"{"FileThumbs":{"items":[{"uid":"volume~first","modified":1700000001}],"generation":42}}"#,
+        )
+        .unwrap();
+        let Request::FileThumbs { items, generation } = decoded else {
+            panic!("decoded the wrong request variant");
+        };
+        assert_eq!(generation, 42);
+        assert_eq!(items.len(), 1);
+        assert!(items[0].name.is_empty());
+    }
+
+    #[test]
+    fn thumbnail_build_requests_and_progress_roundtrip() {
+        let requests = [
+            Request::CancelFileThumbs { generation: 43 },
+            Request::StartThumbnailBuild {
+                path: "pictures/events".into(),
+            },
+            Request::ThumbnailBuildStatus,
+        ];
+        for request in requests {
+            let line = serde_json::to_string(&request).unwrap();
+            let decoded: Request = serde_json::from_str(&line).unwrap();
+            assert_eq!(line, serde_json::to_string(&decoded).unwrap());
+        }
+
+        let response = Response::ThumbnailBuild {
+            status: ThumbnailBuildStatus {
+                running: true,
+                scanning: false,
+                path: "pictures/events".into(),
+                folders_scanned: 12,
+                images_found: 80,
+                completed: 25,
+                failed: 1,
+                message: None,
+            },
+        };
+        let line = serde_json::to_string(&response).unwrap();
+        let decoded: Response = serde_json::from_str(&line).unwrap();
+        assert_eq!(line, serde_json::to_string(&decoded).unwrap());
     }
 
     #[test]

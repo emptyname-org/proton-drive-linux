@@ -389,6 +389,12 @@ pub fn mount(
         own_sealed_revs: Arc::new(Mutex::new(HashMap::new())),
         self_changes: Arc::new(Mutex::new(HashMap::new())),
         thumb_gen: Arc::new(Mutex::new(HashSet::new())),
+        thumb_gen_budget: Arc::new(tokio::sync::Semaphore::new(
+            super::photos::THUMB_GEN_CONCURRENCY,
+        )),
+        file_thumb_generation: Arc::new(AtomicU64::new(0)),
+        file_thumb_cancel: Arc::new(tokio::sync::Notify::new()),
+        thumbnail_build: Arc::new(Mutex::new(Default::default())),
         no_thumbnail: Arc::new(Mutex::new(HashMap::new())),
         quota: Arc::new(Mutex::new(None)),
         size_upgrades: Arc::new(Mutex::new(HashMap::new())),

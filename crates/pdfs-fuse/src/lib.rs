@@ -60,7 +60,7 @@ use pdfs_core::config::{AppDirs, SweepMode};
 use pdfs_core::control::{
     ActivityEntry, ActivityKind, DirEntry, ErrorKind, LocalHit, PhotoKind, PublicLinkInfo,
     SearchFilters, SearchHit, SearchSource, SyncFolderInfo, SyncPhase, SyncProgress,
-    TransferDirection,
+    ThumbnailBuildStatus, TransferDirection,
 };
 use pdfs_core::db::{
     Db, LOCAL_VOLUME, OP_CREATE, OP_MKDIR, OP_RENAME, OP_REVISION, OP_TRASH, PARK_UNTIL, PendingOp,
@@ -511,6 +511,16 @@ struct Core {
     /// those downloads is a full-size photo — so an in-flight uid is never started
     /// twice.
     thumb_gen: Arc<Mutex<HashSet<NodeUid>>>,
+    /// Global permit pool for locally generated thumbnails. The old per-request
+    /// limit multiplied when the GUI sent several batches, allowing dozens of
+    /// full-size images to download at once.
+    thumb_gen_budget: Arc<tokio::sync::Semaphore>,
+    /// Current ordinary-file listing generation and a wake-up for tasks waiting
+    /// on a permit or a download when that listing is abandoned.
+    file_thumb_generation: Arc<AtomicU64>,
+    file_thumb_cancel: Arc<tokio::sync::Notify>,
+    /// Progress of the explicit recursive build started from the Files toolbar.
+    thumbnail_build: Arc<Mutex<ThumbnailBuildStatus>>,
     /// Nodes the remote has told us have *no* thumbnail of a given type, keyed by
     /// `(uid, thumbnail type)` and holding the mtime the answer was learned at.
     ///
