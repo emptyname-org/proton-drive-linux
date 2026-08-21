@@ -104,6 +104,10 @@ pub enum Request {
         #[serde(default)]
         generation: u64,
     },
+    /// Reserve a daemon-issued generation for ordinary-file thumbnail work.
+    /// The daemon is the ordering authority, so GUI restarts and wall-clock
+    /// corrections cannot make a new listing look older than an earlier one.
+    ReserveFileThumbGeneration,
     /// Stop ordinary-file thumbnail work belonging to older listings. Photos
     /// timeline work and an explicit recursive build are deliberately separate.
     CancelFileThumbs { generation: u64 },
@@ -111,6 +115,8 @@ pub enum Request {
     /// The request returns immediately; progress is read with
     /// [`Request::ThumbnailBuildStatus`].
     StartThumbnailBuild { path: String },
+    /// Stop the current recursive ordinary-file thumbnail build, if any.
+    CancelThumbnailBuild,
     /// Read progress for the recursive ordinary-file thumbnail build.
     ThumbnailBuildStatus,
     /// Download a photo's full content into the cache; replies with its path.
@@ -1176,35 +1182,9 @@ pub fn is_thumbnail_image_name(name: &str) -> bool {
     let Some((_, extension)) = name.rsplit_once('.') else {
         return false;
     };
-    matches!(
-        extension.to_ascii_lowercase().as_str(),
-        "bmp"
-            | "gif"
-            | "jpeg"
-            | "jpg"
-            | "png"
-            | "tif"
-            | "tiff"
-            | "webp"
-            | "arw"
-            | "cr2"
-            | "cr3"
-            | "crw"
-            | "dng"
-            | "k25"
-            | "kdc"
-            | "mrw"
-            | "nef"
-            | "nrw"
-            | "orf"
-            | "pef"
-            | "raf"
-            | "rw"
-            | "rw2"
-            | "sr2"
-            | "srf"
-            | "x3f"
-    )
+    let extension = extension.to_ascii_lowercase();
+    STANDARD_THUMBNAIL_EXTENSIONS.contains(&extension.as_str())
+        || RAW_THUMBNAIL_EXTENSIONS.contains(&extension.as_str())
 }
 
 /// Whether `name` is one of the concrete RAW formats handled by the exiftool
@@ -1214,28 +1194,20 @@ pub fn is_raw_image_name(name: &str) -> bool {
     let Some((_, extension)) = name.rsplit_once('.') else {
         return false;
     };
-    matches!(
-        extension.to_ascii_lowercase().as_str(),
-        "arw"
-            | "cr2"
-            | "cr3"
-            | "crw"
-            | "dng"
-            | "k25"
-            | "kdc"
-            | "mrw"
-            | "nef"
-            | "nrw"
-            | "orf"
-            | "pef"
-            | "raf"
-            | "rw"
-            | "rw2"
-            | "sr2"
-            | "srf"
-            | "x3f"
-    )
+    let extension = extension.to_ascii_lowercase();
+    RAW_THUMBNAIL_EXTENSIONS.contains(&extension.as_str())
 }
+
+const STANDARD_THUMBNAIL_EXTENSIONS: &[&str] =
+    &["bmp", "gif", "jpeg", "jpg", "png", "tif", "tiff", "webp"];
+
+/// Concrete camera RAW formats with embedded previews handled by exiftool.
+/// This is the single source used by both RAW classification and the broader
+/// thumbnail capability check.
+const RAW_THUMBNAIL_EXTENSIONS: &[&str] = &[
+    "arw", "cr2", "cr3", "crw", "dng", "k25", "kdc", "mrw", "nef", "nrw", "orf", "pef", "raf",
+    "raw", "rw2", "sr2", "srf", "x3f",
+];
 
 /// Progress of the one recursive ordinary-file thumbnail build the daemon may
 /// run at a time.
@@ -1405,6 +1377,13 @@ pub enum Response {
     PhotoMonths { months: Vec<PhotoMonth> },
     /// Thumbnails for a [`Request::PhotoThumbs`] batch.
     Thumbs { items: Vec<PhotoThumb> },
+    /// A [`Request::FileThumbs`] generation is no longer current. This is
+    /// retryable after reserving a fresh generation and must never be interpreted
+    /// as a permanent "no thumbnail" verdict.
+    FileThumbsStale,
+    /// Daemon-issued generation reserved by
+    /// [`Request::ReserveFileThumbGeneration`].
+    FileThumbGeneration { generation: u64 },
     /// Current recursive thumbnail-build progress.
     ThumbnailBuild { status: ThumbnailBuildStatus },
     /// An on-disk path the front-end can open (e.g. a downloaded photo).
@@ -1739,10 +1718,12 @@ mod tests {
     #[test]
     fn thumbnail_build_requests_and_progress_roundtrip() {
         let requests = [
+            Request::ReserveFileThumbGeneration,
             Request::CancelFileThumbs { generation: 43 },
             Request::StartThumbnailBuild {
                 path: "pictures/events".into(),
             },
+            Request::CancelThumbnailBuild,
             Request::ThumbnailBuildStatus,
         ];
         for request in requests {
@@ -1763,6 +1744,16 @@ mod tests {
                 message: None,
             },
         };
+        let line = serde_json::to_string(&response).unwrap();
+        let decoded: Response = serde_json::from_str(&line).unwrap();
+        assert_eq!(line, serde_json::to_string(&decoded).unwrap());
+
+        let response = Response::FileThumbGeneration { generation: 44 };
+        let line = serde_json::to_string(&response).unwrap();
+        let decoded: Response = serde_json::from_str(&line).unwrap();
+        assert_eq!(line, serde_json::to_string(&decoded).unwrap());
+
+        let response = Response::FileThumbsStale;
         let line = serde_json::to_string(&response).unwrap();
         let decoded: Response = serde_json::from_str(&line).unwrap();
         assert_eq!(line, serde_json::to_string(&decoded).unwrap());

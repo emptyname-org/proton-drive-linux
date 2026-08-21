@@ -6,10 +6,11 @@
 //! a phone) are generated locally and stored as if the server had served them.
 
 use std::collections::{HashMap, HashSet};
+use std::ffi::OsStr;
 use std::fs::OpenOptions;
 use std::io::{Read as _, Write as _};
 use std::os::unix::fs::OpenOptionsExt as _;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Once;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -44,6 +45,11 @@ const THUMB_QUALITY: u8 = 82;
 pub(crate) const THUMB_GEN_CONCURRENCY: usize = 4;
 /// Images processed between recursive-build progress updates.
 const THUMB_BUILD_CHUNK: usize = 16;
+/// A recursive build may wait briefly for an opportunistic tile job that
+/// already owns a uid, but never forever.
+const THUMB_BUILD_CLAIM_TIMEOUT: Duration = Duration::from_secs(30);
+/// Backstop for cancellation if a notification races with waiter registration.
+const THUMB_CANCEL_POLL: Duration = Duration::from_millis(100);
 /// A broken metadata helper must not hold one of the four thumbnail permits
 /// indefinitely. Matches the deliberately generous KDE RAW thumbnail budget.
 const EXIFTOOL_TIMEOUT: Duration = Duration::from_secs(20);
@@ -67,6 +73,17 @@ struct GeneratedThumb {
     bytes: Vec<u8>,
     ratio: f64,
 }
+
+/// Scaling distinguishes a permanent content verdict from an environmental
+/// failure. Only `Undecodable` may enter the local negative cache.
+enum ScaleAttempt {
+    Made(GeneratedThumb),
+    Undecodable,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RawPreviewUnavailable;
 
 /// How one attempt at generating a missing thumbnail ended. The distinction that
 /// matters is *permanent* versus *transient*: only bytes we cannot decode prove
@@ -109,13 +126,49 @@ impl ThumbBatchSummary {
     }
 }
 
+/// `true` means publish a new build, `false` means the caller may attach to the
+/// already-running build for the same root. A different root is never silently
+/// accepted as if it were the requested job.
+fn thumbnail_build_may_start(status: &ThumbnailBuildStatus, path: &str) -> CoreResult<bool> {
+    if !status.running {
+        return Ok(true);
+    }
+    if status.path == path {
+        return Ok(false);
+    }
+    Err(CoreError::invalid(format!(
+        "a thumbnail build is already running for {}",
+        if status.path.is_empty() {
+            "Proton Drive"
+        } else {
+            &status.path
+        }
+    )))
+}
+
 /// Scale a full-size photo down to a thumbnail: at most [`THUMB_EDGE`] on its
-/// longest side, JPEG, aspect ratio preserved. `None` when the bytes aren't an
-/// image this build can decode — the caller then writes the photo off as
-/// un-thumbnailable.
+/// longest side, JPEG, aspect ratio preserved. Environmental RAW-extraction
+/// failures remain retryable; only bytes conclusively outside the supported
+/// formats return an undecodable verdict.
 ///
 /// CPU-bound (a 20 MP JPEG is real work), so callers run it on the blocking pool.
-fn scale_thumbnail(bytes: &[u8], name: &str) -> Option<GeneratedThumb> {
+fn scale_thumbnail(bytes: &[u8], name: &str, staging_dir: &Path) -> ScaleAttempt {
+    scale_thumbnail_with_exiftool(
+        bytes,
+        name,
+        staging_dir,
+        OsStr::new("exiftool"),
+        EXIFTOOL_TIMEOUT,
+    )
+}
+
+fn scale_thumbnail_with_exiftool(
+    bytes: &[u8],
+    name: &str,
+    staging_dir: &Path,
+    exiftool: &OsStr,
+    timeout: Duration,
+) -> ScaleAttempt {
     let direct = image::ImageReader::new(std::io::Cursor::new(bytes))
         .with_guessed_format()
         .ok()
@@ -123,22 +176,29 @@ fn scale_thumbnail(bytes: &[u8], name: &str) -> Option<GeneratedThumb> {
     let image = match direct {
         Some(image) => image,
         None if is_raw_image_name(name) => {
-            let (preview, orientation) = extract_raw_preview(bytes, name)?;
-            let mut image = image::ImageReader::new(std::io::Cursor::new(preview))
+            let (preview, orientation) =
+                match extract_raw_preview(bytes, name, staging_dir, exiftool, timeout) {
+                    Ok(Some(preview)) => preview,
+                    Ok(None) => return ScaleAttempt::Undecodable,
+                    Err(_) => return ScaleAttempt::Unavailable,
+                };
+            let Some(mut image) = image::ImageReader::new(std::io::Cursor::new(preview))
                 .with_guessed_format()
-                .ok()?
-                .decode()
-                .ok()?;
+                .ok()
+                .and_then(|reader| reader.decode().ok())
+            else {
+                return ScaleAttempt::Undecodable;
+            };
             if let Some(orientation) = image::metadata::Orientation::from_exif(orientation) {
                 image.apply_orientation(orientation);
             }
             image
         }
-        None => return None,
+        None => return ScaleAttempt::Undecodable,
     };
     let (width, height) = (image.width(), image.height());
     if width == 0 || height == 0 {
-        return None;
+        return ScaleAttempt::Undecodable;
     }
     let ratio = f64::from(width) / f64::from(height);
 
@@ -146,10 +206,13 @@ fn scale_thumbnail(bytes: &[u8], name: &str) -> Option<GeneratedThumb> {
     // THUMB_EDGE and the ratio is untouched.
     let thumb = image.thumbnail(THUMB_EDGE, THUMB_EDGE).to_rgb8();
     let mut bytes = Vec::new();
-    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut bytes, THUMB_QUALITY)
+    if image::codecs::jpeg::JpegEncoder::new_with_quality(&mut bytes, THUMB_QUALITY)
         .encode_image(&thumb)
-        .ok()?;
-    Some(GeneratedThumb { bytes, ratio })
+        .is_err()
+    {
+        return ScaleAttempt::Unavailable;
+    }
+    ScaleAttempt::Made(GeneratedThumb { bytes, ratio })
 }
 
 /// Temporary file passed to exiftool. The helper identifies most RAWs from their
@@ -158,7 +221,7 @@ fn scale_thumbnail(bytes: &[u8], name: &str) -> Option<GeneratedThumb> {
 struct RawTempFile(PathBuf);
 
 impl RawTempFile {
-    fn create(bytes: &[u8], name: &str) -> Option<Self> {
+    fn create_in(staging_dir: &Path, bytes: &[u8], name: &str) -> Option<Self> {
         let extension = std::path::Path::new(name)
             .extension()
             .and_then(|value| value.to_str())
@@ -174,7 +237,7 @@ impl RawTempFile {
             .as_nanos();
         for _ in 0..16 {
             let nonce = RAW_TEMP_NONCE.fetch_add(1, Ordering::Relaxed);
-            let path = std::env::temp_dir().join(format!(
+            let path = staging_dir.join(format!(
                 "pdfs-raw-{}-{started}-{nonce}.{extension}",
                 std::process::id(),
             ));
@@ -208,8 +271,13 @@ impl Drop for RawTempFile {
 /// Run one bounded exiftool JSON query while draining stdout concurrently. The
 /// latter matters for full-size `JpgFromRaw` fallbacks, whose base64 can exceed a
 /// pipe buffer long before the child exits.
-fn exiftool_query(path: &std::path::Path, tags: &[&str]) -> Option<serde_json::Value> {
-    let mut command = Command::new("exiftool");
+fn exiftool_query(
+    exiftool: &OsStr,
+    path: &Path,
+    tags: &[&str],
+    timeout: Duration,
+) -> Result<serde_json::Value, RawPreviewUnavailable> {
+    let mut command = Command::new(exiftool);
     command.args(["-j", "-b", "-n"]);
     command.args(tags);
     command
@@ -227,10 +295,14 @@ fn exiftool_query(path: &std::path::Path, tags: &[&str]) -> Option<serde_json::V
                     );
                 });
             }
-            return None;
+            return Err(RawPreviewUnavailable);
         }
     };
-    let mut stdout = child.stdout.take()?;
+    let Some(mut stdout) = child.stdout.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(RawPreviewUnavailable);
+    };
     let reader = std::thread::spawn(move || {
         let mut output = Vec::new();
         stdout.read_to_end(&mut output).map(|_| output)
@@ -239,7 +311,7 @@ fn exiftool_query(path: &std::path::Path, tags: &[&str]) -> Option<serde_json::V
     let success = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status.success(),
-            Ok(None) if started.elapsed() < EXIFTOOL_TIMEOUT => {
+            Ok(None) if started.elapsed() < timeout => {
                 std::thread::sleep(Duration::from_millis(10));
             }
             Ok(None) | Err(_) => {
@@ -249,11 +321,15 @@ fn exiftool_query(path: &std::path::Path, tags: &[&str]) -> Option<serde_json::V
             }
         }
     };
-    let output = reader.join().ok()?.ok()?;
+    let output = reader
+        .join()
+        .ok()
+        .and_then(Result::ok)
+        .ok_or(RawPreviewUnavailable)?;
     if !success {
-        return None;
+        return Err(RawPreviewUnavailable);
     }
-    serde_json::from_slice(&output).ok()
+    serde_json::from_slice(&output).map_err(|_| RawPreviewUnavailable)
 }
 
 fn exiftool_object(
@@ -276,17 +352,28 @@ fn exiftool_binary(
 /// Extract the embedded display preview from one concrete camera RAW. PreviewImage
 /// is queried alone first so common files do not also serialize a discarded
 /// full-resolution JpgFromRaw; rarer preview tags are requested only on a miss.
-fn extract_raw_preview(bytes: &[u8], name: &str) -> Option<(Vec<u8>, u8)> {
-    let file = RawTempFile::create(bytes, name)?;
-    let primary = exiftool_query(&file.0, &["-Orientation", "-PreviewImage"])?;
-    let primary = exiftool_object(&primary)?;
+fn extract_raw_preview(
+    bytes: &[u8],
+    name: &str,
+    staging_dir: &Path,
+    exiftool: &OsStr,
+    timeout: Duration,
+) -> Result<Option<(Vec<u8>, u8)>, RawPreviewUnavailable> {
+    let file = RawTempFile::create_in(staging_dir, bytes, name).ok_or(RawPreviewUnavailable)?;
+    let primary = exiftool_query(
+        exiftool,
+        &file.0,
+        &["-Orientation", "-PreviewImage"],
+        timeout,
+    )?;
+    let primary = exiftool_object(&primary).ok_or(RawPreviewUnavailable)?;
     let orientation = primary
         .get("Orientation")
         .and_then(serde_json::Value::as_u64)
         .and_then(|value| u8::try_from(value).ok())
         .unwrap_or(1);
     if let Some(preview) = exiftool_binary(primary, "PreviewImage") {
-        return Some((preview, orientation));
+        return Ok(Some((preview, orientation)));
     }
 
     const FALLBACKS: [&str; 5] = [
@@ -297,6 +384,7 @@ fn extract_raw_preview(bytes: &[u8], name: &str) -> Option<(Vec<u8>, u8)> {
         "ThumbnailTIFF",
     ];
     let fallback = exiftool_query(
+        exiftool,
         &file.0,
         &[
             "-OtherImage",
@@ -305,12 +393,13 @@ fn extract_raw_preview(bytes: &[u8], name: &str) -> Option<(Vec<u8>, u8)> {
             "-ThumbnailImage",
             "-ThumbnailTIFF",
         ],
+        timeout,
     )?;
-    let fallback = exiftool_object(&fallback)?;
-    FALLBACKS
+    let fallback = exiftool_object(&fallback).ok_or(RawPreviewUnavailable)?;
+    Ok(FALLBACKS
         .iter()
         .find_map(|key| exiftool_binary(fallback, key))
-        .map(|preview| (preview, orientation))
+        .map(|preview| (preview, orientation)))
 }
 
 /// Formats supported by the local thumbnail decoder and exposed by the GUI.
@@ -514,14 +603,12 @@ impl Core {
         &self,
         items: &[FileThumbRequest],
         generation: u64,
-    ) -> Vec<PhotoThumb> {
-        let previous = self
-            .file_thumb_generation
-            .fetch_max(generation, Ordering::SeqCst);
-        if generation > previous {
-            self.file_thumb_cancel.notify_waiters();
+    ) -> Option<Vec<PhotoThumb>> {
+        let current =
+            generation != 0 && self.file_thumb_generation.load(Ordering::SeqCst) == generation;
+        if !current {
+            return None;
         }
-        let current = self.file_thumb_generation.load(Ordering::SeqCst) == generation;
         let ttype = ThumbnailType::Thumbnail.as_i32();
         let parsed: Vec<(String, NodeUid, i64)> = items
             .iter()
@@ -549,7 +636,10 @@ impl Core {
                 .cache
                 .cached_thumbnail_path(uid, ttype, *modified)
                 .is_some()
-                || self.no_thumbnail.lock().get(&(uid.clone(), ttype)) == Some(modified)
+                || self
+                    .thumbnail_misses
+                    .lock()
+                    .local_contains(&(uid.clone(), ttype), *modified)
                 || !seen.insert(raw.clone())
             {
                 continue;
@@ -557,26 +647,44 @@ impl Core {
             wanted.push(uid.clone());
         }
 
-        if current && !wanted.is_empty() {
+        if !wanted.is_empty() {
             self.spawn_generate_thumbs(wanted, &tags, &names, ThumbJob::Files(generation));
         }
 
         let pending = self.thumb_gen.lock();
-        items
-            .iter()
-            .map(|item| {
-                let uid = parse_uid(&item.uid);
-                PhotoThumb {
-                    uid: item.uid.clone(),
-                    path: uid.as_ref().and_then(|uid| {
-                        self.cache
-                            .cached_thumbnail_path(uid, ttype, item.modified)
-                            .map(|path| path.display().to_string())
-                    }),
-                    pending: current && uid.as_ref().is_some_and(|uid| pending.contains(uid)),
-                }
+        Some(
+            items
+                .iter()
+                .map(|item| {
+                    let uid = parse_uid(&item.uid);
+                    PhotoThumb {
+                        uid: item.uid.clone(),
+                        path: uid.as_ref().and_then(|uid| {
+                            self.cache
+                                .cached_thumbnail_path(uid, ttype, item.modified)
+                                .map(|path| path.display().to_string())
+                        }),
+                        pending: uid.as_ref().is_some_and(|uid| pending.contains(uid)),
+                    }
+                })
+                .collect(),
+        )
+    }
+
+    /// Reserve the next ordinary-file listing generation. This daemon-owned
+    /// monotonic value replaces GUI wall-clock seeds, which can move backwards
+    /// across NTP corrections, suspend, or dual boot.
+    pub(crate) fn reserve_file_thumb_generation(&self) -> u64 {
+        let next = |current| if current == u64::MAX { 1 } else { current + 1 };
+        let previous = self
+            .file_thumb_generation
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+                Some(next(current))
             })
-            .collect()
+            .expect("generation update always succeeds");
+        let generation = next(previous);
+        self.file_thumb_cancel.notify_waiters();
+        generation
     }
 
     /// Advance the ordinary-file thumbnail generation. Every queued/download in
@@ -644,7 +752,8 @@ impl Core {
             ThumbJob::Files(generation) => {
                 self.file_thumb_generation.load(Ordering::SeqCst) == generation
             }
-            ThumbJob::Photos | ThumbJob::Build => true,
+            ThumbJob::Photos => true,
+            ThumbJob::Build => !self.thumbnail_build_cancelled.load(Ordering::SeqCst),
         }
     }
 
@@ -684,9 +793,29 @@ impl Core {
                                             return (uid, ThumbAttempt::Cancelled);
                                         }
                                     }
+                                    _ = tokio::time::sleep(THUMB_CANCEL_POLL) => {
+                                        if !core.thumb_job_current(job) {
+                                            return (uid, ThumbAttempt::Cancelled);
+                                        }
+                                    }
                                 }
                             },
-                            ThumbJob::Photos | ThumbJob::Build => acquire.await.ok(),
+                            ThumbJob::Build => loop {
+                                tokio::select! {
+                                    permit = &mut acquire => break permit.ok(),
+                                    _ = core.thumbnail_build_cancel.notified() => {
+                                        if !core.thumb_job_current(job) {
+                                            return (uid, ThumbAttempt::Cancelled);
+                                        }
+                                    }
+                                    _ = tokio::time::sleep(THUMB_CANCEL_POLL) => {
+                                        if !core.thumb_job_current(job) {
+                                            return (uid, ThumbAttempt::Cancelled);
+                                        }
+                                    }
+                                }
+                            },
+                            ThumbJob::Photos => acquire.await.ok(),
                         };
                         let Some(_permit) = _permit else {
                             return (uid, ThumbAttempt::Unavailable);
@@ -707,9 +836,29 @@ impl Core {
                                             break None;
                                         }
                                     }
+                                    _ = tokio::time::sleep(THUMB_CANCEL_POLL) => {
+                                        if !core.thumb_job_current(job) {
+                                            break None;
+                                        }
+                                    }
                                 }
                             },
-                            ThumbJob::Photos | ThumbJob::Build => Some(download.await),
+                            ThumbJob::Build => loop {
+                                tokio::select! {
+                                    result = &mut download => break Some(result),
+                                    _ = core.thumbnail_build_cancel.notified() => {
+                                        if !core.thumb_job_current(job) {
+                                            break None;
+                                        }
+                                    }
+                                    _ = tokio::time::sleep(THUMB_CANCEL_POLL) => {
+                                        if !core.thumb_job_current(job) {
+                                            break None;
+                                        }
+                                    }
+                                }
+                            },
+                            ThumbJob::Photos => Some(download.await),
                         };
                         let Some(downloaded) = downloaded else {
                             return (uid, ThumbAttempt::Cancelled);
@@ -726,16 +875,19 @@ impl Core {
                         }
                         // Decoding + scaling a 20 MP JPEG is CPU-bound and would
                         // stall the runtime's worker; hand it to the blocking pool.
-                        let made =
-                            tokio::task::spawn_blocking(move || scale_thumbnail(&bytes, &name))
-                                .await
-                                .unwrap_or(None);
+                        let staging_dir = core.cache.raw_thumbnail_staging_dir().to_path_buf();
+                        let made = tokio::task::spawn_blocking(move || {
+                            scale_thumbnail(&bytes, &name, &staging_dir)
+                        })
+                        .await
+                        .unwrap_or(ScaleAttempt::Unavailable);
                         if !core.thumb_job_current(job) {
                             return (uid, ThumbAttempt::Cancelled);
                         }
                         match made {
-                            Some(thumb) => (uid, ThumbAttempt::Made(thumb)),
-                            None => (uid, ThumbAttempt::Undecodable),
+                            ScaleAttempt::Made(thumb) => (uid, ThumbAttempt::Made(thumb)),
+                            ScaleAttempt::Undecodable => (uid, ThumbAttempt::Undecodable),
+                            ScaleAttempt::Unavailable => (uid, ThumbAttempt::Unavailable),
                         }
                     });
                 }
@@ -760,7 +912,9 @@ impl Core {
                     match self.cache.store_thumbnail(&uid, ttype, tag, &thumb.bytes) {
                         Ok(()) => {
                             summary.made += 1;
-                            self.no_thumbnail.lock().remove(&(uid.clone(), ttype));
+                            self.thumbnail_misses
+                                .lock()
+                                .forget_local(&(uid.clone(), ttype));
                             self.record_thumb(&uid, db::THUMB_HAVE, Some(thumb.ratio));
                         }
                         Err(e) => {
@@ -774,7 +928,9 @@ impl Core {
                 ThumbAttempt::Undecodable => {
                     summary.undecodable += 1;
                     if let Some(&tag) = tags.get(&uid.to_string()) {
-                        self.no_thumbnail.lock().insert((uid.clone(), ttype), tag);
+                        self.thumbnail_misses
+                            .lock()
+                            .remember_local((uid.clone(), ttype), tag);
                     }
                     self.record_thumb(&uid, db::THUMB_NONE, None);
                 }
@@ -792,20 +948,22 @@ impl Core {
         self.thumbnail_build.lock().clone()
     }
 
-    /// Start one recursive local-thumbnail build. A second request while it is
-    /// running attaches to the existing job instead of duplicating every
-    /// download; the caller polls [`Core::thumbnail_build_status`].
-    pub(crate) fn start_thumbnail_build(&self, root: PathBuf) -> ThumbnailBuildStatus {
+    /// Start one recursive local-thumbnail build. A request for the same root
+    /// may attach to it; a different root is rejected explicitly instead of
+    /// silently pretending the existing job belongs to the caller.
+    pub(crate) fn start_thumbnail_build(&self, root: PathBuf) -> CoreResult<ThumbnailBuildStatus> {
         let path = root.to_string_lossy().into_owned();
         let status = {
             let mut status = self.thumbnail_build.lock();
-            if status.running {
-                return status.clone();
+            if !thumbnail_build_may_start(&status, &path)? {
+                return Ok(status.clone());
             }
+            self.thumbnail_build_cancelled
+                .store(false, Ordering::SeqCst);
             *status = ThumbnailBuildStatus {
                 running: true,
                 scanning: true,
-                path,
+                path: path.clone(),
                 folders_scanned: 0,
                 images_found: 0,
                 completed: 0,
@@ -826,18 +984,57 @@ impl Core {
                 status.running = false;
                 status.scanning = false;
                 status.message = Some("Thumbnail generation stopped unexpectedly".to_string());
+                core.thumbnail_build_cancelled
+                    .store(false, Ordering::SeqCst);
                 warn!(path = %status.path, "recursive thumbnail build panicked");
             }
         });
+        Ok(status)
+    }
+
+    pub(crate) fn cancel_thumbnail_build(&self) -> ThumbnailBuildStatus {
+        let (status, cancelled) = {
+            let status = self.thumbnail_build.lock();
+            let cancelled = status.running;
+            if cancelled {
+                self.thumbnail_build_cancelled.store(true, Ordering::SeqCst);
+            }
+            (status.clone(), cancelled)
+        };
+        if cancelled {
+            self.thumbnail_build_cancel.notify_waiters();
+        }
         status
+    }
+
+    fn finish_thumbnail_build(&self) {
+        let mut status = self.thumbnail_build.lock();
+        let cancelled = self.thumbnail_build_cancelled.swap(false, Ordering::SeqCst);
+        status.running = false;
+        status.scanning = false;
+        if cancelled {
+            status.message = Some("Thumbnail build cancelled".to_string());
+        }
+        info!(
+            path = %status.path,
+            images = status.images_found,
+            failed = status.failed,
+            cancelled,
+            "recursive thumbnail build finished"
+        );
     }
 
     fn run_thumbnail_build(&self, root: PathBuf) {
         let mut folders = vec![root];
         let mut images: Vec<(NodeUid, i64, String)> = Vec::new();
-        let mut seen = HashSet::new();
+        let mut seen_folders = HashSet::new();
+        let mut seen_images = HashSet::new();
 
         while let Some(folder) = folders.pop() {
+            if self.thumbnail_build_cancelled.load(Ordering::SeqCst) {
+                self.finish_thumbnail_build();
+                return;
+            }
             let listing = self.list_dir(&folder);
             {
                 let mut status = self.thumbnail_build.lock();
@@ -861,14 +1058,20 @@ impl Core {
             let mut invalid_here = 0_u64;
             for entry in entries {
                 if entry.is_dir {
-                    if seen.insert(entry.uid) {
+                    if seen_folders.insert(entry.uid) {
                         folders.push(folder.join(entry.name));
                     }
                 } else if is_thumbnail_image_name(&entry.name) {
-                    found_here += 1;
                     match parse_uid(&entry.uid) {
-                        Some(uid) => images.push((uid, entry.modified, entry.name)),
-                        None => invalid_here += 1,
+                        Some(uid) if seen_images.insert(uid.clone()) => {
+                            found_here += 1;
+                            images.push((uid, entry.modified, entry.name));
+                        }
+                        Some(_) => {}
+                        None => {
+                            found_here += 1;
+                            invalid_here += 1;
+                        }
                     }
                 }
             }
@@ -879,6 +1082,10 @@ impl Core {
         }
 
         self.thumbnail_build.lock().scanning = false;
+        if self.thumbnail_build_cancelled.load(Ordering::SeqCst) {
+            self.finish_thumbnail_build();
+            return;
+        }
         let ttype = ThumbnailType::Thumbnail.as_i32();
         let mut todo = Vec::new();
         for (uid, modified, name) in images {
@@ -888,7 +1095,11 @@ impl Core {
                 .is_some()
             {
                 self.thumbnail_build.lock().completed += 1;
-            } else if self.no_thumbnail.lock().get(&(uid.clone(), ttype)) == Some(&modified) {
+            } else if self
+                .thumbnail_misses
+                .lock()
+                .local_contains(&(uid.clone(), ttype), modified)
+            {
                 let mut status = self.thumbnail_build.lock();
                 status.completed += 1;
                 status.failed += 1;
@@ -898,6 +1109,10 @@ impl Core {
         }
 
         for chunk in todo.chunks(THUMB_BUILD_CHUNK) {
+            if self.thumbnail_build_cancelled.load(Ordering::SeqCst) {
+                self.finish_thumbnail_build();
+                return;
+            }
             let mut claimed = Vec::with_capacity(chunk.len());
             let mut tags = HashMap::with_capacity(chunk.len());
             let mut names = HashMap::with_capacity(chunk.len());
@@ -905,7 +1120,12 @@ impl Core {
                 // A visible tile may have started this image just before the
                 // toolbar action. Wait for that one bounded job to finish rather
                 // than downloading the full image twice.
+                let waiting_since = Instant::now();
                 loop {
+                    if self.thumbnail_build_cancelled.load(Ordering::SeqCst) {
+                        self.finish_thumbnail_build();
+                        return;
+                    }
                     if self
                         .cache
                         .cached_thumbnail_path(uid, ttype, *modified)
@@ -914,7 +1134,11 @@ impl Core {
                         self.thumbnail_build.lock().completed += 1;
                         break;
                     }
-                    if self.no_thumbnail.lock().get(&(uid.clone(), ttype)) == Some(modified) {
+                    if self
+                        .thumbnail_misses
+                        .lock()
+                        .local_contains(&(uid.clone(), ttype), *modified)
+                    {
                         let mut status = self.thumbnail_build.lock();
                         status.completed += 1;
                         status.failed += 1;
@@ -924,6 +1148,17 @@ impl Core {
                         tags.insert(uid.to_string(), *modified);
                         names.insert(uid.to_string(), name.clone());
                         claimed.push(uid.clone());
+                        break;
+                    }
+                    if waiting_since.elapsed() >= THUMB_BUILD_CLAIM_TIMEOUT {
+                        let mut status = self.thumbnail_build.lock();
+                        status.completed += 1;
+                        status.failed += 1;
+                        if status.message.is_none() {
+                            status.message = Some(
+                                "Some images stayed busy and were skipped after a timeout".into(),
+                            );
+                        }
                         break;
                     }
                     std::thread::sleep(Duration::from_millis(50));
@@ -955,16 +1190,7 @@ impl Core {
                 }
             }
         }
-
-        let mut status = self.thumbnail_build.lock();
-        status.running = false;
-        status.scanning = false;
-        info!(
-            path = %status.path,
-            images = status.images_found,
-            failed = status.failed,
-            "recursive thumbnail build finished"
-        );
+        self.finish_thumbnail_build();
     }
 
     /// Persist what a thumbnail attempt learned about a photo, against the
@@ -1092,9 +1318,14 @@ impl Core {
 
 #[cfg(test)]
 mod thumb_tests {
-    use super::{RawTempFile, THUMB_EDGE, exiftool_binary, ratio_of, scale_thumbnail};
-    use pdfs_core::control::is_thumbnail_image_name;
+    use super::{
+        RawTempFile, ScaleAttempt, THUMB_EDGE, exiftool_binary, ratio_of, scale_thumbnail,
+        scale_thumbnail_with_exiftool, thumbnail_build_may_start,
+    };
+    use pdfs_core::control::{ThumbnailBuildStatus, is_thumbnail_image_name};
+    use std::ffi::OsStr;
     use std::os::unix::fs::PermissionsExt as _;
+    use std::time::Duration;
 
     /// A `width`×`height` JPEG, standing in for a camera photo the server never
     /// generated a thumbnail for.
@@ -1112,7 +1343,10 @@ mod thumb_tests {
     #[test]
     fn scaling_fits_the_long_edge_and_keeps_the_aspect_ratio() {
         let photo = jpeg(4000, 3000);
-        let thumb = scale_thumbnail(&photo, "photo.jpg").expect("a JPEG scales");
+        let ScaleAttempt::Made(thumb) = scale_thumbnail(&photo, "photo.jpg", &std::env::temp_dir())
+        else {
+            panic!("a JPEG scales");
+        };
 
         let (width, height) = image::ImageReader::new(std::io::Cursor::new(&thumb.bytes))
             .with_guessed_format()
@@ -1130,7 +1364,11 @@ mod thumb_tests {
 
     #[test]
     fn a_portrait_photo_fits_its_long_edge_too() {
-        let thumb = scale_thumbnail(&jpeg(1000, 2000), "portrait.jpeg").expect("a JPEG scales");
+        let ScaleAttempt::Made(thumb) =
+            scale_thumbnail(&jpeg(1000, 2000), "portrait.jpeg", &std::env::temp_dir())
+        else {
+            panic!("a JPEG scales");
+        };
         assert!(thumb.ratio < 1.0, "portrait stays portrait");
         assert_eq!(ratio_of(&thumb.bytes).map(|r| r < 1.0), Some(true));
     }
@@ -1139,7 +1377,10 @@ mod thumb_tests {
     fn undecodable_bytes_are_not_a_thumbnail() {
         // What a photo in a format this build has no decoder for looks like: the
         // caller writes it off as un-thumbnailable rather than retrying forever.
-        assert!(scale_thumbnail(b"not an image at all", "broken.jpg").is_none());
+        assert!(matches!(
+            scale_thumbnail(b"not an image at all", "broken.jpg", &std::env::temp_dir()),
+            ScaleAttempt::Undecodable
+        ));
         assert!(ratio_of(b"not an image at all").is_none());
     }
 
@@ -1150,9 +1391,11 @@ mod thumb_tests {
 
     #[test]
     fn raw_staging_file_is_private_and_removed_on_drop() {
-        let file =
-            RawTempFile::create(b"private camera bytes", "shot.NEF").expect("temporary RAW file");
+        let staging_dir = std::env::temp_dir();
+        let file = RawTempFile::create_in(&staging_dir, b"private camera bytes", "shot.NEF")
+            .expect("temporary RAW file");
         let path = file.0.clone();
+        assert_eq!(path.parent(), Some(staging_dir.as_path()));
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
         assert_eq!(
@@ -1172,7 +1415,10 @@ mod thumb_tests {
         let path = std::path::PathBuf::from(path);
         let name = path.file_name().unwrap().to_string_lossy();
         let bytes = std::fs::read(&path).unwrap();
-        let thumb = scale_thumbnail(&bytes, &name).expect("embedded RAW preview");
+        let ScaleAttempt::Made(thumb) = scale_thumbnail(&bytes, &name, &std::env::temp_dir())
+        else {
+            panic!("embedded RAW preview");
+        };
         let (width, height) = image::ImageReader::new(std::io::Cursor::new(&thumb.bytes))
             .with_guessed_format()
             .unwrap()
@@ -1192,6 +1438,7 @@ mod thumb_tests {
             "camera.NEF",
             "negative.cr3",
             "sensor.orf",
+            "camera.raw",
         ] {
             assert!(is_thumbnail_image_name(name), "{name}");
         }
@@ -1203,6 +1450,7 @@ mod thumb_tests {
             "unsupported.heic",
             "unsupported.avif",
             "vector.svg",
+            "camera.rw",
         ] {
             assert!(!is_thumbnail_image_name(name), "{name}");
         }
@@ -1223,5 +1471,31 @@ mod thumb_tests {
         assert_eq!(exiftool_binary(object, "OtherImage"), None);
         assert_eq!(exiftool_binary(object, "ThumbnailImage"), None);
         assert_eq!(exiftool_binary(object, "Missing"), None);
+    }
+
+    #[test]
+    fn missing_exiftool_is_retryable_not_a_permanent_raw_miss() {
+        let attempt = scale_thumbnail_with_exiftool(
+            b"camera bytes that require an embedded preview",
+            "shot.raw",
+            &std::env::temp_dir(),
+            OsStr::new("pdfs-exiftool-deliberately-absent"),
+            Duration::from_millis(10),
+        );
+        assert!(matches!(attempt, ScaleAttempt::Unavailable));
+    }
+
+    #[test]
+    fn a_running_build_only_accepts_the_same_root() {
+        let status = ThumbnailBuildStatus {
+            running: true,
+            path: "pictures/first".into(),
+            ..Default::default()
+        };
+        assert!(!thumbnail_build_may_start(&status, "pictures/first").unwrap());
+        assert!(thumbnail_build_may_start(&status, "pictures/second").is_err());
+
+        let idle = ThumbnailBuildStatus::default();
+        assert!(thumbnail_build_may_start(&idle, "pictures/second").unwrap());
     }
 }
