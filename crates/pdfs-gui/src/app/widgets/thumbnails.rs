@@ -7,7 +7,6 @@
 
 use crate::*;
 use pdfs_core::control::{FileThumbRequest, is_thumbnail_image_name};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 const THUMB_BATCH: usize = 32;
 const THUMB_CACHE_MAX: usize = 256;
@@ -25,6 +24,27 @@ pub(crate) struct FileThumbnailState {
     inflight: Cell<bool>,
     source: RefCell<Option<glib::SourceId>>,
     generation: Cell<u64>,
+    generation_loading: Cell<bool>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ReplyDisposition {
+    Ignore,
+    Load,
+    Retry,
+    Missing,
+}
+
+fn reply_disposition(wanted: bool, has_path: bool, pending: bool) -> ReplyDisposition {
+    if !wanted {
+        ReplyDisposition::Ignore
+    } else if has_path {
+        ReplyDisposition::Load
+    } else if pending {
+        ReplyDisposition::Retry
+    } else {
+        ReplyDisposition::Missing
+    }
 }
 
 impl FileThumbnailState {
@@ -38,13 +58,8 @@ impl FileThumbnailState {
             queue: RefCell::new(VecDeque::new()),
             inflight: Cell::new(false),
             source: RefCell::new(None),
-            generation: Cell::new(
-                SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_nanos()
-                    .min(u128::from(u64::MAX)) as u64,
-            ),
+            generation: Cell::new(0),
+            generation_loading: Cell::new(false),
         }
     }
 
@@ -84,14 +99,17 @@ pub(crate) fn cancel_file_thumbnails(ui: &Rc<Ui>) {
     }
     ui.file_thumbs.queue.borrow_mut().clear();
     ui.file_thumbs.wanted.borrow_mut().clear();
-    let generation = ui.file_thumbs.generation.get().saturating_add(1);
-    ui.file_thumbs.generation.set(generation);
+    let generation = ui.file_thumbs.generation.replace(0);
     // The request is useful even when its reply is not. `spawn_request` owns the
     // socket round-trip on a worker thread, so dropping the receiver is safe.
-    drop(spawn_request(
-        ui.dirs.control_socket(),
-        Request::CancelFileThumbs { generation },
-    ));
+    if generation != 0 {
+        drop(spawn_request(
+            ui.dirs.control_socket(),
+            Request::CancelFileThumbs {
+                generation: generation.saturating_add(1),
+            },
+        ));
+    }
 }
 
 /// A square thumbnail surface with a generic file icon underneath the picture.
@@ -244,6 +262,10 @@ fn schedule_file_thumbs(ui: &Rc<Ui>) {
     if ui.file_thumbs.queue.borrow().is_empty() || ui.file_thumbs.inflight.get() {
         return;
     }
+    if ui.file_thumbs.generation.get() == 0 {
+        reserve_file_thumb_generation(ui);
+        return;
+    }
     if let Some(source) = ui.file_thumbs.source.borrow_mut().take() {
         source.remove();
     }
@@ -251,6 +273,40 @@ fn schedule_file_thumbs(ui: &Rc<Ui>) {
     let source = glib::timeout_add_local_once(THUMB_DEBOUNCE, move || {
         ui_flush.file_thumbs.source.borrow_mut().take();
         flush_file_thumbs(&ui_flush);
+    });
+    *ui.file_thumbs.source.borrow_mut() = Some(source);
+}
+
+fn reserve_file_thumb_generation(ui: &Rc<Ui>) {
+    if ui.file_thumbs.generation_loading.replace(true) {
+        return;
+    }
+    let rx = spawn_request(
+        ui.dirs.control_socket(),
+        Request::ReserveFileThumbGeneration,
+    );
+    let ui = ui.clone();
+    glib::spawn_future_local(async move {
+        let result = rx.recv().await;
+        ui.file_thumbs.generation_loading.set(false);
+        match result {
+            Ok(Ok(Response::FileThumbGeneration { generation })) if generation != 0 => {
+                ui.file_thumbs.generation.set(generation);
+                schedule_file_thumbs(&ui);
+            }
+            _ => retry_file_thumb_generation(&ui),
+        }
+    });
+}
+
+fn retry_file_thumb_generation(ui: &Rc<Ui>) {
+    if let Some(source) = ui.file_thumbs.source.borrow_mut().take() {
+        source.remove();
+    }
+    let ui_retry = ui.clone();
+    let source = glib::timeout_add_local_once(THUMB_RETRY, move || {
+        ui_retry.file_thumbs.source.borrow_mut().take();
+        schedule_file_thumbs(&ui_retry);
     });
     *ui.file_thumbs.source.borrow_mut() = Some(source);
 }
@@ -291,51 +347,63 @@ fn flush_file_thumbs(ui: &Rc<Ui>) {
         ui.file_thumbs.inflight.set(false);
         match result {
             Ok(Ok(Response::Thumbs { items: replies })) => {
-                let requested: HashMap<String, FileThumbRequest> = items
+                let mut requested: HashMap<String, FileThumbRequest> = items
                     .iter()
                     .cloned()
                     .map(|item| (item.uid.clone(), item))
                     .collect();
                 let mut pending = Vec::new();
                 for reply in replies {
-                    let Some(request) = requested.get(&reply.uid) else {
+                    let Some(request) = requested.remove(&reply.uid) else {
                         continue;
                     };
                     let key = thumbnail_key(&request.uid, request.modified);
-                    match reply.path {
-                        Some(path) => match gtk4::gdk::Texture::from_filename(&path) {
-                            Ok(texture) => {
-                                ui.file_thumbs.store_texture(&key, texture.clone());
-                                if let Some(pictures) =
-                                    ui.file_thumbs.wanted.borrow_mut().remove(&key)
-                                {
-                                    for picture in pictures {
-                                        paint(&picture, &key, &texture);
+                    let wanted = ui.file_thumbs.wanted.borrow().contains_key(&key);
+                    match reply_disposition(wanted, reply.path.is_some(), reply.pending) {
+                        ReplyDisposition::Ignore => continue,
+                        ReplyDisposition::Load => {
+                            let Some(path) = reply.path else { continue };
+                            match gtk4::gdk::Texture::from_filename(&path) {
+                                Ok(texture) => {
+                                    ui.file_thumbs.store_texture(&key, texture.clone());
+                                    if let Some(pictures) =
+                                        ui.file_thumbs.wanted.borrow_mut().remove(&key)
+                                    {
+                                        for picture in pictures {
+                                            paint(&picture, &key, &texture);
+                                        }
                                     }
                                 }
+                                Err(e) => {
+                                    tracing::debug!("cannot decode file thumbnail {path}: {e}");
+                                    ui.file_thumbs.store_missing(key.clone());
+                                    ui.file_thumbs.wanted.borrow_mut().remove(&key);
+                                }
                             }
-                            Err(e) => {
-                                tracing::debug!("cannot decode file thumbnail {path}: {e}");
-                                ui.file_thumbs.store_missing(key.clone());
-                                ui.file_thumbs.wanted.borrow_mut().remove(&key);
-                            }
-                        },
-                        None if reply.pending => pending.push(request.clone()),
-                        None => {
+                        }
+                        ReplyDisposition::Retry => pending.push(request),
+                        ReplyDisposition::Missing => {
                             ui.file_thumbs.store_missing(key.clone());
                             ui.file_thumbs.wanted.borrow_mut().remove(&key);
                         }
                     }
                 }
+                pending.extend(requested.into_values());
                 if !pending.is_empty() {
                     retry_file_thumbs(&ui, pending);
                 }
             }
+            Ok(Ok(Response::FileThumbsStale)) => {
+                ui.file_thumbs.generation.set(0);
+                retry_file_thumbs(&ui, items);
+            }
             Ok(Ok(Response::Error { message, .. })) => {
                 tracing::debug!("file thumbnails failed: {message}");
+                retry_file_thumbs(&ui, items);
             }
             Ok(Ok(_)) | Ok(Err(_)) | Err(_) => {
                 tracing::debug!("file thumbnails: no reply");
+                retry_file_thumbs(&ui, items);
             }
         }
         schedule_file_thumbs(&ui);
@@ -358,7 +426,7 @@ fn retry_file_thumbs(ui: &Rc<Ui>, items: Vec<FileThumbRequest>) {
 
 #[cfg(test)]
 mod tests {
-    use super::is_image_name;
+    use super::{ReplyDisposition, is_image_name, reply_disposition};
 
     #[test]
     fn image_extensions_are_case_insensitive_and_specific() {
@@ -369,6 +437,7 @@ mod tests {
             "archive.tiff",
             "camera.nef",
             "negative.CR3",
+            "camera.RAW",
         ] {
             assert!(is_image_name(name), "{name}");
         }
@@ -380,8 +449,21 @@ mod tests {
             "camera.heic",
             "frame.avif",
             "graphic.svg",
+            "camera.rw",
         ] {
             assert!(!is_image_name(name), "{name}");
         }
+    }
+
+    #[test]
+    fn cancelled_listing_replies_cannot_become_permanent_misses() {
+        assert_eq!(
+            reply_disposition(false, false, false),
+            ReplyDisposition::Ignore
+        );
+        assert_eq!(
+            reply_disposition(true, false, false),
+            ReplyDisposition::Missing
+        );
     }
 }

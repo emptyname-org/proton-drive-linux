@@ -407,6 +407,7 @@ fn build_window(app: &adw::Application) {
             thumbnail_status: browser_widgets.thumbnail_status.clone(),
             thumbnail_poll: RefCell::new(None),
             thumbnail_build_running: Cell::new(false),
+            thumbnail_cancel_pending: Cell::new(false),
             search_source: RefCell::new(None),
             load_generation: Cell::new(0),
             views: browser_widgets.views.clone(),

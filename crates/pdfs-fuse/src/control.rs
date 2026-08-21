@@ -329,8 +329,14 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
                 items: core.photo_thumbs(&parsed),
             }
         }
-        Ok(CtlRequest::FileThumbs { items, generation }) => CtlResponse::Thumbs {
-            items: core.file_thumbs(&items, generation),
+        Ok(CtlRequest::FileThumbs { items, generation }) => {
+            match core.file_thumbs(&items, generation) {
+                Some(items) => CtlResponse::Thumbs { items },
+                None => CtlResponse::FileThumbsStale,
+            }
+        }
+        Ok(CtlRequest::ReserveFileThumbGeneration) => CtlResponse::FileThumbGeneration {
+            generation: core.reserve_file_thumb_generation(),
         },
         Ok(CtlRequest::CancelFileThumbs { generation }) => {
             core.cancel_file_thumbs(generation);
@@ -339,10 +345,14 @@ fn handle_control_conn(core: &Core, username: &str, mountpoint: &Path, stream: U
             }
         }
         Ok(CtlRequest::StartThumbnailBuild { path }) => match rel_to_mount(mountpoint, &path) {
-            Ok(rel) => CtlResponse::ThumbnailBuild {
-                status: core.start_thumbnail_build(rel),
+            Ok(rel) => match core.start_thumbnail_build(rel) {
+                Ok(status) => CtlResponse::ThumbnailBuild { status },
+                Err(error) => CtlResponse::error(error),
             },
             Err(error) => CtlResponse::error(error),
+        },
+        Ok(CtlRequest::CancelThumbnailBuild) => CtlResponse::ThumbnailBuild {
+            status: core.cancel_thumbnail_build(),
         },
         Ok(CtlRequest::ThumbnailBuildStatus) => CtlResponse::ThumbnailBuild {
             status: core.thumbnail_build_status(),

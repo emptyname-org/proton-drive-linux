@@ -35,6 +35,7 @@ pub(crate) struct BrowserState {
     pub(crate) thumbnail_status: gtk4::Label,
     pub(crate) thumbnail_poll: RefCell<Option<glib::SourceId>>,
     pub(crate) thumbnail_build_running: Cell<bool>,
+    pub(crate) thumbnail_cancel_pending: Cell<bool>,
     /// Pending debounce timer for the search box; replaced on every keystroke so
     /// only the last pause actually fires a [`Request::Search`].
     pub(crate) search_source: RefCell<Option<glib::SourceId>>,
@@ -1469,7 +1470,13 @@ pub(crate) fn wire_browser_actions(
     let ui_uf = ui.clone();
     upload_folder.connect_clicked(move |_| prompt_upload_folder(&ui_uf));
     let ui_thumbs = ui.clone();
-    build_thumbnails.connect_clicked(move |_| start_thumbnail_build(&ui_thumbs));
+    build_thumbnails.connect_clicked(move |_| {
+        if ui_thumbs.browser.thumbnail_build_running.get() {
+            cancel_thumbnail_build(&ui_thumbs);
+        } else {
+            start_thumbnail_build(&ui_thumbs);
+        }
+    });
 }
 
 const THUMBNAIL_BUILD_POLL: Duration = Duration::from_millis(500);
@@ -1488,7 +1495,10 @@ fn start_thumbnail_build(ui: &Rc<Ui>) {
     }
     cancel_file_thumbnails(ui);
     ui.browser.thumbnail_build_running.set(true);
-    ui.browser.build_thumbnails.set_sensitive(false);
+    // Do not expose Cancel until the daemon has acknowledged Start; the two
+    // requests use separate control connections and could otherwise reorder.
+    ui.browser.thumbnail_cancel_pending.set(true);
+    repaint_thumbnail_build_action(ui, true);
     ui.browser.thumbnail_build_row.set_visible(true);
     ui.browser.thumbnail_progress.set_fraction(0.0);
     ui.browser
@@ -1504,19 +1514,59 @@ fn start_thumbnail_build(ui: &Rc<Ui>) {
     glib::spawn_future_local(async move {
         match rx.recv().await {
             Ok(Ok(Response::ThumbnailBuild { status })) => {
+                ui.browser.thumbnail_cancel_pending.set(false);
                 repaint_thumbnail_build(&ui, &status);
             }
             Ok(Ok(Response::Error { message, kind })) => {
-                thumbnail_build_failed(&ui, &message);
+                thumbnail_build_failed(&ui);
                 toast_failure(&ui, "Couldn't build thumbnails", &message, kind);
             }
             _ => {
                 let message = "The mount service didn't respond.";
-                thumbnail_build_failed(&ui, message);
+                thumbnail_build_failed(&ui);
                 toast_error(&ui, "Couldn't build thumbnails", message);
             }
         }
     });
+}
+
+fn cancel_thumbnail_build(ui: &Rc<Ui>) {
+    if ui.browser.thumbnail_cancel_pending.replace(true) {
+        return;
+    }
+    ui.browser.build_thumbnails.set_sensitive(false);
+    ui.browser
+        .thumbnail_status
+        .set_label("Stopping thumbnail build…");
+    let rx = spawn_request(ui.dirs.control_socket(), Request::CancelThumbnailBuild);
+    let ui = ui.clone();
+    glib::spawn_future_local(async move {
+        match rx.recv().await {
+            Ok(Ok(Response::ThumbnailBuild { status })) if !status.running => {
+                repaint_thumbnail_build(&ui, &status)
+            }
+            Ok(Ok(Response::ThumbnailBuild { .. })) => schedule_thumbnail_build_poll(&ui),
+            Ok(Ok(Response::Error { message, kind })) => {
+                thumbnail_cancel_failed(&ui);
+                toast_failure(&ui, "Couldn't cancel thumbnail build", &message, kind);
+            }
+            _ => {
+                thumbnail_cancel_failed(&ui);
+                toast_error(
+                    &ui,
+                    "Couldn't cancel thumbnail build",
+                    "The mount service didn't respond.",
+                );
+            }
+        }
+    });
+}
+
+fn thumbnail_cancel_failed(ui: &Rc<Ui>) {
+    ui.browser.thumbnail_cancel_pending.set(false);
+    ui.browser.thumbnail_build_running.set(true);
+    repaint_thumbnail_build_action(ui, true);
+    schedule_thumbnail_build_poll(ui);
 }
 
 fn schedule_thumbnail_build_poll(ui: &Rc<Ui>) {
@@ -1534,12 +1584,17 @@ fn schedule_thumbnail_build_poll(ui: &Rc<Ui>) {
                     repaint_thumbnail_build(&ui_result, &status)
                 }
                 Ok(Ok(Response::Error { message, .. })) => {
-                    thumbnail_build_failed(&ui_result, &message)
+                    thumbnail_build_failed(&ui_result);
+                    toast_error(&ui_result, "Thumbnail build stopped", &message);
                 }
-                _ => thumbnail_build_failed(
-                    &ui_result,
-                    "The mount service stopped reporting thumbnail progress.",
-                ),
+                _ => {
+                    thumbnail_build_failed(&ui_result);
+                    toast_error(
+                        &ui_result,
+                        "Thumbnail build stopped",
+                        "The mount service stopped reporting thumbnail progress.",
+                    );
+                }
             }
         });
     });
@@ -1593,13 +1648,12 @@ fn repaint_thumbnail_build(ui: &Rc<Ui>, status: &ThumbnailBuildStatus) {
 
     if status.running {
         ui.browser.thumbnail_build_running.set(true);
-        ui.browser.build_thumbnails.set_sensitive(false);
+        repaint_thumbnail_build_action(ui, true);
         schedule_thumbnail_build_poll(ui);
     } else {
         ui.browser.thumbnail_build_running.set(false);
-        ui.browser
-            .build_thumbnails
-            .set_sensitive(*ui.mounted.borrow());
+        ui.browser.thumbnail_cancel_pending.set(false);
+        repaint_thumbnail_build_action(ui, false);
         if ui.stack.visible_child_name().as_deref() == Some("browser") {
             reload_listing(ui);
         }
@@ -1612,15 +1666,32 @@ fn show_thumbnail_build_progress(status: &ThumbnailBuildStatus) -> bool {
     status.running
 }
 
-fn thumbnail_build_failed(ui: &Rc<Ui>, message: &str) {
-    ui.browser.thumbnail_build_running.set(false);
+fn repaint_thumbnail_build_action(ui: &Rc<Ui>, running: bool) {
+    ui.browser.build_thumbnails.set_icon_name(if running {
+        "process-stop-symbolic"
+    } else {
+        "pdfs-build-thumbnails-symbolic"
+    });
     ui.browser
         .build_thumbnails
-        .set_sensitive(*ui.mounted.borrow());
-    ui.browser.thumbnail_build_row.set_visible(true);
+        .set_tooltip_text(Some(if running {
+            "Cancel thumbnail build"
+        } else {
+            "Build thumbnails in this folder and its subfolders"
+        }));
+    ui.browser.build_thumbnails.set_sensitive(
+        *ui.mounted.borrow() && (!running || !ui.browser.thumbnail_cancel_pending.get()),
+    );
+}
+
+fn thumbnail_build_failed(ui: &Rc<Ui>) {
+    ui.browser.thumbnail_build_running.set(false);
+    ui.browser.thumbnail_cancel_pending.set(false);
+    repaint_thumbnail_build_action(ui, false);
+    ui.browser.thumbnail_build_row.set_visible(false);
     ui.browser.thumbnail_progress.set_fraction(0.0);
-    ui.browser.thumbnail_status.set_label(message);
-    ui.browser.thumbnail_status.set_tooltip_text(Some(message));
+    ui.browser.thumbnail_status.set_label("");
+    ui.browser.thumbnail_status.set_tooltip_text(None);
 }
 
 /// Send a mutating request (rename / move / delete / mkdir / upload, or a trash

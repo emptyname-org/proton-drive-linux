@@ -683,9 +683,11 @@ pub(crate) fn set_mounted(ui: &Rc<Ui>, mounted: bool) {
     ui.browser.new_folder.set_sensitive(mounted);
     ui.browser.upload.set_sensitive(mounted);
     ui.browser.upload_folder.set_sensitive(mounted);
-    ui.browser
-        .build_thumbnails
-        .set_sensitive(mounted && !ui.browser.thumbnail_build_running.get());
+    ui.browser.build_thumbnails.set_sensitive(
+        mounted
+            && (!ui.browser.thumbnail_build_running.get()
+                || !ui.browser.thumbnail_cancel_pending.get()),
+    );
     ui.gallery.upload.set_sensitive(mounted);
     ui.details.details.pin_row.set_sensitive(mounted);
     ui.details.details.rename_button.set_sensitive(mounted);
